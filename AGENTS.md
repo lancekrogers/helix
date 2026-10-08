@@ -58,7 +58,9 @@ runs typecheck, lint, format check, docs build, and the full test suite. Fix
 failures and rerun the gate before proceeding. Targeted checks are useful during
 iteration but do not replace it. CI uses the same script, split into static
 checks (`typecheck lint format docs`) and tests (`test`, requiring Postgres and
-Azurite). Running the script without step names covers both.
+Azurite). Running the script without step names covers both. The workflows'
+automatic triggers are commented out to save Actions minutes, so CI runs only
+when dispatched by hand. Nothing checks a PR unless someone runs the gate.
 
 ## Environment
 

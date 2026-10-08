@@ -22,9 +22,13 @@ name: Release CLI
 # purpose. This workflow proves the exact bytes it is about to publish rather
 # than trusting that an earlier run proved something similar.
 
+# The tag trigger is commented out: the repo is private, so every run bills
+# Actions minutes. Dispatch it by hand on a `cli-v*` tag, or uncomment the
+# trigger to restore it.
 on:
-  push:
-    tags: ["cli-v*"]
+  # push:
+  #   tags: ["cli-v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

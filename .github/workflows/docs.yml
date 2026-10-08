@@ -9,9 +9,12 @@ name: Docs
 #   gh api repos/AZX-PBC-OSS/helix/pages -X POST \
 #     -f build_type=workflow -f source='{"branch":"main","path":"/"}'
 
+# The push trigger is commented out: the repo is private, so every run bills
+# Actions minutes. Run it by hand from the Actions tab, or uncomment the trigger
+# to restore it.
 on:
-  push:
-    branches: [main]
+  # push:
+  #   branches: [main]
   workflow_dispatch:
 
 permissions:
