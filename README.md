@@ -193,6 +193,10 @@ isn't finished until it passes clean. CI invokes this same script, splitting it 
 jobs by naming steps (`./check-and-lint.sh typecheck lint format docs` and `… test`) —
 running it bare locally covers both.
 
+The root `justfile` names these commands as recipes, grouped into modules under `.justfiles/`
+(`dev`, `check`, `db`, `cli`, `image`, `infra`). Run `just` to list them. `just check` runs
+`./check-and-lint.sh`, so it is the same gate.
+
 ## Conventions
 
 - **TypeScript everywhere, ESM, Node 24.** Strict `tsconfig.base.json`, extended per package.

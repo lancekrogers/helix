@@ -18,6 +18,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash \
         | bash -s -- 1.7.7 /usr/local/bin
 
+# ── just (pinned; bookworm's apt doesn't carry it) ───────────
+# Runs the root justfile. The release tarball is checked against the
+# SHA256SUMS file published with the same release before it is unpacked.
+ARG JUST_VERSION=1.58.0
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "${arch}" in x86_64 | aarch64) ;; *) echo "just: unsupported arch ${arch}" >&2; exit 1 ;; esac; \
+    tarball="just-${JUST_VERSION}-${arch}-unknown-linux-musl.tar.gz"; \
+    base="https://github.com/casey/just/releases/download/${JUST_VERSION}"; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL -o "${tmp}/${tarball}" "${base}/${tarball}"; \
+    curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"; \
+    (cd "${tmp}" && grep " ${tarball}\$" SHA256SUMS | sha256sum -c -); \
+    tar -xzf "${tmp}/${tarball}" -C /usr/local/bin just; \
+    rm -rf "${tmp}"; \
+    just --version
+
 # ── gh CLI ───────────────────────────────────────────────────
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
