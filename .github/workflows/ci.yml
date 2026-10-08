@@ -54,11 +54,15 @@ name: CI
 # real-browser failure blocks the publish path. It uploads its
 # traces/screenshots on failure.
 
+# The automatic triggers are commented out: the repo is private, so every run
+# bills Actions minutes. Run it by hand from the Actions tab, or uncomment the
+# triggers to restore it.
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
+  # push:
+  #   branches: [main]
+  #   tags: ["v*"]
+  # pull_request:
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref (e.g. force-pushes to a PR branch) —
 # but only for PRs. On `main` and on tags, a run's tail is a *publish*: two

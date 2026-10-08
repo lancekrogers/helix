@@ -10,3 +10,7 @@ indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
+
+# `just --fmt` indents recipe bodies with 4 spaces.
+[{justfile,*.just}]
+indent_size = 4
