@@ -16,6 +16,7 @@ import {
   INSTR_APP_VISITS,
   INSTR_GATEWAY_ADMISSION_DENIED,
   INSTR_GATEWAY_CUT_CHARGES,
+  INSTR_GATEWAY_PLATFORM_SPEND_RATIO,
   INSTR_GATEWAY_CALLS,
   INSTR_GATEWAY_DURATION,
   INSTR_REGISTRY_LOAD_FAILURES,
@@ -78,6 +79,8 @@ export interface EdgeInstruments {
    * Not gated by the denial throttle — counts refusals the ledger drops.
    */
   gatewayAdmissionDenied: Counter;
+  /** Cached platform spend over the configured ceiling; dimension `helix.env`. */
+  platformSpendRatio: ObservableGauge;
 }
 
 /**
@@ -143,6 +146,10 @@ export function instruments(): EdgeInstruments {
     }),
     gatewayAdmissionDenied: meter.createCounter(INSTR_GATEWAY_ADMISSION_DENIED, {
       description: "LLM gateway admission denials by capability and reason.",
+    }),
+    platformSpendRatio: meter.createObservableGauge(INSTR_GATEWAY_PLATFORM_SPEND_RATIO, {
+      description:
+        "Cached platform LLM spend today divided by the configured daily ceiling. Absent until the first successful read.",
     }),
   };
   return cached;

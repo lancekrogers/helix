@@ -144,6 +144,8 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
     provider: deps.llmProvider,
     usage: deps.usage,
     denialThrottle,
+    // helix_dev has no EXECUTE on platform_llm_spend_micro_usd; no platform ceiling here.
+    platformCeilingDollars: 0,
   };
   const handleLlmChat = makeLlmHandler(llmRuntime);
   const handleOpenAiChat = makeLlmHandler(llmRuntime, openAiCodec, ROUTE_OPENAI);

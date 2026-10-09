@@ -104,6 +104,7 @@ param deployFoundry = false
 // param foundryLocation = 'eastus2'
 // param foundryAttestation = { organizationName: 'Contoso', countryCode: 'US', industry: 'technology' }
 // param llmMonthlyBudgetUsd = 1000         // notify-only LLM budget on the Foundry group; 0 = none. Default matches platformMonthlyUsdCap so the Azure mail and the portal watch line agree
+// param llmPlatformDollarsPerDay = -1      // enforced daily LLM ceiling on the edge (-1 = one tenth of platformMonthlyUsdCap; 0 = off)
 // param llmDefaultDollarsPerDay = 50      // enforced daily cap for apps with no manifest dollarsPerDay (EDGE_LLM_DEFAULT_DOLLARS_PER_DAY); 0 = unset is unlimited
 
 // Servable-model policy (ADR-0047) — what the portal catalogue / rendered

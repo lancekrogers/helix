@@ -23,6 +23,7 @@ import {
   meterCutCharge,
   meterGatewayCall,
   type GatewayOutcome,
+  type LlmSpend,
   type UsageStore,
 } from "./usage.js";
 import type { DenialThrottle } from "./denialThrottle.js";
@@ -92,6 +93,20 @@ export interface LlmGatewayRuntime {
   usage: UsageStore | null;
   /** Caps metered quota denials per (app, env). null => uncapped (tests). */
   denialThrottle: DenialThrottle | null;
+  /** Platform-wide daily LLM ceiling in USD; `0` disables. */
+  platformCeilingDollars: number;
+}
+
+/**
+ * Seconds until the next local midnight in the edge process timezone. The
+ * database day window uses `date_trunc('day', now())` in the session timezone,
+ * so the edge and Postgres must agree (both UTC on Container Apps and the dev
+ * container). The value is advisory for `retry-after`.
+ */
+export function secondsUntilNextLocalMidnight(now = new Date()): number {
+  const next = new Date(now);
+  next.setHours(24, 0, 0, 0);
+  return Math.max(1, Math.ceil((next.getTime() - now.getTime()) / 1000));
 }
 
 /**
@@ -204,6 +219,36 @@ export function makeLlmHandler(
     // request is never cut — including when the client hangs up or a deadline
     // fires; those are not quota cuts. Both windows read the frozen costMicroUsd column.
     const usage = rt.usage;
+    const recordDenial = async (reason: AdmissionDenialReason, errorDetail?: string) => {
+      meterGatewayCall({ appId: entry.appId, capability: "llm", outcome: "quota_blocked" });
+      meterAdmissionDenied({ appId: entry.appId, capability: "llm", reason });
+      trace.getActiveSpan()?.setAttribute(ATTR_REASON, reason);
+      const decision = rt.denialThrottle
+        ? await rt.denialThrottle.admit(entry.appId, caller.env, "llm")
+        : { meter: true as const, suppressedAt: undefined };
+      if (decision.suppressedAt !== undefined) {
+        req.log.warn(
+          { appId: entry.appId, env: caller.env, reason, attempts: decision.suppressedAt },
+          "quota-denial metering suppressed: this app is over its denial budget for the window",
+        );
+      }
+      if (decision.meter) {
+        await usage
+          .record({
+            appId: entry.appId,
+            env: caller.env,
+            ...identity,
+            capability: "llm",
+            model: chat.model,
+            inputTokens: 0,
+            outputTokens: 0,
+            costMicroUsd: 0,
+            outcome: "quota_blocked",
+            ...(errorDetail ? { errorDetail } : {}),
+          })
+          .catch(() => {});
+      }
+    };
     // An unset budget is the install default, never unlimited. 0 is the operator's explicit
     // "no default" (a one-organization install, ADR-0028).
     const cap = entry.llm.dollarsPerDay ?? rt.config.llm.defaultDollarsPerDay;
@@ -214,42 +259,41 @@ export function makeLlmHandler(
       const overBurst = hourMicro >= capMicro * BURST_BUDGET_FRACTION;
       if (overDay || overBurst) {
         const reason: AdmissionDenialReason = overDay ? "app_budget_day" : "app_budget_burst";
-        // The signals are NOT gated on the throttle: the throttle protects an append-only
-        // table with no DELETE grant, it does not hide the event. Past the cap the ledger is
-        // blind to the flood by design; the counter and the span are not.
-        meterGatewayCall({ appId: entry.appId, capability: "llm", outcome: "quota_blocked" });
-        meterAdmissionDenied({ appId: entry.appId, capability: "llm", reason });
-        trace.getActiveSpan()?.setAttribute(ATTR_REASON, reason);
-        const decision = rt.denialThrottle
-          ? await rt.denialThrottle.admit(entry.appId, caller.env, "llm")
-          : { meter: true as const, suppressedAt: undefined };
-        if (decision.suppressedAt !== undefined) {
-          req.log.warn(
-            { appId: entry.appId, env: caller.env, attempts: decision.suppressedAt },
-            "quota-denial metering suppressed: this app is over its denial budget for the window",
-          );
-        }
-        if (decision.meter) {
-          await usage
-            .record({
-              appId: entry.appId,
-              env: caller.env,
-              ...identity,
-              capability: "llm",
-              model: chat.model,
-              inputTokens: 0,
-              outputTokens: 0,
-              costMicroUsd: 0,
-              outcome: "quota_blocked",
-            })
-            .catch(() => {});
-        }
+        await recordDenial(reason);
         // Day cap is the harder stop ("done for the day"); prefer its message.
         if (overDay) {
           codec.error(reply, 429, "quota_exceeded", "daily spend budget exhausted");
         } else {
           codec.error(reply, 429, "rate_limited", "burst spend budget exhausted — retry shortly");
         }
+        return;
+      }
+    }
+
+    // Platform ceiling after the per-app gate: overshoot is at most the ceiling plus
+    // calls admitted before the per-replica cache (PLATFORM_SPEND_CACHE_MS) catches up.
+    if (rt.platformCeilingDollars > 0) {
+      let platform: LlmSpend;
+      try {
+        platform = await usage.platformLlmSpendMicroUsd(caller.env);
+      } catch (err) {
+        req.log.warn(
+          { err, event: "gateway.platform_spend_unavailable" },
+          "platform spend read failed",
+        );
+        reply.header("retry-after", "5");
+        codec.error(reply, 503, "capability_unavailable", "platform budget check unavailable");
+        return;
+      }
+      if (platform.todayMicro >= rt.platformCeilingDollars * 1_000_000) {
+        await recordDenial("platform_ceiling", "platform_ceiling");
+        reply.header("retry-after", String(secondsUntilNextLocalMidnight()));
+        codec.error(
+          reply,
+          503,
+          "capability_unavailable",
+          "platform LLM budget exhausted for today",
+        );
         return;
       }
     }

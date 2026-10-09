@@ -41,6 +41,7 @@ export const INSTR_EGRESS_UPSTREAM_ABORTS = "helix.egress.upstream_aborts";
 export const INSTR_APP_VISITS = "helix.app.visits";
 export const INSTR_GATEWAY_CUT_CHARGES = "helix.gateway.cut_charges";
 export const INSTR_GATEWAY_ADMISSION_DENIED = "helix.gateway.admission_denied";
+export const INSTR_GATEWAY_PLATFORM_SPEND_RATIO = "helix.gateway.platform_spend_ratio";
 
 /**
  * Attribute keys.
@@ -231,7 +232,11 @@ export type SessionDenialReason = (typeof SESSION_DENIAL_REASONS)[number];
  * refusal branches in `apps/edge/src/gateway/llm.ts`, and a test asserts the set.
  * `app_budget_day` and `app_budget_burst` are the per-app USD windows.
  */
-export const ADMISSION_DENIAL_REASONS = ["app_budget_day", "app_budget_burst"] as const;
+export const ADMISSION_DENIAL_REASONS = [
+  "app_budget_day",
+  "app_budget_burst",
+  "platform_ceiling",
+] as const;
 export type AdmissionDenialReason = (typeof ADMISSION_DENIAL_REASONS)[number];
 
 /**

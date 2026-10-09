@@ -14,6 +14,9 @@ import { HttpEgressProvider, type EgressProvider } from "./gateway/egressProvide
 import { deriveInstructionKey } from "./gateway/instruction.js";
 import { HttpPortalProvider, type PortalProvider } from "./routing/portalProvider.js";
 import { PgUsageStore, type UsageStore } from "./gateway/usage.js";
+import { ATTR_ENV } from "@azx-pbc/shared/telemetry";
+import type { ObservableResult } from "@opentelemetry/api";
+import { instruments } from "./telemetry.js";
 import { PgAppDataStore, type AppDataStore } from "./gateway/data.js";
 import { IpRateLimiter } from "./gateway/ipRateLimiter.js";
 import { LoginThrottle } from "./auth/loginThrottle.js";
@@ -273,6 +276,9 @@ const counterSweep = setInterval(() => {
 }, counterSweepMs);
 counterSweep.unref();
 app.addHook("onClose", async () => {
+  if (observePlatformSpendRatio) {
+    instruments().platformSpendRatio.removeCallback(observePlatformSpendRatio);
+  }
   sweeper?.stop();
   clearInterval(counterSweep);
   oidc?.stop();
@@ -299,6 +305,33 @@ app.addHook("onClose", async () => {
 // (`@azx-pbc/shared/lifecycle`, not the barrel — that one is browser-consumed.)
 installGracefulShutdown(app, app.log);
 
+const pgUsage = usage instanceof PgUsageStore ? usage : null;
+let observePlatformSpendRatio: ((result: ObservableResult) => void) | null = null;
+if (config.llm.platformDollarsPerDay > 0 && pgUsage) {
+  const check = await pgUsage.checkPlatformSpendFunction();
+  if (check.status === "misconfigured") {
+    throw new Error(
+      `platform LLM ceiling is enabled but the database is misconfigured: ${check.problem}`,
+    );
+  }
+  if (check.status === "unreachable") {
+    app.log.warn(
+      { err: check.error, event: "platform_ceiling.selftest_unreachable" },
+      "platform ceiling self-test could not reach the database; per-call reads fail closed",
+    );
+  }
+  const ratioGauge = instruments().platformSpendRatio;
+  observePlatformSpendRatio = (result: ObservableResult): void => {
+    const spend = pgUsage.peekPlatformSpend("prod");
+    if (spend) {
+      result.observe(spend.todayMicro / (config.llm.platformDollarsPerDay * 1_000_000), {
+        [ATTR_ENV]: "prod",
+      });
+    }
+  };
+  ratioGauge.addCallback(observePlatformSpendRatio);
+}
+
 try {
   // First load attempt completes before we accept traffic; a down DB logs and
   // retries rather than blocking boot (LiveRegistry.start never throws, and
@@ -316,6 +349,7 @@ try {
       allowPublicApps: config.allowPublicApps,
       allowPasswordApps: config.allowPasswordApps,
       llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
+      llmPlatformDollarsPerDay: config.llm.platformDollarsPerDay,
       tls: https !== null,
       // Free, and it answers "why do I have no traces" without an exec into
       // the container — the commonest first question about a telemetry

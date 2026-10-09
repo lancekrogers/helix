@@ -214,6 +214,12 @@ export class FakeUsageStore implements UsageStore {
   spendTodayMicro?: number;
   /** Override to force the rolling-hour burst gate (micro-USD); else summed live. */
   spendHourMicro?: number;
+  /** Override platform-wide today spend (micro-USD); else sum of every `llm` record. */
+  platformSpendTodayMicro?: number;
+  /** Override platform-wide hour spend (micro-USD); else same default as today. */
+  platformSpendHourMicro?: number;
+  /** When set, `platformLlmSpendMicroUsd` rejects with this error. */
+  platformReadError?: Error;
 
   async llmSpendMicroUsd(): Promise<LlmSpend> {
     const summed = this.records
@@ -222,6 +228,17 @@ export class FakeUsageStore implements UsageStore {
     return {
       todayMicro: this.spendTodayMicro ?? summed,
       hourMicro: this.spendHourMicro ?? summed,
+    };
+  }
+
+  async platformLlmSpendMicroUsd(env: Env): Promise<LlmSpend> {
+    if (this.platformReadError) throw this.platformReadError;
+    const summed = this.records
+      .filter((r) => r.capability === "llm" && r.env === env)
+      .reduce((n, r) => n + (r.costMicroUsd ?? 0), 0);
+    return {
+      todayMicro: this.platformSpendTodayMicro ?? summed,
+      hourMicro: this.platformSpendHourMicro ?? summed,
     };
   }
 

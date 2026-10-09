@@ -21,6 +21,7 @@ import {
 } from "../test/fakes.js";
 import { LlmProviderError } from "./provider.js";
 import { ERROR_DETAIL_MAX } from "./usage.js";
+import { secondsUntilNextLocalMidnight } from "./llm.js";
 
 /**
  * The `/_api/llm/chat` gateway (architecture §6.1, project plan §4 M4): authn,
@@ -47,6 +48,7 @@ function buildLlmEdge(
     llm?: { models: string[]; dollarsPerDay?: number } | null;
     withProvider?: boolean;
     defaultDollarsPerDay?: number;
+    platformCeilingDollars?: number;
   } = {},
 ): LlmEdge {
   const sessions = new FakeSessionStore();
@@ -69,6 +71,7 @@ function buildLlmEdge(
           connection: "openai",
         },
         defaultDollarsPerDay: opts.defaultDollarsPerDay ?? 50,
+        platformDollarsPerDay: opts.platformCeilingDollars ?? 0,
       },
     }),
     registry: new FakeRegistry([
@@ -990,5 +993,186 @@ describe("/_api/llm/chat over a real socket", () => {
     });
     expect(edge.provider.sawAbort).toBe(false);
     expect(edge.usage.records[0]?.outcome).toBe("ok");
+  });
+});
+
+describe("secondsUntilNextLocalMidnight", () => {
+  it("returns seconds until local midnight for a mid-day instant", () => {
+    const now = new Date(2026, 5, 15, 12, 0, 0);
+    expect(secondsUntilNextLocalMidnight(now)).toBe(43_200);
+  });
+
+  it("returns at least 1 second just before local midnight", () => {
+    const now = new Date(2026, 5, 15, 23, 59, 59, 500);
+    expect(secondsUntilNextLocalMidnight(now)).toBe(1);
+  });
+});
+
+describe("platform ceiling", () => {
+  it("503s at the ceiling with retry-after and a throttled denial row", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const edge = buildLlmEdge({
+        llm: { models: [MODEL], dollarsPerDay: 10 },
+        platformCeilingDollars: 1,
+      });
+      edge.usage.spendTodayMicro = 0;
+      edge.usage.platformSpendTodayMicro = 1_000_000;
+      const token = await seedSession(edge.sessions);
+      const res = await chat(edge, token, ASK);
+      expect(res.statusCode).toBe(503);
+      expect(res.json().error.code).toBe("capability_unavailable");
+      expect(res.headers["retry-after"]).toBeDefined();
+      const retryAfter = Number(res.headers["retry-after"]);
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+      expect(retryAfter).toBeLessThanOrEqual(86_400);
+      expect(edge.provider.calls).toHaveLength(0);
+      expect(edge.usage.records).toEqual([
+        expect.objectContaining({
+          outcome: "quota_blocked",
+          errorDetail: "platform_ceiling",
+        }),
+      ]);
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
+  it("serves when platform spend is below the ceiling", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 10 },
+      platformCeilingDollars: 2,
+    });
+    edge.usage.platformSpendTodayMicro = 1_000_000;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("ignores the ceiling when it is disabled", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 10 },
+      platformCeilingDollars: 0,
+    });
+    edge.usage.platformSpendTodayMicro = 9_000_000;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("prefers the per-app 429 when both app and platform are over budget", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 1 },
+      platformCeilingDollars: 1,
+    });
+    edge.usage.spendTodayMicro = 1_000_000;
+    edge.usage.platformSpendTodayMicro = 1_000_000;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(429);
+    expect(res.json().error.code).toBe("quota_exceeded");
+  });
+
+  it("throttles platform_ceiling ledger rows but counts every admission denial", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const edge = buildLlmEdge({
+        llm: { models: [MODEL], dollarsPerDay: 10 },
+        platformCeilingDollars: 1,
+      });
+      edge.usage.platformSpendTodayMicro = 1_000_000;
+      const token = await seedSession(edge.sessions);
+      for (let i = 0; i < 25; i += 1) {
+        const res = await chat(edge, token, ASK);
+        expect(res.statusCode).toBe(503);
+      }
+      const blocked = edge.usage.records.filter((r) => r.outcome === "quota_blocked");
+      expect(blocked).toHaveLength(20);
+      const denied = (await telemetry.metrics()).filter(
+        (p) =>
+          p.name === INSTR_GATEWAY_ADMISSION_DENIED &&
+          p.attributes["helix.reason"] === "platform_ceiling",
+      );
+      const totalDenied = denied.reduce((sum, p) => sum + p.value, 0);
+      expect(totalDenied).toBe(25);
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
+  it("503s with retry-after 5 when the platform read fails", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 10 },
+      platformCeilingDollars: 1,
+    });
+    edge.usage.platformReadError = new Error("db down");
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error.code).toBe("capability_unavailable");
+    expect(res.headers["retry-after"]).toBe("5");
+    expect(edge.provider.calls).toHaveLength(0);
+    expect(edge.usage.records).toHaveLength(0);
+  });
+
+  it("counts a cut-stream charge toward the platform sum", async () => {
+    const system = "x".repeat(3000);
+    const body = { ...ASK, stream: false, system };
+    const requestBytes =
+      Buffer.byteLength(system, "utf8") + Buffer.byteLength(ASK.messages[0]!.content, "utf8");
+    const inputTokens = Math.ceil(requestBytes / BYTES_PER_TOKEN);
+    const expectedMicro = Math.round(
+      costUsd({
+        model: body.model,
+        inputTokens,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      }) * 1_000_000,
+    );
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+      platformCeilingDollars: expectedMicro / 1_000_000,
+    });
+    const token = await seedSession(edge.sessions);
+    edge.provider.deltas = Array.from({ length: 50 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    };
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => edge.provider.calls.length === 1, "provider called");
+      ac.abort();
+      await pending;
+      await until(() => edge.usage.records.length === 1, "cut row");
+      const blocked = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify(ASK),
+      });
+      expect(blocked.statusCode).toBe(503);
+      expect(((await blocked.body.json()) as { error: { code: string } }).error.code).toBe(
+        "capability_unavailable",
+      );
+    });
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThanOrEqual(expectedMicro);
   });
 });

@@ -195,7 +195,8 @@ looked up:
 | `helix.registry.load_failures` | counter | `outcome` |
 | `helix.gateway.calls` | counter | `capability`, `outcome`, `appId` |
 | `helix.gateway.cut_charges` | counter | `appId`, `basis` (`measured` / `estimated` / `mixed`; operational only, never reconciled with the ledger. Alert on a high share of `estimated`: it means the vendor is not delivering counts) |
-| `helix.gateway.admission_denied` | counter | `capability`, `reason` (`app_budget_day` / `app_budget_burst`; later gateway reasons are added with the change that introduces them), `appId`. Not gated by the denial throttle, so it counts refusals the ledger drops |
+| `helix.gateway.admission_denied` | counter | `capability`, `reason` (`app_budget_day`, `app_budget_burst`, `platform_ceiling`; later gateway reasons are added with the change that introduces them), `appId`. Not gated by the denial throttle, so it counts refusals the ledger drops |
+| `helix.gateway.platform_spend_ratio` | observable gauge | `env` | Cached platform LLM spend today divided by `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`. Absent until the first successful read. Alert at 80% before the block when wired in Azure (unverified) |
 | `helix.gateway.duration` | histogram (ms) | `capability`, `outcome` |
 | `helix.egress.proxy.duration` | histogram (ms) | `outcome` |
 | `helix.egress.upstream_aborts` | counter | `capability` (`llm` or `fetch`) |

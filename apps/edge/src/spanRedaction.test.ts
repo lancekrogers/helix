@@ -733,6 +733,90 @@ describe("LLM admission denials", () => {
     const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
     expect(llmSpan?.attributes[ATTR_REASON]).toBe("app_budget_day");
   });
+
+  it("never leaks prompt, oid, or URL on a platform ceiling refusal", async () => {
+    const sessions = new FakeSessionStore();
+    const usage = new FakeUsageStore();
+    usage.platformSpendTodayMicro = 2_000_000;
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({
+        auth: testAuthConfig(),
+        allowUnauthenticated: false,
+        llm: {
+          endpoint: "https://api.anthropic.com",
+          path: "/v1/messages",
+          anthropicVersion: "2023-06-01",
+          connection: "anthropic",
+          openai: {
+            endpoint: "https://api.openai.com",
+            path: "/v1/chat/completions",
+            connection: "openai",
+          },
+          defaultDollarsPerDay: 50,
+          platformDollarsPerDay: 1,
+        },
+      }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "deny",
+          blobPrefix: "apps/e/3/",
+          llm: { models: [MODEL], dollarsPerDay: 10 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: new FakeLlmProvider(),
+      usage,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+      },
+    });
+    expect(res.statusCode).toBe(503);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_PROMPT);
+      expect(dump).not.toContain(PLANTED_OID);
+      expect(dump).not.toContain("?");
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(llmSpan?.attributes[ATTR_REASON]).toBe("platform_ceiling");
+  });
 });
 
 describe("cut and failed LLM gateway calls", () => {

@@ -267,6 +267,7 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
           provider: deps.llmProvider ?? null,
           usage: deps.usage ?? null,
           denialThrottle,
+          platformCeilingDollars: config.llm.platformDollarsPerDay,
         }
       : null;
   const handleLlmChat = llmRuntime ? makeLlmHandler(llmRuntime) : null;

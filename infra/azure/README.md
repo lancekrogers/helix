@@ -1095,6 +1095,17 @@ budget that sat _below_ expected spend whenever the firewall was on. The deploy
 echoes both `costBudgetUsd` and `expectedMonthlyUsd` so the pair can be checked
 after any deploy that flips the firewall.
 
+**Enforced LLM ceiling (separate from this budget).** `llmPlatformDollarsPerDay`
+(default `-1`) becomes `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` on the **edge only**
+(not the dev gateway). When unset (`-1`), the effective value is one tenth of
+`platformMonthlyUsdCap`, or `100` when that display line is `0`, so hiding the
+portal watch line does not disable enforcement. Set `0` to switch the ceiling
+off (one-organization installs, ADR-0028). Apply the
+`platform_llm_spend_micro_usd` migration before deploying an edge image that
+enforces it. `modules/alerts.bicep` includes a rule on
+`helix.gateway.admission_denied` with `reason = platform_ceiling` (KQL unverified
+in Azure).
+
 ### Verifying it, which you must do explicitly
 
 `snet-apps` is deny-by-default outbound and the **absence** of an allow rule

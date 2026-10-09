@@ -203,6 +203,12 @@ export interface GatewayConfig {
      * classifier showed the approver. `0` means an unset budget is unlimited.
      */
     defaultDollarsPerDay: number;
+    /**
+     * Platform-wide daily LLM spend ceiling in USD (`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`).
+     * `0` or unset disables enforcement on this process. The dev gateway ignores it
+     * (`helix_dev` has no `EXECUTE` on the aggregate function).
+     */
+    platformDollarsPerDay: number;
   };
   /**
    * Fetch-proxy wiring (M4.5). The policy plane authorizes a `/_api/fetch` call
@@ -782,6 +788,11 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
         env.EDGE_LLM_DEFAULT_DOLLARS_PER_DAY,
         BASELINE_DOLLARS_PER_DAY,
         "EDGE_LLM_DEFAULT_DOLLARS_PER_DAY",
+      ),
+      platformDollarsPerDay: requireNonNegativeNumber(
+        env.EDGE_LLM_PLATFORM_DOLLARS_PER_DAY,
+        0,
+        "EDGE_LLM_PLATFORM_DOLLARS_PER_DAY",
       ),
     },
     fetch: {

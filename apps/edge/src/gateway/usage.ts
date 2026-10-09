@@ -3,6 +3,60 @@ import { type Pool } from "pg";
 import { type Env, type GatewayOutcome } from "@azx-pbc/shared";
 
 import { createEdgePool, type EdgePoolOpts } from "../db/pool.js";
+
+/** Default TTL for cached platform LLM spend reads (per edge replica). */
+export const PLATFORM_SPEND_CACHE_MS = 5_000;
+
+export interface PgUsageStoreOpts extends EdgePoolOpts {
+  /** Platform spend cache TTL; `0` disables caching (tests). */
+  platformCacheMs?: number;
+}
+
+export const PLATFORM_SPEND_CHECK_SQL = `
+  SELECT p.prosecdef AS definer,
+         EXISTS (SELECT 1 FROM pg_policies pol
+                 WHERE pol.schemaname = 'public' AND pol.tablename = 'gateway_calls'
+                   AND pol.policyname = 'gateway_calls_owner_read'
+                   AND pg_get_userbyid(p.proowner) = ANY (pol.roles)) AS owner_policy
+  FROM pg_proc p
+  WHERE p.proname = 'platform_llm_spend_micro_usd' AND p.pronamespace = 'public'::regnamespace`;
+
+export type PlatformSpendCheck =
+  | { status: "ok" }
+  | { status: "misconfigured"; problem: string }
+  | { status: "unreachable"; error: unknown };
+
+type PlatformSpendCheckRow = { definer: boolean; owner_policy: boolean };
+
+export function classifyPlatformSpendCheck(
+  rows: PlatformSpendCheckRow[],
+): Exclude<PlatformSpendCheck, { status: "unreachable" }> {
+  const row = rows[0];
+  if (!row) {
+    return { status: "misconfigured", problem: "platform_llm_spend_micro_usd is missing" };
+  }
+  if (!row.definer) {
+    return {
+      status: "misconfigured",
+      problem: "platform_llm_spend_micro_usd is not SECURITY DEFINER",
+    };
+  }
+  if (!row.owner_policy) {
+    return {
+      status: "misconfigured",
+      problem: "gateway_calls_owner_read does not admit the function owner",
+    };
+  }
+  return { status: "ok" };
+}
+
+function postgresErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
 import { withPartition } from "../db/partition.js";
 import type { PrincipalKind } from "@azx-pbc/shared";
 import { USER_EMAIL_MAX, USER_NAME_MAX, truncate } from "../auth/identity.js";
@@ -244,6 +298,11 @@ export interface UsageStore {
    */
   llmSpendMicroUsd(appId: string, env: Env): Promise<LlmSpend>;
   /**
+   * Platform-wide LLM spend (micro-USD) for one env, from the definer aggregate.
+   * Cached per store instance; throws when the read fails.
+   */
+  platformLlmSpendMicroUsd(env: Env): Promise<LlmSpend>;
+  /**
    * Count of successful app-data **write** calls today (app-data design §7) —
    * the per-app `writesPerDay` budget window. Writes are the put/append verbs
    * (`user.put`, `collection.append`, `shared.put`); reads and quota-blocks
@@ -285,14 +344,75 @@ export const DATA_WRITE_VERBS = ["user.put", "collection.append", "shared.put"] 
 
 export class PgUsageStore implements UsageStore {
   #pool: Pool;
+  #platformCacheMs: number;
+  #platformCache = new Map<Env, { at: number; value: LlmSpend }>();
+  #platformInflight = new Map<Env, Promise<LlmSpend>>();
 
-  constructor(databaseUrl: string, opts: EdgePoolOpts = {}) {
+  constructor(databaseUrl: string, opts: PgUsageStoreOpts = {}) {
     // Spread, don't re-list — see the note in auth/sessions.ts.
     this.#pool = createEdgePool(databaseUrl, {
       ...opts,
       max: opts.max ?? 10,
       label: opts.label ?? "usage",
     });
+    this.#platformCacheMs = opts.platformCacheMs ?? PLATFORM_SPEND_CACHE_MS;
+  }
+
+  peekPlatformSpend(env: Env): LlmSpend | null {
+    return this.#platformCache.get(env)?.value ?? null;
+  }
+
+  async platformLlmSpendMicroUsd(env: Env): Promise<LlmSpend> {
+    if (this.#platformCacheMs > 0) {
+      const hit = this.#platformCache.get(env);
+      if (hit && Date.now() - hit.at < this.#platformCacheMs) return hit.value;
+    }
+    let read = this.#platformInflight.get(env);
+    if (!read) {
+      read = this.#readPlatform(env)
+        .then((value) => {
+          if (this.#platformCacheMs > 0) {
+            this.#platformCache.set(env, { at: Date.now(), value });
+          }
+          return value;
+        })
+        .finally(() => this.#platformInflight.delete(env));
+      this.#platformInflight.set(env, read);
+    }
+    return read;
+  }
+
+  async #readPlatform(env: Env): Promise<LlmSpend> {
+    // Straight on the pool, not withPartition: the function takes the env itself, and a
+    // partition would set an app GUC that means nothing here.
+    const result = await this.#pool.query(
+      "SELECT today, hour FROM platform_llm_spend_micro_usd($1)",
+      [env],
+    );
+    const row = result.rows[0] as { today: string | number; hour: string | number } | undefined;
+    return { todayMicro: row ? Number(row.today) : 0, hourMicro: row ? Number(row.hour) : 0 };
+  }
+
+  async checkPlatformSpendFunction(): Promise<PlatformSpendCheck> {
+    try {
+      const catalog = await this.#pool.query(PLATFORM_SPEND_CHECK_SQL);
+      const classified = classifyPlatformSpendCheck(catalog.rows as PlatformSpendCheckRow[]);
+      if (classified.status === "misconfigured") return classified;
+      await this.#pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
+      return { status: "ok" };
+    } catch (err) {
+      const code = postgresErrorCode(err);
+      if (code === "42501" || code === "42883") {
+        return {
+          status: "misconfigured",
+          problem:
+            code === "42501"
+              ? "helix_edge cannot execute platform_llm_spend_micro_usd"
+              : "platform_llm_spend_micro_usd is not callable",
+        };
+      }
+      return { status: "unreachable", error: err };
+    }
   }
 
   async llmSpendMicroUsd(appId: string, env: Env): Promise<LlmSpend> {

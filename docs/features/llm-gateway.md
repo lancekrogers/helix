@@ -51,6 +51,18 @@ record nothing — see below). The approval classifier cannot see
 edge will enforce the install default — that default may be above the $50 baseline or unlimited
 (`0`). See [capabilities-and-manifests.md](./capabilities-and-manifests.md) for the full rules.
 
+When `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` is positive, the edge also refuses new LLM calls
+platform-wide once the day's summed `costMicroUsd` across all apps reaches that ceiling
+(`503 capability_unavailable`, message "platform LLM budget exhausted for today"), with
+`retry-after` set to seconds until the next local midnight (the same `date_trunc('day', now())`
+window as the per-app gate). The check runs after the per-app gate so an app over its own
+budget still gets `429`. Denials record `quota_blocked` with `errorDetail = platform_ceiling`,
+throttled like other quota refusals, and increment `helix.gateway.admission_denied` with reason
+`platform_ceiling`. Spend is read through a `SECURITY DEFINER` aggregate, cached per edge
+replica for five seconds — overshoot is at most the ceiling plus calls admitted before the
+cache catches up. A failed read fails closed (`503`, `retry-after: 5`). `0` or unset disables
+the ceiling locally; deployed installs receive a Bicep-derived default.
+
 ### Provider seam + streaming
 
 `apps/edge/src/gateway/provider.ts` defines a vendor-agnostic `LlmProvider`:

@@ -43,6 +43,7 @@ function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
         connection: "openai",
       },
       defaultDollarsPerDay: 50,
+      platformDollarsPerDay: 0,
     },
     anonRateLimit: { max: 0, windowMs: 60_000 },
     trustProxy: false,

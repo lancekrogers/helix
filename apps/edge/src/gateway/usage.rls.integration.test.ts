@@ -398,3 +398,104 @@ describe("platform_llm_spend_micro_usd owner policy (non-bypass probe)", () => {
     }
   });
 });
+
+describe("PgUsageStore.platformLlmSpendMicroUsd", () => {
+  const PLATFORM_APP = randomUUID();
+
+  afterAll(async () => {
+    const owner = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+    try {
+      await owner.query(`DELETE FROM gateway_calls WHERE "appId" = $1::uuid`, [PLATFORM_APP]);
+    } finally {
+      await owner.end();
+    }
+  });
+
+  it("returns the cross-app sum as helix_edge", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const owner = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+    const platformStore = new PgUsageStore(edgeUrl(), { max: 2, platformCacheMs: 0 });
+    try {
+      const before = await platformStore.platformLlmSpendMicroUsd("prod");
+      await seedGatewayCost(owner, PLATFORM_APP, "prod", 77_000, "llm");
+      const after = await platformStore.platformLlmSpendMicroUsd("prod");
+      expect(after.todayMicro - before.todayMicro).toBe(77_000);
+    } finally {
+      await owner.end();
+      await platformStore.close();
+    }
+  });
+
+  it("includes error rows with positive costMicroUsd", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const owner = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+    const platformStore = new PgUsageStore(edgeUrl(), { max: 2, platformCacheMs: 0 });
+    try {
+      const before = await platformStore.platformLlmSpendMicroUsd("prod");
+      await owner.query(
+        `INSERT INTO gateway_calls (id, "appId", env, "userOid", capability, model, outcome, "costMicroUsd")
+         VALUES (gen_random_uuid(), $1, 'prod', 'seed', 'llm', 'm', 'error', 42_000)`,
+        [PLATFORM_APP],
+      );
+      const after = await platformStore.platformLlmSpendMicroUsd("prod");
+      expect(after.todayMicro - before.todayMicro).toBe(42_000);
+    } finally {
+      await owner.end();
+      await platformStore.close();
+    }
+  });
+
+  it("serves a cached value inside the TTL", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const owner = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+    const platformStore = new PgUsageStore(edgeUrl(), { max: 2, platformCacheMs: 60_000 });
+    try {
+      const first = await platformStore.platformLlmSpendMicroUsd("prod");
+      await seedGatewayCost(owner, PLATFORM_APP, "prod", 1, "llm");
+      const second = await platformStore.platformLlmSpendMicroUsd("prod");
+      expect(second).toEqual(first);
+    } finally {
+      await owner.end();
+      await platformStore.close();
+    }
+  });
+
+  it("re-reads when caching is disabled", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const owner = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+    const platformStore = new PgUsageStore(edgeUrl(), { max: 2, platformCacheMs: 0 });
+    try {
+      const before = await platformStore.platformLlmSpendMicroUsd("prod");
+      await seedGatewayCost(owner, PLATFORM_APP, "prod", 5, "llm");
+      const after = await platformStore.platformLlmSpendMicroUsd("prod");
+      expect(after.todayMicro).toBe(before.todayMicro + 5);
+    } finally {
+      await owner.end();
+      await platformStore.close();
+    }
+  });
+
+  it("single-flights concurrent reads", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const platformStore = new PgUsageStore(edgeUrl(), { max: 2, platformCacheMs: 0 });
+    try {
+      const [a, b] = await Promise.all([
+        platformStore.platformLlmSpendMicroUsd("prod"),
+        platformStore.platformLlmSpendMicroUsd("prod"),
+      ]);
+      expect(a).toEqual(b);
+    } finally {
+      await platformStore.close();
+    }
+  });
+
+  it("checkPlatformSpendFunction returns ok on a migrated database", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const platformStore = new PgUsageStore(edgeUrl(), { max: 1 });
+    try {
+      expect(await platformStore.checkPlatformSpendFunction()).toEqual({ status: "ok" });
+    } finally {
+      await platformStore.close();
+    }
+  });
+});

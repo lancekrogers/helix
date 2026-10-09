@@ -68,7 +68,11 @@ describe("the telemetry vocabulary", () => {
     expect(new Set(SESSION_DENIAL_REASONS).size).toBe(SESSION_DENIAL_REASONS.length);
     expect([...REGISTRY_LOAD_OUTCOMES]).toEqual(["failed", "never_loaded"]);
     expect([...CUT_CHARGE_BASES]).toEqual(["measured", "estimated", "mixed"]);
-    expect([...ADMISSION_DENIAL_REASONS]).toEqual(["app_budget_day", "app_budget_burst"]);
+    expect([...ADMISSION_DENIAL_REASONS]).toEqual([
+      "app_budget_day",
+      "app_budget_burst",
+      "platform_ceiling",
+    ]);
   });
 
   it("keeps the consent-start outcome vocabulary bounded and duplicate-free", () => {

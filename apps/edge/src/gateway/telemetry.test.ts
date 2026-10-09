@@ -8,8 +8,11 @@ import {
   INSTR_GATEWAY_CALLS,
   INSTR_GATEWAY_CUT_CHARGES,
   INSTR_GATEWAY_DURATION,
+  INSTR_GATEWAY_PLATFORM_SPEND_RATIO,
+  ATTR_ENV,
 } from "@azx-pbc/shared/telemetry";
 import { meterAdmissionDenied, meterCutCharge, meterGatewayCall } from "./usage.js";
+import { instruments } from "../telemetry.js";
 
 /**
  * `helix.gateway.calls` / `helix.gateway.duration` (ADR-0037 decision 8).
@@ -127,6 +130,24 @@ describe("meterGatewayCall", () => {
       expect(ADMISSION_DENIAL_REASONS).toContain(point.attributes["helix.reason"]);
       expect(Object.keys(point.attributes)).not.toContain("helix.user_oid");
     }
+  });
+
+  it("observes platform spend ratio with helix.env only", async () => {
+    recording = startRecordingTelemetry();
+    const gauge = instruments().platformSpendRatio;
+    const observe = (result: {
+      observe: (value: number, attrs: Record<string, string>) => void;
+    }): void => {
+      result.observe(0.42, { [ATTR_ENV]: "prod" });
+    };
+    gauge.addCallback(observe);
+    const points = (await recording.metrics()).filter(
+      (p) => p.name === INSTR_GATEWAY_PLATFORM_SPEND_RATIO,
+    );
+    gauge.removeCallback(observe);
+    expect(points).toHaveLength(1);
+    expect(points[0]?.value).toBe(0.42);
+    expect(Object.keys(points[0]!.attributes).sort()).toEqual(["helix.env"]);
   });
 
   it("only ever emits outcomes from the ledger's own vocabulary", async () => {

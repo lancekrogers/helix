@@ -54,12 +54,16 @@ param postgresStorageSizeGB int = 32
 @description('Public apps domain, e.g. azx.helix.azxlabs.io.')
 param appsDomain string = 'azx.helix.azxlabs.io'
 
-@description('Display-only month-to-date platform spend watch line in USD, surfaced on the admin Activity page via GET /api/v1/config. Defaults to 1000 so an install gets a budget signal without being configured for one; set 0 to show no ceiling. Nothing enforces this — per-app daily token budgets are the real limit.')
+@description('Display-only month-to-date platform spend watch line in USD, surfaced on the admin Activity page via GET /api/v1/config. Defaults to 1000 so an install gets a budget signal without being configured for one; set 0 to show no ceiling. The enforced daily LLM ceiling on the edge defaults to one tenth of this value (see llmPlatformDollarsPerDay).')
 param platformMonthlyUsdCap int = 1000
 
 @description('Daily LLM spend budget in USD applied to any app whose manifest sets no dollarsPerDay (EDGE_LLM_DEFAULT_DOLLARS_PER_DAY on the edge and dev gateway). Mirrors BASELINE_DOLLARS_PER_DAY (50) in packages/shared/src/approval.ts; raising it enforces more than the approval classifier showed the approver. 0 = an unset budget is unlimited.')
 @minValue(0)
 param llmDefaultDollarsPerDay int = 50
+
+@description('Platform-wide daily LLM spend ceiling in USD, enforced by the edge (EDGE_LLM_PLATFORM_DOLLARS_PER_DAY): once the day\'s spend across all apps reaches it, new LLM calls are refused with 503 until local midnight. -1 (default) derives one tenth of platformMonthlyUsdCap (100 when platformMonthlyUsdCap is 0, so hiding the portal watch line does not switch enforcement off). 0 switches the ceiling off, for a one-organization install (ADR-0028). Needs the platform_llm_spend_micro_usd migration applied before the edge image.')
+@minValue(-1)
+param llmPlatformDollarsPerDay int = -1
 
 @description('Max uncompressed size in MB of any single file in a deployed bundle.')
 param deployMaxFileMb int = 50
@@ -739,6 +743,7 @@ var portalBaseUrl = 'https://${portalApp.?outputs.fqdn ?? ''}'
 // One value for every hop that caps /_api/fetch bodies. A hop left at its code
 // default (10 MiB) keeps answering 413 above that, whatever the others allow.
 var fetchMaxBodyBytes = string(fetchMaxBodyMb * 1024 * 1024)
+var effectiveLlmPlatformDollarsPerDay = llmPlatformDollarsPerDay >= 0 ? llmPlatformDollarsPerDay : (platformMonthlyUsdCap > 0 ? max(1, platformMonthlyUsdCap / 10) : 100)
 
 // Base for the apps' ACA Key Vault references (vaultUri ends in '/').
 // Versionless on purpose: rotation becomes "write the vault" and ACA picks the
@@ -1233,6 +1238,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_LLM_OPENAI_PATH', value: llm.openaiPath }
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
       { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
+      { name: 'EDGE_LLM_PLATFORM_DOLLARS_PER_DAY', value: string(effectiveLlmPlatformDollarsPerDay) }
       // Behind ACA's Envoy ingress the socket peer is the ingress, so the
       // per-IP anon rate limiter and the password-login throttle need the
       // ingress address named to recover the real client IP (issue #13). See
