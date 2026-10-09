@@ -906,6 +906,49 @@ describe("app_visits: write-only from the edge, pinned to its partition (ADR-005
   });
 });
 
+describe("inflight_leases: edge-owned lease slots (ADR-0002 amendment)", () => {
+  const leaseId = randomUUID();
+  const leaseScope = `rs-lease-${randomUUID()}`;
+  const insert = `INSERT INTO inflight_leases (id, scope, "expiresAt")
+                  VALUES ($1::uuid, $2, now() + interval '1 minute')`;
+  const deleteRow = `DELETE FROM inflight_leases WHERE id = $1::uuid`;
+
+  it("helix_portal, helix_egress, and helix_dev cannot read inflight_leases", async () => {
+    for (const [available, url] of [
+      [portalRoleAvailable, portalUrl],
+      [egressRoleAvailable, egressUrl],
+      [devRoleAvailable, devUrl],
+    ] as const) {
+      if (!(await available())) continue;
+      const pool = new Pool({ connectionString: url(), max: 1 });
+      try {
+        await expect(pool.query("SELECT count(*) FROM inflight_leases")).rejects.toThrow(
+          /permission denied/i,
+        );
+      } finally {
+        await pool.end();
+      }
+    }
+  });
+
+  it("helix_edge can SELECT, INSERT, and DELETE but not UPDATE", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const pool = new Pool({ connectionString: edgeUrl(), max: 1 });
+    try {
+      await expect(pool.query(insert, [leaseId, leaseScope])).resolves.toBeDefined();
+      await expect(
+        pool.query("SELECT count(*) FROM inflight_leases WHERE scope = $1", [leaseScope]),
+      ).resolves.toBeDefined();
+      await expect(
+        pool.query(`UPDATE inflight_leases SET scope = 'x' WHERE id = $1::uuid`, [leaseId]),
+      ).rejects.toThrow(/permission denied/i);
+      await expect(pool.query(deleteRow, [leaseId])).resolves.toBeDefined();
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
 describe("platform_llm_spend_micro_usd: EXECUTE grant (ADR-0002 amendment)", () => {
   const call = `SELECT * FROM platform_llm_spend_micro_usd('prod')`;
 

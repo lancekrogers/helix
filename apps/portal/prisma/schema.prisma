@@ -394,6 +394,21 @@ model InstructionJti {
   @@map("instruction_jti")
 }
 
+/// In-flight call leases behind the edge's per-app and per-user concurrency caps. **Edge-written
+/// data**: the edge inserts one row per scope per admitted call (apps/edge/src/gateway/leaseStore.ts)
+/// and deletes them when the call ends. A row also expires at `expiresAt`, so a replica that dies
+/// leaks a slot only until then. No RLS: `scope` embeds the app id, the way rate_counters keys
+/// do. `helix_edge` has SELECT+INSERT+DELETE; every other role is carved out.
+model InflightLease {
+  id        String   @db.Uuid
+  scope     String
+  expiresAt DateTime
+
+  @@id([id, scope])
+  @@index([scope, expiresAt])
+  @@map("inflight_leases")
+}
+
 /// Per-user / per-app key-value store (architecture §6.1, app-data design
 /// §3.1/§3.3). **Edge-written data**, like sessions/gateway_calls: the edge
 /// reads & writes ONLY rows whose partition key is the caller's own
