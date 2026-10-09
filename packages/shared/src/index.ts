@@ -16,6 +16,7 @@ export * from "./scrypt.js";
 export * from "./llm.js";
 export * from "./llmOpenai.js";
 export * from "./pricing.js";
+export * from "./usageEstimate.js";
 export * from "./usage.js";
 export * from "./visitors.js";
 export * from "./data.js";

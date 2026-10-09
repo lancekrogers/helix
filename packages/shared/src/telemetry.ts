@@ -256,6 +256,15 @@ export const PROVIDERS_RECONCILE_OUTCOMES = ["ok", "failed"] as const;
 export type ProvidersReconcileOutcome = (typeof PROVIDERS_RECONCILE_OUTCOMES)[number];
 
 /**
+ * How a cut or failed LLM call's charge was derived: the `helix.usage.basis` span
+ * attribute and the `helix.gateway.cut_charges` dimension. `measured`: both counts
+ * came from the vendor's usage block. `estimated`: both came from byte counts.
+ * `mixed`: one of each (for example a measured input and an estimated output).
+ */
+export const CUT_CHARGE_BASES = ["measured", "estimated", "mixed"] as const;
+export type CutChargeBasis = (typeof CUT_CHARGE_BASES)[number];
+
+/**
  * Why a `shared` list call was denied — the {@link ATTR_REASON} value on the
  * `helix.gateway.data` span, separating the deny path from an empty result
  * (ADR-0042 decision 7). Bounded by construction: these are the authorization
