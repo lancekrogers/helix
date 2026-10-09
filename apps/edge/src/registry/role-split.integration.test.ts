@@ -905,3 +905,33 @@ describe("app_visits: write-only from the edge, pinned to its partition (ADR-005
     }
   });
 });
+
+describe("platform_llm_spend_micro_usd: EXECUTE grant (ADR-0002 amendment)", () => {
+  const call = `SELECT * FROM platform_llm_spend_micro_usd('prod')`;
+
+  it("helix_edge can execute the platform spend aggregate", async () => {
+    if (!(await edgeRoleAvailable())) return;
+    const pool = new Pool({ connectionString: edgeUrl(), max: 1 });
+    try {
+      await expect(pool.query(call)).resolves.toBeDefined();
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it("helix_portal, helix_egress, and helix_dev cannot execute it", async () => {
+    for (const [available, url] of [
+      [portalRoleAvailable, portalUrl],
+      [egressRoleAvailable, egressUrl],
+      [devRoleAvailable, devUrl],
+    ] as const) {
+      if (!(await available())) continue;
+      const pool = new Pool({ connectionString: url(), max: 1 });
+      try {
+        await expect(pool.query(call)).rejects.toThrow(/permission denied/i);
+      } finally {
+        await pool.end();
+      }
+    }
+  });
+});

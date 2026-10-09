@@ -59,3 +59,31 @@ redeem UPDATE stays edge-only by grant, not just by convention. Same carve-out m
 `20260721120000` (which made `gateway_calls` append-only for every runtime role). Pinned in
 `role-split.integration.test.ts`; the kill's effect on the edge's uncached lookup is asserted in
 `sessions.rls.integration.test.ts`.
+
+## Amendment (2026-10-09): the platform spend aggregate
+
+Migration `20261009223800_platform_llm_spend_definer` adds `platform_llm_spend_micro_usd(p_env text)`, a
+`SECURITY DEFINER` SQL function with `SET search_path = pg_catalog, public`. It returns two
+aggregates — `today` and `hour`, both in micro-USD — summing `gateway_calls."costMicroUsd"` for
+`capability = 'llm'` in the requested env over the same day and rolling-hour windows the per-app
+budget uses (`PgUsageStore.llmSpendMicroUsd`). It exposes no per-app breakdown. `EXECUTE` is
+revoked from `PUBLIC` and granted to `helix_edge` only; `helix_dev` has no grant (the dev gateway
+does not enforce the platform ceiling).
+
+`gateway_calls` uses `FORCE ROW LEVEL SECURITY`, so the table owner is subject to RLS like any
+other role. Every existing policy is scoped to a runtime role, so a definer function owned by the
+migration role would match no policy and return zero rows — silently disabling a platform ceiling.
+The migration therefore adds `gateway_calls_owner_read` (`FOR SELECT TO <migration owner> USING
+(true)`), with the role name bound at apply time via `format('%I', current_user)`. Production
+migrations run as `helixadmin` (`postgresAdminLogin` in `infra/azure/main.bicep`); the dev
+container runs them as `helix` (the `POSTGRES_USER` object owner).
+
+This does not widen the RCE boundary stated in **Framing (2026-07-21)**: an edge compromise can
+already `set_config('app.app_id', …)` and read any app's metering rows one partition at a time.
+The function returns only a platform-wide aggregate to the same role; grant absence on
+`app_secrets` and registry writes remains the real containment. Pinned in
+`usage.rls.integration.test.ts` (including a non-superuser owner probe that fails closed when the
+owner policy is removed) and `role-split.integration.test.ts`.
+
+A follow-on migration in the same hardening sequence will record `inflight_leases` grants here as
+well once the lease store lands.
