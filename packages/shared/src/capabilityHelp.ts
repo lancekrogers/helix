@@ -82,10 +82,13 @@ const ENTRIES: Record<string, CapabilityHelp> = {
   "llm.dollarsPerDay": {
     title: "LLM spend budget",
     grants:
-      "Caps the app's daily LLM spend at the requested amount. Removing the cap means unlimited.",
-    risks: ["The cap is a ceiling, not a prediction — a runaway loop can burn up to it every day."],
+      "Caps the app's daily LLM spend at the requested amount. Removing the cap falls back to the install default (often $50/day, unless the operator changed it).",
+    risks: [
+      "The cap is a ceiling, not a prediction — a runaway loop can burn up to it every day.",
+      "Without a cap, spend is bounded only by that install default — which may be higher than $50/day or unlimited on some deployments.",
+    ],
     riskWhy:
-      "Spend above the $50/day baseline is a human accepting a larger worst-case daily bill.",
+      "Removing a cap can raise the worst-case daily bill above what was approved; spend above the $50/day baseline also needs a human look.",
   },
 
   "data.user": {

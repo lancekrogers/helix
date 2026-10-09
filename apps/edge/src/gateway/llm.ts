@@ -41,7 +41,8 @@ import { withRootSpan } from "../telemetry.js";
  * project plan §4 M4). The choke point that makes per-app blast-radius real:
  * it authenticates the user (session gate), proves the request came from the
  * app's own origin (CSRF — §4.2), enforces the per-app model allowlist and
- * daily spend budget from the manifest (§6.3), proxies to the vendor through
+ * daily spend budget from the manifest or install default (§6.3), proxies to the
+ * vendor through
  * the `LlmProvider` seam (the app never sees the key), and meters every call.
  *
  * Quota is **block-new, finish-in-flight**: the budget is checked once at
@@ -197,8 +198,10 @@ export function makeLlmHandler(
     // request is never cut — including when the client hangs up or a deadline
     // fires; those are not quota cuts. Both windows read the frozen costMicroUsd column.
     const usage = rt.usage;
-    const cap = entry.llm.dollarsPerDay;
-    if (cap !== undefined) {
+    // An unset budget is the install default, never unlimited. 0 is the operator's explicit
+    // "no default" (a one-organization install, ADR-0028).
+    const cap = entry.llm.dollarsPerDay ?? rt.config.llm.defaultDollarsPerDay;
+    if (cap > 0) {
       const capMicro = cap * 1_000_000;
       const { todayMicro, hourMicro } = await usage.llmSpendMicroUsd(entry.appId, caller.env);
       const overDay = todayMicro >= capMicro;

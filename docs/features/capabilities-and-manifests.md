@@ -149,9 +149,14 @@ Two invariants keep it safe without being annoying (`docs/design/approvals.md` �
 - **Reducing privilege is always baseline** — removing a grant, shrinking a budget, public→internal
   never needs approval; only increases gate. For visibility the rule is really *crossing the tenant
   boundary*: `group → internal` widens access and is still baseline, because `internal` is the
-  baseline trust level and the default. Subtle corollary: an **unset budget is unlimited**
-  (the edge only enforces a defined cap), so *removing* a cap is a privilege increase and gates,
-  while *adding* one is a reduction and commits.
+  baseline trust level and the default. **LLM spend cap:** at the edge, an unset
+  `dollarsPerDay` is enforced at the install default (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`, $50/day
+  unless changed). The classifier cannot read that knob, so a *requested* unset cap is treated as
+  possibly unlimited and *removing* an explicit LLM cap gates; *adding* a cap (including unset →
+  any number) is a reduction and commits when the new cap is at or under the $50 baseline. **Unset
+  data and fetch budgets** remain unlimited (those paths only enforce a defined cap), so removing
+  those caps is still a privilege increase and gates, while *adding* any budget is a reduction and
+  commits.
 - **Any elevated part makes the whole submission one atomic request** (the reviewer sees the full
   diff), with `risk` = the max across its deltas.
 

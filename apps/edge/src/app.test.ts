@@ -42,6 +42,7 @@ function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
         path: "/v1/chat/completions",
         connection: "openai",
       },
+      defaultDollarsPerDay: 50,
     },
     anonRateLimit: { max: 0, windowMs: 60_000 },
     trustProxy: false,

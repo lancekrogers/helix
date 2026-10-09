@@ -208,6 +208,7 @@ try {
       service: SERVICE_NAME,
       port: config.devGateway.port,
       baseDomain: config.baseDomain,
+      llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
       tls: https !== null,
       telemetry: telemetry.enabled,
     },

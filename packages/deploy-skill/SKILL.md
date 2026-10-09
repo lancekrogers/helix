@@ -144,7 +144,7 @@ you did not declare returns `403` — that is the expected failure, not a bug.
   "capabilities": {
     "llm": {
       "models": ["claude-haiku-4-5"], // exact ids; anything else is 403 model_not_allowed
-      "dollarsPerDay": 5 // daily spend cap in USD; omit for unbounded
+      "dollarsPerDay": 5 // daily spend cap in USD; omit for the install default
     },
     "data": {
       "user": true, // per-user private store

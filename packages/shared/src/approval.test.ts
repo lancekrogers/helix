@@ -57,7 +57,7 @@ describe("classifyChange — LLM", () => {
     expect(paths(over.elevatedDeltas)).toEqual(["llm.dollarsPerDay"]);
   });
 
-  it("treats removing a spend cap (→ unlimited) as elevated", () => {
+  it("elevates removing an LLM spend cap (requested unset may exceed install default)", () => {
     const eff: Capabilities = {
       mcp: [],
       externalOrigins: [],
@@ -65,9 +65,10 @@ describe("classifyChange — LLM", () => {
     };
     const r = classifyChange(eff, { mcp: [], externalOrigins: [], llm: { models: [] } });
     expect(paths(r.elevatedDeltas)).toEqual(["llm.dollarsPerDay"]);
+    expect(r.baselineDeltas).toHaveLength(0);
   });
 
-  it("treats adding a cap (unlimited → capped) as baseline privilege reduction", () => {
+  it("treats adding a cap (unset default → capped) as baseline privilege reduction", () => {
     const eff: Capabilities = { mcp: [], externalOrigins: [], llm: { models: [] } };
     const r = classifyChange(eff, {
       mcp: [],
@@ -90,6 +91,72 @@ describe("classifyChange — LLM", () => {
       llm: { models: [], dollarsPerDay: BASELINE_DOLLARS_PER_DAY * 2 },
     });
     expect(r.elevatedDeltas).toHaveLength(0);
+  });
+
+  it("classifies unset LLM budget changes against the install default", () => {
+    const to100 = classifyChange(EMPTY, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: [], dollarsPerDay: 100 },
+    });
+    expect(paths(to100.elevatedDeltas)).toEqual(["llm.dollarsPerDay"]);
+
+    const to50 = classifyChange(EMPTY, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: [], dollarsPerDay: BASELINE_DOLLARS_PER_DAY },
+    });
+    expect(to50.elevatedDeltas).toHaveLength(0);
+
+    const unsetGrant: Capabilities = { mcp: [], externalOrigins: [], llm: { models: [] } };
+    const stillUnset = classifyChange(unsetGrant, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: [] },
+    });
+    expect(stillUnset.baselineDeltas).toHaveLength(0);
+    expect(stillUnset.elevatedDeltas).toHaveLength(0);
+  });
+
+  it("still treats removing data and fetch caps as elevated (unset remains unlimited)", () => {
+    const dataEff: Capabilities = {
+      mcp: [],
+      externalOrigins: [],
+      data: {
+        user: true,
+        collections: [],
+        sharedRead: [],
+        sharedWrite: [],
+        sharedReadPrefixes: [],
+        sharedWritePrefixes: [],
+        writesPerDay: 500,
+      },
+    };
+    const dataR = classifyChange(dataEff, {
+      mcp: [],
+      externalOrigins: [],
+      data: {
+        user: true,
+        collections: [],
+        sharedRead: [],
+        sharedWrite: [],
+        sharedReadPrefixes: [],
+        sharedWritePrefixes: [],
+      },
+    });
+    expect(paths(dataR.elevatedDeltas)).toEqual(["data.writesPerDay"]);
+
+    const fetchEff: Capabilities = {
+      mcp: [],
+      externalOrigins: [],
+      fetch: { shim: false, origins: [], requestsPerDay: 500 },
+    };
+    const fetchR = classifyChange(fetchEff, {
+      mcp: [],
+      externalOrigins: [],
+      fetch: { shim: false, origins: [] },
+    });
+    expect(paths(fetchR.elevatedDeltas)).toEqual(["fetch.requestsPerDay"]);
   });
 });
 
@@ -777,7 +844,7 @@ describe("applyDeltas", () => {
     expect(applied.mcp).toEqual([]); // pagerduty stays out until approved
   });
 
-  it("applies scalar removal (cap removed)", () => {
+  it("applies scalar removal (LLM cap removed to install default) from elevated bundle", () => {
     const eff: Capabilities = {
       mcp: [],
       externalOrigins: [],

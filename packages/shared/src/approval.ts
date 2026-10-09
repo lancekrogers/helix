@@ -236,15 +236,22 @@ export interface ClassifyResult {
 /**
  * Budget privilege, ordered least→most permissive:
  *  - no grant at all (`llm`/`data` absent) ⇒ 0 — the edge 403s without the grant.
- *  - grant present, budget unset ⇒ +∞ — the edge only enforces a defined budget
- *    (`llm.ts` / `data-handler.ts`), so an unset cap is unlimited.
+ *  - grant present, budget unset ⇒ `unsetMeans` (data/fetch: +∞; LLM uses
+ *    asymmetric defaults in `classifyDeltas` — see below).
  *  - grant present, budget = n ⇒ n.
- * Removing a cap (n → unset) is therefore a privilege increase; adding one
- * (unset → n) is a reduction.
+ * LLM cap deltas compare requested unset as +∞ (the portal cannot read
+ * `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`, so a removed cap may land unlimited or
+ * above baseline) against effective unset as `BASELINE_DOLLARS_PER_DAY` (what
+ * the edge enforces when the install default is unchanged). Data/fetch still
+ * treat unset as +∞ on both sides, so removing those caps is a privilege increase.
  */
-function budgetPrivilege(hasGrant: boolean, v: number | undefined): number {
+function budgetPrivilege(
+  hasGrant: boolean,
+  v: number | undefined,
+  unsetMeans: number = Number.POSITIVE_INFINITY,
+): number {
   if (!hasGrant) return 0;
-  return v ?? Number.POSITIVE_INFINITY;
+  return v ?? unsetMeans;
 }
 
 function diffArray(before: string[], after: string[]): { added: string[]; removed: string[] } {
@@ -326,7 +333,8 @@ export function classifyChange(effective: unknown, requested: unknown): Classify
   const reqDollars = req.llm?.dollarsPerDay;
   if (effDollars !== reqDollars) {
     const reqPriv = budgetPrivilege(req.llm !== undefined, reqDollars);
-    const increase = reqPriv > budgetPrivilege(eff.llm !== undefined, effDollars);
+    const effPriv = budgetPrivilege(eff.llm !== undefined, effDollars, BASELINE_DOLLARS_PER_DAY);
+    const increase = reqPriv > effPriv;
     push(
       { path: "llm.dollarsPerDay", from: effDollars, to: reqDollars, risk: "med" },
       increase && reqPriv > BASELINE_DOLLARS_PER_DAY,

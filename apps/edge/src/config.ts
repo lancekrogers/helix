@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { BASELINE_DOLLARS_PER_DAY } from "@azx-pbc/shared";
 import { DEFAULT_STATEMENT_TIMEOUT_MS } from "./db/pool.js";
 
 /**
@@ -195,6 +196,13 @@ export interface GatewayConfig {
       /** Name of the `platform`-scoped secret holding the OpenAI key. */
       connection: string;
     };
+    /**
+     * Daily LLM budget applied to an app whose manifest sets none
+     * (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`). Defaults to the approval baseline.
+     * Not clamped to it: an operator who raises it enforces more than the
+     * classifier showed the approver. `0` means an unset budget is unlimited.
+     */
+    defaultDollarsPerDay: number;
   };
   /**
    * Fetch-proxy wiring (M4.5). The policy plane authorizes a `/_api/fetch` call
@@ -692,6 +700,15 @@ function requirePositiveMs(raw: string | undefined, fallback: number, name: stri
   return value;
 }
 
+function requireNonNegativeNumber(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative number (got ${JSON.stringify(raw)})`);
+  }
+  return value;
+}
+
 /**
  * Validate an LLM upstream path override. Egress binds
  * `target.pathname === instruction.path` (the path only), so anything URL
@@ -761,6 +778,11 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
         path: llmPath(env.EDGE_LLM_OPENAI_PATH, "/v1/chat/completions", "EDGE_LLM_OPENAI_PATH"),
         connection: env.EDGE_LLM_OPENAI_CONNECTION ?? "openai",
       },
+      defaultDollarsPerDay: requireNonNegativeNumber(
+        env.EDGE_LLM_DEFAULT_DOLLARS_PER_DAY,
+        BASELINE_DOLLARS_PER_DAY,
+        "EDGE_LLM_DEFAULT_DOLLARS_PER_DAY",
+      ),
     },
     fetch: {
       egressUrl: env.EDGE_EGRESS_URL || null,

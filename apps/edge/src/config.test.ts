@@ -130,6 +130,33 @@ describe("loadConfig", () => {
     ).toThrow(/EDGE_RECONCILE_INTERVAL_MS must be a positive number/);
   });
 
+  it("parses EDGE_LLM_DEFAULT_DOLLARS_PER_DAY with the same rules as other gateway knobs", () => {
+    for (const bad of ["abc", "-1", "NaN", "Infinity"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: bad })).toThrow(
+        /EDGE_LLM_DEFAULT_DOLLARS_PER_DAY must be a non-negative number/,
+      );
+    }
+    expect(loadConfig({ ...ENV }).llm.defaultDollarsPerDay).toBe(50);
+    expect(
+      loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: "120" }).llm.defaultDollarsPerDay,
+    ).toBe(120);
+    expect(
+      loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: "0" }).llm.defaultDollarsPerDay,
+    ).toBe(0);
+    for (const blank of ["", "   "]) {
+      expect(
+        loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: blank }).llm.defaultDollarsPerDay,
+      ).toBe(50);
+    }
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: "abc",
+      }),
+    ).toThrow(/EDGE_LLM_DEFAULT_DOLLARS_PER_DAY must be a non-negative number/);
+  });
+
   // A hop count trusts by position, so it structurally ignores the peer address
   // and lets anyone reaching the origin directly spoof X-Forwarded-*
   // (GHSA-3m5p-2c4r-xxw2). Fastify 5.12.1 compiles a number to "trust nothing"

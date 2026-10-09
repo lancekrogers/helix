@@ -81,6 +81,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
         path: "/v1/chat/completions",
         connection: "openai",
       },
+      defaultDollarsPerDay: 50,
     },
     // Off by default in unit tests; suites that exercise it pass a low `max`.
     anonRateLimit: { max: 0, windowMs: 60_000 },
@@ -131,6 +132,7 @@ export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}):
         path: "/v1/chat/completions",
         connection: "openai",
       },
+      defaultDollarsPerDay: 50,
     },
     fetch: {
       egressUrl: null,

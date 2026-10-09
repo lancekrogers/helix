@@ -315,6 +315,7 @@ try {
       allowUnauthenticated: config.allowUnauthenticated,
       allowPublicApps: config.allowPublicApps,
       allowPasswordApps: config.allowPasswordApps,
+      llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
       tls: https !== null,
       // Free, and it answers "why do I have no traces" without an exec into
       // the container — the commonest first question about a telemetry

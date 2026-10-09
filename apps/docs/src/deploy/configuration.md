@@ -119,6 +119,7 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `llmModelAllowlist` | *(empty)* | Catalog ids the portal advertises as servable (capability catalogue, agent skill, model picker). Empty with `deployFoundry` auto-derives from `foundryModels`; empty without it derives from seeded platform secrets. Set it to declare the set explicitly (e.g. a BYO Foundry serving a subset). Ids outside the platform catalog are ignored |
 | `llmModelBlocklist` | *(empty)* | Catalog ids withheld even when otherwise servable, subtracted in either allowlist mode — the "everything except these" knob (e.g. `['claude-fable-5']` when your Anthropic upstream lacks that line) |
 | `platformMonthlyUsdCap` | `1000` | Display-only LLM spend line on the admin Activity page. `0` hides it. Nothing enforces it — per-app daily budgets are the real limit |
+| `llmDefaultDollarsPerDay` | `50` | Daily LLM spend enforced when an app's manifest omits `dollarsPerDay` (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` on the edge and dev gateway). Matches the approval baseline; raising it enforces more than the classifier showed approvers. `0` = unset is unlimited |
 | `deployMaxFileMb` | `50` | Max uncompressed size of any single file in a deployed bundle |
 | `deployMaxBundleMb` | `250` | Max uncompressed size of the whole bundle (and the compressed upload). Raising it a lot wants more CPU/memory on the portal container |
 | `fetchMaxBodyMb` | `25` | Max size of each direction of a `/_api/fetch` call (the request body and the response body). Sets `EDGE_FETCH_MAX_BODY_BYTES` on the edge and dev gateway and `EGRESS_MAX_BODY_BYTES` on egress; each hop enforces it, and a call over it gets a 413 |
@@ -190,6 +191,7 @@ build-time configuration at all):
 | `APP_PUBLIC_BASE` | `https://<appsDomain>` | The portal refuses to boot |
 | `DEV_API_PUBLIC_BASE` | set when `deployDevGateway` | The SPA reports dev mode as disabled |
 | `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` | No spend line on the Activity page |
+| `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` | `llmDefaultDollarsPerDay` | Apps with no manifest `dollarsPerDay` use the install default ($50/day unless raised); `0` on the parameter means unset is unlimited |
 
 The OAuth connections feature adds three more template-derived URLs —
 each is the target app's ingress FQDN, so there is nothing to configure:

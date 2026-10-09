@@ -57,6 +57,10 @@ param appsDomain string = 'azx.helix.azxlabs.io'
 @description('Display-only month-to-date platform spend watch line in USD, surfaced on the admin Activity page via GET /api/v1/config. Defaults to 1000 so an install gets a budget signal without being configured for one; set 0 to show no ceiling. Nothing enforces this — per-app daily token budgets are the real limit.')
 param platformMonthlyUsdCap int = 1000
 
+@description('Daily LLM spend budget in USD applied to any app whose manifest sets no dollarsPerDay (EDGE_LLM_DEFAULT_DOLLARS_PER_DAY on the edge and dev gateway). Mirrors BASELINE_DOLLARS_PER_DAY (50) in packages/shared/src/approval.ts; raising it enforces more than the approval classifier showed the approver. 0 = an unset budget is unlimited.')
+@minValue(0)
+param llmDefaultDollarsPerDay int = 50
+
 @description('Max uncompressed size in MB of any single file in a deployed bundle.')
 param deployMaxFileMb int = 50
 
@@ -1228,6 +1232,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_LLM_OPENAI_ENDPOINT', value: llm.openaiEndpoint }
       { name: 'EDGE_LLM_OPENAI_PATH', value: llm.openaiPath }
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
+      { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
       // Behind ACA's Envoy ingress the socket peer is the ingress, so the
       // per-IP anon rate limiter and the password-login throttle need the
       // ingress address named to recover the real client IP (issue #13). See
@@ -1438,6 +1443,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_LLM_OPENAI_ENDPOINT', value: llm.openaiEndpoint }
       { name: 'EDGE_LLM_OPENAI_PATH', value: llm.openaiPath }
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
+      { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
       { name: 'EDGE_EGRESS_URL', value: egressBaseUrl }
       { name: 'EDGE_FETCH_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
       // The dev-gateway's consent surface consults the portal

@@ -44,6 +44,7 @@ function buildLlmEdge(
   opts: {
     llm?: { models: string[]; dollarsPerDay?: number } | null;
     withProvider?: boolean;
+    defaultDollarsPerDay?: number;
   } = {},
 ): LlmEdge {
   const sessions = new FakeSessionStore();
@@ -52,7 +53,22 @@ function buildLlmEdge(
   // Default cap is $1/day (1e6 micro-USD); the burst sub-cap is $1/6.
   const llm = opts.llm === undefined ? { models: [MODEL], dollarsPerDay: 1 } : opts.llm;
   const app = buildApp({
-    config: testEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+    config: testEdgeConfig({
+      auth: testAuthConfig(),
+      allowUnauthenticated: false,
+      llm: {
+        endpoint: "https://api.anthropic.com",
+        path: "/v1/messages",
+        anthropicVersion: "2023-06-01",
+        connection: "anthropic",
+        openai: {
+          endpoint: "https://api.openai.com",
+          path: "/v1/chat/completions",
+          connection: "openai",
+        },
+        defaultDollarsPerDay: opts.defaultDollarsPerDay ?? 50,
+      },
+    }),
     registry: new FakeRegistry([
       registryEntry({ appId: APP_ID, slug: "demo", blobPrefix: PREFIX, llm }),
     ]),
@@ -389,12 +405,41 @@ describe("quota: block-new, finish-in-flight (USD)", () => {
     });
   });
 
-  it("imposes no cap when the grant omits dollarsPerDay", async () => {
-    const edge = buildLlmEdge({ llm: { models: [MODEL] } });
-    edge.usage.spendTodayMicro = 10_000_000_000;
-    const token = await seedSession(edge.sessions);
-    const res = await chat(edge, token, ASK);
-    expect(res.statusCode).toBe(200);
+  it("enforces the install default when the grant omits dollarsPerDay", async () => {
+    const unset = buildLlmEdge({ llm: { models: [MODEL] } });
+    unset.usage.spendTodayMicro = 50_000_000;
+    const token = await seedSession(unset.sessions);
+    const atCap = await chat(unset, token, ASK);
+    expect(atCap.statusCode).toBe(429);
+    expect(atCap.json().error.code).toBe("quota_exceeded");
+    expect(unset.provider.calls).toHaveLength(0);
+
+    const burst = buildLlmEdge({ llm: { models: [MODEL] } });
+    burst.usage.spendTodayMicro = 1_000_000;
+    burst.usage.spendHourMicro = Math.ceil(50_000_000 / 6);
+    const burstToken = await seedSession(burst.sessions);
+    const overBurst = await chat(burst, burstToken, ASK);
+    expect(overBurst.statusCode).toBe(429);
+    expect(overBurst.json().error.code).toBe("rate_limited");
+
+    const under = buildLlmEdge({ llm: { models: [MODEL] } });
+    under.usage.spendTodayMicro = 49_999_999;
+    under.usage.spendHourMicro = 0;
+    const underToken = await seedSession(under.sessions);
+    const ok = await chat(under, underToken, ASK);
+    expect(ok.statusCode).toBe(200);
+
+    const explicit = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 500 } });
+    explicit.usage.spendTodayMicro = 400_000_000;
+    const explicitToken = await seedSession(explicit.sessions);
+    const explicitOk = await chat(explicit, explicitToken, ASK);
+    expect(explicitOk.statusCode).toBe(200);
+
+    const noDefault = buildLlmEdge({ llm: { models: [MODEL] }, defaultDollarsPerDay: 0 });
+    noDefault.usage.spendTodayMicro = 10_000_000_000;
+    const noDefaultToken = await seedSession(noDefault.sessions);
+    const unlimited = await chat(noDefault, noDefaultToken, ASK);
+    expect(unlimited.statusCode).toBe(200);
   });
 
   it("403s a model with no configured price before reaching the provider", async () => {
