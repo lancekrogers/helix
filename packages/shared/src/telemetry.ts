@@ -39,6 +39,7 @@ export const INSTR_EGRESS_RENEWALS = "helix.egress.renewals";
 export const INSTR_EGRESS_RETIREMENTS = "helix.egress.retirements";
 export const INSTR_EGRESS_UPSTREAM_ABORTS = "helix.egress.upstream_aborts";
 export const INSTR_APP_VISITS = "helix.app.visits";
+export const INSTR_GATEWAY_CUT_CHARGES = "helix.gateway.cut_charges";
 
 /**
  * Attribute keys.
@@ -61,6 +62,7 @@ export const ATTR_TARGET_PATH = "helix.target.path";
 export const ATTR_CONNECTION = "helix.connection";
 export const ATTR_UPSTREAM_STATUS = "helix.upstream.status";
 export const ATTR_CLIENT_DISCONNECTED = "helix.client_disconnected";
+export const ATTR_USAGE_BASIS = "helix.usage.basis";
 /**
  * How egress sourced the injected credential — `secret` (a sealed `app_secrets`
  * row), `managed-identity` (a minted Entra token, ADR-0046), or `delegated`

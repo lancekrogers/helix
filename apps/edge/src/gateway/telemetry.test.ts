@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { GATEWAY_OUTCOMES } from "@azx-pbc/shared";
-import { INSTR_GATEWAY_CALLS, INSTR_GATEWAY_DURATION } from "@azx-pbc/shared/telemetry";
-import { meterGatewayCall } from "./usage.js";
+import {
+  CUT_CHARGE_BASES,
+  INSTR_GATEWAY_CALLS,
+  INSTR_GATEWAY_CUT_CHARGES,
+  INSTR_GATEWAY_DURATION,
+} from "@azx-pbc/shared/telemetry";
+import { meterCutCharge, meterGatewayCall } from "./usage.js";
 
 /**
  * `helix.gateway.calls` / `helix.gateway.duration` (ADR-0037 decision 8).
@@ -83,6 +88,21 @@ describe("meterGatewayCall", () => {
       ]) {
         expect(keys, `${point.name} must not carry ${banned}`).not.toContain(banned);
       }
+    }
+  });
+
+  it("carries exactly appId and usage basis on cut-charge counter", async () => {
+    recording = startRecordingTelemetry();
+    for (const basis of CUT_CHARGE_BASES) {
+      meterCutCharge({ appId: "app-1", basis });
+    }
+
+    const points = (await recording.metrics()).filter((p) => p.name === INSTR_GATEWAY_CUT_CHARGES);
+    expect(points).toHaveLength(CUT_CHARGE_BASES.length);
+    for (const point of points) {
+      expect(Object.keys(point.attributes).sort()).toEqual(["helix.app_id", "helix.usage.basis"]);
+      expect(CUT_CHARGE_BASES).toContain(point.attributes["helix.usage.basis"]);
+      expect(Object.keys(point.attributes)).not.toContain("helix.user_oid");
     }
   });
 

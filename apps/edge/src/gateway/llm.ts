@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import {
   costUsd,
+  estimateCutUsage,
   priceForModel,
   supportsStructuredOutputs,
   type ApiErrorCode,
@@ -15,12 +16,21 @@ import type { OriginCheck } from "../auth/validate.js";
 import { anonRateLimited, type IpRateLimiter } from "./ipRateLimiter.js";
 import { LlmProviderError, type LlmProvider } from "./provider.js";
 import { nativeCodec, type LlmWireCodec, type LlmWireContext } from "./llmCodec.js";
-import { errorDetailOf, meterGatewayCall, type GatewayOutcome, type UsageStore } from "./usage.js";
+import {
+  ERROR_DETAIL_MAX,
+  errorDetailOf,
+  meterCutCharge,
+  meterGatewayCall,
+  type GatewayOutcome,
+  type UsageStore,
+} from "./usage.js";
+import { truncate } from "../auth/identity.js";
 import { trace } from "@opentelemetry/api";
 import {
   ATTR_APP_SLUG,
   ATTR_CAPABILITY,
   ATTR_CLIENT_DISCONNECTED,
+  ATTR_USAGE_BASIS,
   ROUTE_LLM,
   SPAN_LLM,
 } from "@azx-pbc/shared/telemetry";
@@ -36,7 +46,9 @@ import { withRootSpan } from "../telemetry.js";
  *
  * Quota is **block-new, finish-in-flight**: the budget is checked once at
  * admission; an admitted request always runs to completion, even if it pushes
- * the app over budget — the next request is the one that gets blocked.
+ * the app over budget — the next request is the one that gets blocked. An abort
+ * by the client, or by the call deadline, is not a quota cut; the budget never
+ * cuts an admitted call.
  *
  * The budget is denominated in **USD**, not tokens, so the cap means the same
  * thing across models (a token cap is a 10× range of dollars between haiku and
@@ -182,7 +194,8 @@ export function makeLlmHandler(
 
     // Quota (block-new): if the app is already at/over its daily *or* rolling-
     // hour USD budget, refuse before sending anything upstream. An in-flight
-    // request is never cut. Both windows read the frozen costMicroUsd column.
+    // request is never cut — including when the client hangs up or a deadline
+    // fires; those are not quota cuts. Both windows read the frozen costMicroUsd column.
     const usage = rt.usage;
     const cap = entry.llm.dollarsPerDay;
     if (cap !== undefined) {
@@ -251,9 +264,16 @@ export function makeLlmHandler(
       cacheReadInputTokens: 0,
       cacheCreationInputTokens: 0,
     };
+    // What a cut call is charged from, when the vendor never sent `done`.
+    const requestBytes =
+      Buffer.byteLength(chat.system ?? "", "utf8") +
+      chat.messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0);
+    let relayedBytes = 0;
+    let measured: LlmUsage | undefined;
+    let eventsSeen = 0;
     const recordOnce = async (
       outcome: GatewayOutcome,
-      extra: { errorDetail?: string } = {},
+      extra: { errorDetail?: string; cut?: boolean } = {},
     ): Promise<void> => {
       if (recorded) return;
       recorded = true;
@@ -262,6 +282,21 @@ export function makeLlmHandler(
       // `for await` itself), so this duration is the real end-to-end time, not
       // time-to-first-header.
       meterGatewayCall({ appId: entry.appId, capability: "llm", outcome, durationMs });
+      let stopReason: string | null = finalStopReason;
+      let errorDetail = extra.errorDetail ?? null;
+      if (extra.cut) {
+        const estimate = estimateCutUsage({ measured, requestBytes, relayedBytes });
+        Object.assign(finalUsage, estimate.usage);
+        // The default "end_turn" is false for a call that never finished.
+        stopReason = null;
+        // The marker goes LAST and the text before it is cut to fit: clampRecord truncates
+        // errorDetail at ERROR_DETAIL_MAX and would otherwise drop the marker.
+        const marker = `;usage=${estimate.basis}`;
+        errorDetail =
+          truncate(extra.errorDetail ?? "", ERROR_DETAIL_MAX - marker.length - 1) + marker;
+        meterCutCharge({ appId: entry.appId, basis: estimate.basis });
+        trace.getActiveSpan()?.setAttribute(ATTR_USAGE_BASIS, estimate.basis);
+      }
       // Freeze the as-charged cost at write time (micro-USD) from the final
       // token counts + the requested model's current rate. This is what both
       // the spend gate and the portal dollar figures read back.
@@ -281,8 +316,8 @@ export function makeLlmHandler(
           outcome,
           durationMs,
           // LLM streams over a 200; the stop reason is the useful signal here.
-          stopReason: finalStopReason,
-          errorDetail: extra.errorDetail ?? null,
+          stopReason,
+          errorDetail,
         })
         .catch((err: unknown) =>
           req.log.warn(
@@ -336,12 +371,15 @@ export function makeLlmHandler(
       try {
         for await (const ev of events) {
           if (ev.type === "delta") {
+            eventsSeen += 1;
+            relayedBytes += Buffer.byteLength(ev.text, "utf8");
             start();
             codec.writeDelta(reply, ctx, ev.text);
           } else if (ev.type === "usage") {
-            // Interim counts; `done` carries the final totals and still overwrites finalUsage.
-            // Nothing is recorded from an interim event here.
+            eventsSeen += 1;
+            measured = ev.usage;
           } else {
+            measured = ev.usage; // the final counts are measured too
             Object.assign(finalUsage, ev.usage);
             finalStopReason = ev.stopReason;
           }
@@ -357,10 +395,12 @@ export function makeLlmHandler(
         // no `cancelled` member, and adding one would mean migrating a shared enum
         // for something the detail already distinguishes.
         if (clientGone) {
-          await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED });
+          await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
           return;
         }
-        await recordOnce("error", { errorDetail: errorDetailOf(err) });
+        // Charged only if the upstream answered 200 and something arrived. A vendor 4xx/5xx
+        // before the stream started generated nothing, so it stays a $0 error row.
+        await recordOnce("error", { errorDetail: errorDetailOf(err), cut: eventsSeen > 0 });
         const { status, code, message, param, retryAfter } = describeError(err, { structured });
         if (!started) {
           // `start()` is lazy, so a failure before the first delta has written
@@ -381,11 +421,15 @@ export function makeLlmHandler(
     let content = "";
     try {
       for await (const ev of events) {
-        if (ev.type === "delta") content += ev.text;
-        else if (ev.type === "usage") {
-          // Interim counts; `done` carries the final totals and still overwrites finalUsage.
-          // Nothing is recorded from an interim event here.
+        if (ev.type === "delta") {
+          eventsSeen += 1;
+          relayedBytes += Buffer.byteLength(ev.text, "utf8");
+          content += ev.text;
+        } else if (ev.type === "usage") {
+          eventsSeen += 1;
+          measured = ev.usage;
         } else {
+          measured = ev.usage; // the final counts are measured too
           Object.assign(finalUsage, ev.usage);
           finalStopReason = ev.stopReason;
         }
@@ -399,10 +443,12 @@ export function makeLlmHandler(
     } catch (err) {
       // As above: our own abort ended this, not the vendor.
       if (clientGone) {
-        await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED });
+        await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
         return;
       }
-      await recordOnce("error", { errorDetail: errorDetailOf(err) });
+      // Charged only if the upstream answered 200 and something arrived. A vendor 4xx/5xx
+      // before the stream started generated nothing, so it stays a $0 error row.
+      await recordOnce("error", { errorDetail: errorDetailOf(err), cut: eventsSeen > 0 });
       const { status, code, message, param, retryAfter } = describeError(err, { structured });
       // 502 for upstream failures, 400 when the vendor rejected the app's request,
       // 429 (with retry-after) when it throttled one; the code stays within the

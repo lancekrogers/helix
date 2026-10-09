@@ -100,6 +100,9 @@ looked up:
   records `http.route` per surface — `/_api/llm/chat` or
   `/_api/openai/v1/chat/completions` — so throttles on the OpenAI-compatible
   route are findable by route.
+- `helix.gateway.llm` spans carry `helix.usage.basis` ∈ {`measured`, `estimated`,
+  `mixed`} when a call ends without a final usage block (a client hang-up or a
+  post-200 stream failure charged from interim counts and byte estimates).
 - When the edge hangs up before egress finishes writing a response,
   `helix.egress.proxy` still records `helix.outcome` = `ok` and
   `helix.upstream.status` = 200, because no outcome header was committed on
@@ -191,6 +194,7 @@ looked up:
 | `helix.registry.stale_for_ms` | observable gauge | — |
 | `helix.registry.load_failures` | counter | `outcome` |
 | `helix.gateway.calls` | counter | `capability`, `outcome`, `appId` |
+| `helix.gateway.cut_charges` | counter | `appId`, `basis` (`measured` / `estimated` / `mixed`; operational only, never reconciled with the ledger. Alert on a high share of `estimated`: it means the vendor is not delivering counts) |
 | `helix.gateway.duration` | histogram (ms) | `capability`, `outcome` |
 | `helix.egress.proxy.duration` | histogram (ms) | `outcome` |
 | `helix.egress.upstream_aborts` | counter | `capability` (`llm` or `fetch`) |

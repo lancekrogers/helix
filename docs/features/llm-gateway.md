@@ -93,6 +93,16 @@ Every call records exactly once (`recordOnce`) into `gateway_calls` via
 inputTokens, outputTokens, outcome}` where outcome is `ok` / `error` / `quota_blocked` (the column
 also admits `refusal`, reserved for content-policy stops; M4 emits the three above).
 
+**Cut and failed streams** (a client hang-up, or an error after the upstream answered `200` with at
+least one stream event) still write `outcome: error`, but freeze a best-effort charge in
+`costMicroUsd` and mark the row in `errorDetail` with a trailing `;usage=measured`, `;usage=estimated`,
+or `;usage=mixed`. `stopReason` is `null` on those rows — not the default `end_turn`, which would
+claim a call that never finished. Per field: input is the measured count when a `usage` event (or
+`done`) delivered one, else a byte estimate of the prompt; output is `max(measured, estimate)` from
+relayed delta bytes. An upstream `4xx`/`5xx` before any event still records `costMicroUsd: 0` with no
+marker. **Residuals:** reasoning tokens billed but never streamed are not estimated; an edge crash
+mid-stream writes no row at all.
+
 `userOid` and the two label columns are the **identity half and the display half** of the caller,
 and the split is the point. `userOid` is the Entra `oid` claim since ADR-0048 (a pairwise `sub` on
 rows that predate the re-base) — stable, compared, joined on, and an attribution dead end, because

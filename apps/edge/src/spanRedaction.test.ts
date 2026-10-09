@@ -5,8 +5,14 @@ import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telem
 import { DataCapabilitySchema, INTERNAL_AUTH_HEADER } from "@azx-pbc/shared";
 import { hashDevToken } from "@azx-pbc/shared/devToken";
 import { spanUrlAttributes } from "@azx-pbc/shared/logging";
-import { FORBIDDEN_URL_ATTRS } from "@azx-pbc/shared/telemetry";
-import { SPAN_CONSENT_STATUS_DEV, SPAN_CONSENT_STATUS_EDGE } from "@azx-pbc/shared/telemetry";
+import {
+  ATTR_USAGE_BASIS,
+  CUT_CHARGE_BASES,
+  FORBIDDEN_URL_ATTRS,
+  SPAN_CONSENT_STATUS_DEV,
+  SPAN_CONSENT_STATUS_EDGE,
+  SPAN_LLM,
+} from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "./telemetry.js";
 import { buildApp } from "./app.js";
 import { buildDevGateway } from "./devGateway/app.js";
@@ -17,6 +23,7 @@ import { testAuthConfig, testDevGatewayConfig, testEdgeConfig } from "./test/con
 import {
   FakeAppDataStore,
   FakeBlobReader,
+  FakeLlmProvider,
   FakeOidcClient,
   FakePortalProvider,
   FakeRegistry,
@@ -24,6 +31,7 @@ import {
   FakeUsageStore,
   registryEntry,
 } from "./test/fakes.js";
+import { LlmProviderError } from "./gateway/provider.js";
 
 /**
  * ADR-0037 decision 10's redaction case — the direct sibling of
@@ -641,5 +649,91 @@ describe("span attributes never carry a credential", () => {
         }
       }
     });
+  });
+});
+
+describe("cut and failed LLM gateway calls", () => {
+  const APP_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const HOST = "cut.local.helix.azxlabs.io";
+  const ORIGIN = `https://${HOST}:8080`;
+  const MODEL = "claude-opus-4-8";
+  const PLANTED_PROMPT = "PLANTED-PROMPT-FRAGMENT-cut-charge";
+  const PLANTED_OID = "oid-planted-cut-charge";
+
+  it("never leaks prompt, oid, URL, or scope on spans or cut-charge metrics", async () => {
+    const sessions = new FakeSessionStore();
+    const provider = new FakeLlmProvider();
+    provider.errorAfterDeltas = new LlmProviderError("openai stream ended without a usage block");
+    provider.deltas = ["x"];
+    const usage = new FakeUsageStore();
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Cut Charge",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "cut",
+          blobPrefix: "apps/d/2/",
+          llm: { models: [MODEL], dollarsPerDay: 1 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: provider,
+      usage,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+        stream: true,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump, "leaked the planted prompt").not.toContain(PLANTED_PROMPT);
+      expect(dump, "leaked the planted oid").not.toContain(PLANTED_OID);
+      expect(dump, "leaked a URL query").not.toContain("?");
+      expect(dump, "leaked a lease scope").not.toMatch(/llm:(app|user):/);
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(CUT_CHARGE_BASES).toContain(llmSpan?.attributes[ATTR_USAGE_BASIS]);
   });
 });

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { request as undiciRequest } from "undici";
 import { describe, expect, it } from "vitest";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
+import { BYTES_PER_TOKEN, costUsd } from "@azx-pbc/shared";
 import { buildApp } from "../app.js";
 import { SESSION_COOKIE } from "../auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "../auth/sessions.js";
@@ -17,6 +18,7 @@ import {
   registryEntry,
 } from "../test/fakes.js";
 import { LlmProviderError } from "./provider.js";
+import { ERROR_DETAIL_MAX } from "./usage.js";
 
 /**
  * The `/_api/llm/chat` gateway (architecture §6.1, project plan §4 M4): authn,
@@ -578,6 +580,205 @@ describe("an upstream 429 is a throttle, not an outage", () => {
   });
 });
 
+describe("cut and failed calls are charged", () => {
+  function cutChargeMicro(
+    body: { model: string; messages: { content: string }[]; system?: string },
+    usage: { inputTokens: number; outputTokens: number },
+  ): number {
+    return Math.round(
+      costUsd({
+        model: body.model,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      }) * 1_000_000,
+    );
+  }
+
+  it("charges an input-byte estimate and blocks the next call when the budget is tight", async () => {
+    const system = "x".repeat(3000);
+    const body = { ...ASK, stream: false, system };
+    const requestBytes =
+      Buffer.byteLength(system, "utf8") + Buffer.byteLength(ASK.messages[0]!.content, "utf8");
+    const inputTokens = Math.ceil(requestBytes / BYTES_PER_TOKEN);
+    const expectedMicro = cutChargeMicro(body, { inputTokens, outputTokens: 0 });
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: (expectedMicro - 1) / 1_000_000 },
+    });
+    const token = await seedSession(edge.sessions);
+    edge.provider.deltas = Array.from({ length: 50 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      for (let n = 0; n < 500; n++) {
+        if (edge.provider.sawAbort) return;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+
+    function socketHeaders(t: string): Record<string, string> {
+      return {
+        host: HOST.host,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${t}`,
+      };
+    }
+
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: socketHeaders(token),
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => edge.provider.calls.length === 1, "the provider to be called");
+      ac.abort();
+      await pending;
+      await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the cut row to land");
+
+      expect(edge.usage.records[0]).toMatchObject({
+        outcome: "error",
+        inputTokens,
+        stopReason: null,
+      });
+      expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThanOrEqual(expectedMicro);
+      expect(edge.usage.records[0]?.errorDetail).toMatch(/;usage=estimated$/);
+
+      const blocked = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: socketHeaders(token),
+        body: JSON.stringify(ASK),
+      });
+      expect(blocked.statusCode).toBe(429);
+      expect(((await blocked.body.json()) as { error: { code: string } }).error.code).toBe(
+        "quota_exceeded",
+      );
+      expect(edge.usage.records).toHaveLength(2);
+      expect(edge.usage.records[1]?.outcome).toBe("quota_blocked");
+    });
+  });
+
+  it("prefers measured input and estimates relayed output on a mixed hang-up", async () => {
+    const edge = buildLlmEdge();
+    edge.provider.earlyUsage = {
+      inputTokens: 1200,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    };
+    edge.provider.deltas = Array.from({ length: 200 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async (i) => {
+      if (i > 0) await new Promise((r) => setTimeout(r, 5));
+    };
+    const token = await seedSession(edge.sessions);
+    await withServer(edge.app, async (base) => {
+      const res = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: true }),
+      });
+      expect(res.statusCode).toBe(200);
+      for await (const chunk of res.body) {
+        if (String(chunk).includes("event: delta")) break;
+      }
+      res.body.destroy();
+      await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the cut row to land");
+    });
+    const relayedBytes = Buffer.byteLength("d0", "utf8");
+    const estimatedOutput = Math.ceil(relayedBytes / BYTES_PER_TOKEN);
+    expect(edge.usage.records[0]).toMatchObject({
+      inputTokens: 1200,
+      stopReason: null,
+    });
+    expect(edge.usage.records[0]?.outputTokens).toBeGreaterThanOrEqual(estimatedOutput);
+    expect(edge.usage.records[0]?.errorDetail).toMatch(/;usage=mixed$/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("charges a post-200 OpenAI-shaped stream failure and keeps the in-band error frame", async () => {
+    const edge = buildLlmEdge();
+    const msg = "openai stream ended without a usage block";
+    edge.provider.errorAfterDeltas = new LlmProviderError(msg);
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("event: error");
+    const row = edge.usage.records[0];
+    expect(row).toMatchObject({ outcome: "error", stopReason: null });
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+    expect(row?.errorDetail).toMatch(new RegExp(`^${msg};usage=estimated$`));
+  });
+
+  it("does not estimate a vendor rejection before the stream starts", async () => {
+    for (const status of [429, 400, 500]) {
+      const edge = buildLlmEdge();
+      edge.provider.error = new LlmProviderError(`vendor ${status}`, status);
+      const token = await seedSession(edge.sessions);
+      const res = await chat(edge, token, { ...ASK, stream: true });
+      expect(res.statusCode).toBeGreaterThanOrEqual(400);
+      expect(edge.usage.records[0]).toMatchObject({ outcome: "error", costMicroUsd: 0 });
+      expect(edge.usage.records[0]?.errorDetail ?? "").not.toMatch(/;usage=/);
+    }
+  });
+
+  it("keeps the usage marker when the upstream error text is very long", async () => {
+    const edge = buildLlmEdge();
+    const long = "e".repeat(1000);
+    edge.provider.errorAfterDeltas = new LlmProviderError(long);
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, { ...ASK, stream: true });
+    const detail = edge.usage.records[0]?.errorDetail ?? "";
+    expect(detail.length).toBeLessThanOrEqual(ERROR_DETAIL_MAX);
+    expect(detail.endsWith(";usage=estimated")).toBe(true);
+  });
+
+  it("charges the non-streaming path the same way on a hang-up", async () => {
+    const edge = buildLlmEdge();
+    const token = await seedSession(edge.sessions);
+    edge.provider.deltas = Array.from({ length: 50 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      for (let n = 0; n < 500; n++) {
+        if (edge.provider.sawAbort) return;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: false }),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => edge.provider.calls.length === 1, "the provider to be called");
+      ac.abort();
+      await pending;
+      await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the cut row to land");
+    });
+    expect(String(edge.usage.records[0]?.errorDetail)).toMatch(/^client_disconnected;usage=/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+    expect(edge.usage.records[0]?.stopReason).toBeNull();
+  });
+});
+
 /**
  * Real-socket coverage for client disconnect. The rest of this file drives the
  * app through `app.inject()`, which cannot express a client hanging up — and
@@ -624,7 +825,11 @@ describe("/_api/llm/chat over a real socket", () => {
     // Metered once, and marked as the app leaving rather than a vendor failure.
     expect(edge.usage.records).toHaveLength(1);
     expect(edge.usage.records[0]?.outcome).toBe("error");
-    expect(edge.usage.records[0]?.errorDetail).toBe("client_disconnected");
+    expect(edge.usage.records[0]?.errorDetail).toMatch(
+      /^client_disconnected;usage=(measured|estimated|mixed)$/,
+    );
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+    expect(edge.usage.records[0]?.stopReason).toBeNull();
   });
 
   it("aborts a non-streaming call when the client hangs up", async () => {
@@ -646,7 +851,15 @@ describe("/_api/llm/chat over a real socket", () => {
       ac.abort();
       await pending;
       await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the call to be metered");
     });
+    expect(edge.usage.records).toHaveLength(1);
+    expect(edge.usage.records[0]?.outcome).toBe("error");
+    expect(edge.usage.records[0]?.errorDetail).toMatch(
+      /^client_disconnected;usage=(measured|estimated|mixed)$/,
+    );
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+    expect(edge.usage.records[0]?.stopReason).toBeNull();
   });
 
   it("streams a normal completion unchanged over a socket", async () => {

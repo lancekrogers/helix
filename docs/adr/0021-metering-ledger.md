@@ -11,7 +11,7 @@ Every gateway call (LLM, data, fetch) must be metered, audited, and budget-enfor
 
 One **append-only** `gateway_calls` row per call: `(appId, userOid, userName, userEmail, capability, model, inputTokens, outputTokens, outcome)` plus a **frozen, as-charged `costMicroUsd`** priced at write time from a **code-resident rate table** (`@azx-pbc/shared/pricing.ts`). `helix_edge` has **INSERT-only** (+ `SELECT` for budget sums) — no `UPDATE`/`DELETE` — so integrity rests on the DB grant set, not a hash chain.
 
-- **Daily budgets are token/request-denominated** (`tokensPerDay`, `requestsPerDay`), not USD — a coarse, predictable ceiling.
+- **Daily budgets are USD-denominated** (`dollarsPerDay` on the LLM grant), with a frozen `costMicroUsd` per row priced from the code-resident rate table at write time.
 - **Quota is block-new / finish-in-flight:** an admitted request always runs to completion; the *next* request is the one blocked once the budget is crossed.
 - The portal recomputes `costUsd` for dashboards from the same rate table at read time.
 
@@ -19,7 +19,7 @@ One **append-only** `gateway_calls` row per call: `(appId, userOid, userName, us
 
 - Append-only-by-grant resists edge-RCE tampering; it is **not** cryptographically tamper-evident, and no immutable sink is committed — the grant set is the integrity boundary (see the 2026-09-17 amendment).
 - Cost is **frozen per call**, so a later rate change never rewrites history; pricing lives in versioned code.
-- Token-denominated budgets stay stable across price changes; dollars are a derived view, not the enforcement unit.
+- Budget enforcement reads the frozen `costMicroUsd` column; token counts on the row are the audit view, and portal dollar figures can be recomputed from the same rate table at read time.
 - The ledger is a metering + budget primitive, deliberately narrow (no latency/error-detail/size) — not an observability sink.
 
 > Note: `docs/features/llm-gateway.md` was reconciled (2026-07) to document the frozen `costMicroUsd` column — the earlier "tokens, not dollars / no cost column" wording is gone.
@@ -164,6 +164,12 @@ What this does and doesn't change:
   ledger's own contents — `path` (2026-08-28) and the directly-identifying
   `userName`/`userEmail` (2026-08-31) on a table with no `DELETE` grant and no
   pruning job — not on the PM brief. It remains tracked in `TODO.md`.
+
+## Amendment (2026-10-09): cut and failed calls are charged
+
+1. A frozen `costMicroUsd` may be an **estimate** for a call that ended without a final vendor usage block. The row says so: `errorDetail` ends with `;usage=measured`, `;usage=estimated`, or `;usage=mixed`, and `stopReason` is `null`.
+2. The Decision bullets above were stale (token-denominated budgets); they now state that LLM daily budgets are **USD-denominated**, aligned with `docs/features/llm-gateway.md` and the gate implementation.
+3. **Block-new is unchanged.** An abort by the client or by the wall-clock call deadline is **not** a quota cut — an admitted request is never cut by the budget; only the next request is blocked once spend crosses the cap. Append-only grants are unchanged.
 
 ## Amendment (2026-09-22): `userOid` provenance changed — ADR-0048
 

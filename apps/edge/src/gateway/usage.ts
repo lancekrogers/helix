@@ -10,8 +10,10 @@ import {
   ATTR_APP_ID,
   ATTR_CAPABILITY,
   ATTR_OUTCOME,
+  ATTR_USAGE_BASIS,
   capTargetPath,
   TARGET_PATH_MAX,
+  type CutChargeBasis,
 } from "@azx-pbc/shared/telemetry";
 import { instruments } from "../telemetry.js";
 
@@ -87,7 +89,7 @@ export interface GatewayCallRecord {
 }
 
 /** Max length of the `errorDetail` ledger string, before the ellipsis. */
-const ERROR_DETAIL_MAX = 300;
+export const ERROR_DETAIL_MAX = 300;
 
 /**
  * Max length of the `path` ledger column, before the ellipsis.
@@ -447,4 +449,11 @@ export function meterGatewayCall(call: {
       [ATTR_OUTCOME]: call.outcome,
     });
   }
+}
+
+export function meterCutCharge(call: { appId: string; basis: CutChargeBasis }): void {
+  instruments().gatewayCutCharges.add(1, {
+    [ATTR_APP_ID]: call.appId,
+    [ATTR_USAGE_BASIS]: call.basis,
+  });
 }

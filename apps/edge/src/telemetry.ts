@@ -14,6 +14,7 @@ import {
 import {
   DURATION_BUCKETS_MS,
   INSTR_APP_VISITS,
+  INSTR_GATEWAY_CUT_CHARGES,
   INSTR_GATEWAY_CALLS,
   INSTR_GATEWAY_DURATION,
   INSTR_REGISTRY_LOAD_FAILURES,
@@ -69,6 +70,8 @@ export interface EdgeInstruments {
   trustProxyUnresolved: ObservableGauge;
   /** `appId`, `outcome` ∈ `VISIT_RECORD_OUTCOMES` (ADR-0050). */
   appVisits: Counter;
+  /** `appId`, `basis` ∈ `CUT_CHARGE_BASES` — operational only, never reconciled with the ledger. */
+  gatewayCutCharges: Counter;
 }
 
 /**
@@ -127,6 +130,10 @@ export function instruments(): EdgeInstruments {
       description:
         "Hosted-app document loads the edge tried to record, by outcome. Operational only — " +
         "the owner-facing counts come from app_visits.",
+    }),
+    gatewayCutCharges: meter.createCounter(INSTR_GATEWAY_CUT_CHARGES, {
+      description:
+        "LLM calls charged without a final usage block, by how the charge was derived. Operational only; never reconciled with the ledger.",
     }),
   };
   return cached;
