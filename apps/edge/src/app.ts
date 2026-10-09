@@ -266,6 +266,7 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
           anonLimiter: anonRateLimiter,
           provider: deps.llmProvider ?? null,
           usage: deps.usage ?? null,
+          denialThrottle,
         }
       : null;
   const handleLlmChat = llmRuntime ? makeLlmHandler(llmRuntime) : null;

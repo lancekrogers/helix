@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { request as undiciRequest } from "undici";
 import { describe, expect, it } from "vitest";
+import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
+import { ATTR_REASON, INSTR_GATEWAY_ADMISSION_DENIED, SPAN_LLM } from "@azx-pbc/shared/telemetry";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
 import { BYTES_PER_TOKEN, costUsd } from "@azx-pbc/shared";
 import { buildApp } from "../app.js";
@@ -378,6 +380,52 @@ describe("quota: block-new, finish-in-flight (USD)", () => {
     expect(edge.usage.records).toEqual([
       expect.objectContaining({ outcome: "quota_blocked", costMicroUsd: 0 }),
     ]);
+  });
+
+  it("sets helix.reason on the llm span for day and burst refusals", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const dayEdge = buildLlmEdge();
+      dayEdge.usage.spendTodayMicro = 1_000_000;
+      const dayToken = await seedSession(dayEdge.sessions);
+      await chat(dayEdge, dayToken, ASK);
+      const daySpan = telemetry.spans().find((s) => s.name === SPAN_LLM);
+      expect(daySpan?.attributes[ATTR_REASON]).toBe("app_budget_day");
+
+      telemetry.reset();
+      const burstEdge = buildLlmEdge();
+      burstEdge.usage.spendTodayMicro = 200_000;
+      burstEdge.usage.spendHourMicro = 200_000;
+      const burstToken = await seedSession(burstEdge.sessions);
+      await chat(burstEdge, burstToken, ASK);
+      const burstSpan = telemetry.spans().find((s) => s.name === SPAN_LLM);
+      expect(burstSpan?.attributes[ATTR_REASON]).toBe("app_budget_burst");
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
+  it("throttles quota_blocked ledger rows after 20 refusals per window but counts every refusal", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const edge = buildLlmEdge();
+      edge.usage.spendTodayMicro = 1_000_000;
+      const token = await seedSession(edge.sessions);
+      for (let i = 0; i < 25; i += 1) {
+        const res = await chat(edge, token, ASK);
+        expect(res.statusCode).toBe(429);
+        expect(res.json().error.code).toBe("quota_exceeded");
+      }
+      const blocked = edge.usage.records.filter((r) => r.outcome === "quota_blocked");
+      expect(blocked).toHaveLength(20);
+      const denied = (await telemetry.metrics()).filter(
+        (p) => p.name === INSTR_GATEWAY_ADMISSION_DENIED,
+      );
+      const totalDenied = denied.reduce((sum, p) => sum + p.value, 0);
+      expect(totalDenied).toBe(25);
+    } finally {
+      await telemetry.restore();
+    }
   });
 
   it("admits an under-cap request and runs it to completion even if it crosses", async () => {

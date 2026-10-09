@@ -6,6 +6,7 @@ import { DataCapabilitySchema, INTERNAL_AUTH_HEADER } from "@azx-pbc/shared";
 import { hashDevToken } from "@azx-pbc/shared/devToken";
 import { spanUrlAttributes } from "@azx-pbc/shared/logging";
 import {
+  ATTR_REASON,
   ATTR_USAGE_BASIS,
   CUT_CHARGE_BASES,
   FORBIDDEN_URL_ATTRS,
@@ -649,6 +650,88 @@ describe("span attributes never carry a credential", () => {
         }
       }
     });
+  });
+});
+
+describe("LLM admission denials", () => {
+  const APP_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const HOST = "deny.local.helix.azxlabs.io";
+  const ORIGIN = `https://${HOST}:8080`;
+  const MODEL = "claude-opus-4-8";
+  const PLANTED_PROMPT = "PLANTED-PROMPT-FRAGMENT-admission-deny";
+  const PLANTED_OID = "oid-planted-admission-deny";
+
+  it("never leaks prompt, oid, or URL on spans or admission-denied metrics", async () => {
+    const sessions = new FakeSessionStore();
+    const usage = new FakeUsageStore();
+    usage.spendTodayMicro = 1_000_000;
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "deny",
+          blobPrefix: "apps/e/3/",
+          llm: { models: [MODEL], dollarsPerDay: 1 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: new FakeLlmProvider(),
+      usage,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+      },
+    });
+    expect(res.statusCode).toBe(429);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump, "leaked the planted prompt").not.toContain(PLANTED_PROMPT);
+      expect(dump, "leaked the planted oid").not.toContain(PLANTED_OID);
+      expect(dump, "leaked a URL query").not.toContain("?");
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(llmSpan?.attributes[ATTR_REASON]).toBe("app_budget_day");
   });
 });
 

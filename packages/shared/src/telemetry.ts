@@ -40,6 +40,7 @@ export const INSTR_EGRESS_RETIREMENTS = "helix.egress.retirements";
 export const INSTR_EGRESS_UPSTREAM_ABORTS = "helix.egress.upstream_aborts";
 export const INSTR_APP_VISITS = "helix.app.visits";
 export const INSTR_GATEWAY_CUT_CHARGES = "helix.gateway.cut_charges";
+export const INSTR_GATEWAY_ADMISSION_DENIED = "helix.gateway.admission_denied";
 
 /**
  * Attribute keys.
@@ -223,6 +224,15 @@ export const SESSION_DENIAL_REASONS = [
   "refresh_required",
 ] as const;
 export type SessionDenialReason = (typeof SESSION_DENIAL_REASONS)[number];
+
+/**
+ * Why the LLM gateway refused a call before sending it upstream: the `helix.reason`
+ * dimension of `helix.gateway.admission_denied`. Bounded by construction: these are the
+ * refusal branches in `apps/edge/src/gateway/llm.ts`, and a test asserts the set.
+ * `app_budget_day` and `app_budget_burst` are the per-app USD windows.
+ */
+export const ADMISSION_DENIAL_REASONS = ["app_budget_day", "app_budget_burst"] as const;
+export type AdmissionDenialReason = (typeof ADMISSION_DENIAL_REASONS)[number];
 
 /**
  * Why a registry projection load failed — the `helix.registry.load_failures`

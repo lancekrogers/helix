@@ -19,20 +19,24 @@ import { nativeCodec, type LlmWireCodec, type LlmWireContext } from "./llmCodec.
 import {
   ERROR_DETAIL_MAX,
   errorDetailOf,
+  meterAdmissionDenied,
   meterCutCharge,
   meterGatewayCall,
   type GatewayOutcome,
   type UsageStore,
 } from "./usage.js";
+import type { DenialThrottle } from "./denialThrottle.js";
 import { truncate } from "../auth/identity.js";
 import { trace } from "@opentelemetry/api";
 import {
   ATTR_APP_SLUG,
   ATTR_CAPABILITY,
   ATTR_CLIENT_DISCONNECTED,
+  ATTR_REASON,
   ATTR_USAGE_BASIS,
   ROUTE_LLM,
   SPAN_LLM,
+  type AdmissionDenialReason,
 } from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "../telemetry.js";
 
@@ -86,6 +90,8 @@ export interface LlmGatewayRuntime {
   /** Null when no vendor key is configured — the capability 503s. */
   provider: LlmProvider | null;
   usage: UsageStore | null;
+  /** Caps metered quota denials per (app, env). null => uncapped (tests). */
+  denialThrottle: DenialThrottle | null;
 }
 
 /**
@@ -207,20 +213,37 @@ export function makeLlmHandler(
       const overDay = todayMicro >= capMicro;
       const overBurst = hourMicro >= capMicro * BURST_BUDGET_FRACTION;
       if (overDay || overBurst) {
+        const reason: AdmissionDenialReason = overDay ? "app_budget_day" : "app_budget_burst";
+        // The signals are NOT gated on the throttle: the throttle protects an append-only
+        // table with no DELETE grant, it does not hide the event. Past the cap the ledger is
+        // blind to the flood by design; the counter and the span are not.
         meterGatewayCall({ appId: entry.appId, capability: "llm", outcome: "quota_blocked" });
-        await usage
-          .record({
-            appId: entry.appId,
-            env: caller.env,
-            ...identity,
-            capability: "llm",
-            model: chat.model,
-            inputTokens: 0,
-            outputTokens: 0,
-            costMicroUsd: 0,
-            outcome: "quota_blocked",
-          })
-          .catch(() => {});
+        meterAdmissionDenied({ appId: entry.appId, capability: "llm", reason });
+        trace.getActiveSpan()?.setAttribute(ATTR_REASON, reason);
+        const decision = rt.denialThrottle
+          ? await rt.denialThrottle.admit(entry.appId, caller.env, "llm")
+          : { meter: true as const, suppressedAt: undefined };
+        if (decision.suppressedAt !== undefined) {
+          req.log.warn(
+            { appId: entry.appId, env: caller.env, attempts: decision.suppressedAt },
+            "quota-denial metering suppressed: this app is over its denial budget for the window",
+          );
+        }
+        if (decision.meter) {
+          await usage
+            .record({
+              appId: entry.appId,
+              env: caller.env,
+              ...identity,
+              capability: "llm",
+              model: chat.model,
+              inputTokens: 0,
+              outputTokens: 0,
+              costMicroUsd: 0,
+              outcome: "quota_blocked",
+            })
+            .catch(() => {});
+        }
         // Day cap is the harder stop ("done for the day"); prefer its message.
         if (overDay) {
           codec.error(reply, 429, "quota_exceeded", "daily spend budget exhausted");

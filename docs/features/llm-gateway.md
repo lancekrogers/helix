@@ -35,7 +35,9 @@ Handler: `apps/edge/src/gateway/llm.ts` (`makeLlmHandler`). Route wiring:
 The budget is checked **once at admission** against the frozen `costMicroUsd` ledger column,
 over two windows: the calendar day (`429 quota_exceeded`) and a rolling hour at a fraction of
 it (`429 rate_limited`, the burst/availability control, so one actor can't drain the day in a
-spike). Either way a `quota_blocked` row is recorded. The effective daily cap is
+spike). Either way a `quota_blocked` row is recorded, throttled per app and env (20 per minute
+per replica) so a flood of refusals cannot become a ledger write flood; the
+`helix.gateway.admission_denied` counter still counts every refusal. The effective daily cap is
 `entry.llm.dollarsPerDay` when set, otherwise `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` (default
 $50/day, matching the approval baseline). Setting that install knob to `0` makes an unset
 manifest budget unlimited again. An admitted request always runs to completion even if it tips

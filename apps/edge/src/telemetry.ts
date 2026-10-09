@@ -14,6 +14,7 @@ import {
 import {
   DURATION_BUCKETS_MS,
   INSTR_APP_VISITS,
+  INSTR_GATEWAY_ADMISSION_DENIED,
   INSTR_GATEWAY_CUT_CHARGES,
   INSTR_GATEWAY_CALLS,
   INSTR_GATEWAY_DURATION,
@@ -72,6 +73,11 @@ export interface EdgeInstruments {
   appVisits: Counter;
   /** `appId`, `basis` ∈ `CUT_CHARGE_BASES` — operational only, never reconciled with the ledger. */
   gatewayCutCharges: Counter;
+  /**
+   * `capability`, `reason` ∈ `ADMISSION_DENIAL_REASONS`, `appId`. Never `userOid`.
+   * Not gated by the denial throttle — counts refusals the ledger drops.
+   */
+  gatewayAdmissionDenied: Counter;
 }
 
 /**
@@ -134,6 +140,9 @@ export function instruments(): EdgeInstruments {
     gatewayCutCharges: meter.createCounter(INSTR_GATEWAY_CUT_CHARGES, {
       description:
         "LLM calls charged without a final usage block, by how the charge was derived. Operational only; never reconciled with the ledger.",
+    }),
+    gatewayAdmissionDenied: meter.createCounter(INSTR_GATEWAY_ADMISSION_DENIED, {
+      description: "LLM gateway admission denials by capability and reason.",
     }),
   };
   return cached;

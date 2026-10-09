@@ -54,4 +54,12 @@ describe("DenialThrottle", () => {
     clock += 60_001;
     expect((await t.admit("app-a", "prod")).meter).toBe(true);
   });
+
+  it("keeps LLM-scoped and unscoped buckets independent for the same app and env", async () => {
+    const t = throttle(1);
+    expect((await t.admit("app-a", "prod", "llm")).meter).toBe(true);
+    expect((await t.admit("app-a", "prod", "llm")).meter).toBe(false);
+    expect((await t.admit("app-a", "prod")).meter).toBe(true);
+    expect((await t.admit("app-a", "prod")).meter).toBe(false);
+  });
 });

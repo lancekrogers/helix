@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as telemetry from "./telemetry.js";
 import {
+  ADMISSION_DENIAL_REASONS,
   CUT_CHARGE_BASES,
   FORBIDDEN_URL_ATTRS,
   REGISTRY_LOAD_OUTCOMES,
@@ -67,6 +68,7 @@ describe("the telemetry vocabulary", () => {
     expect(new Set(SESSION_DENIAL_REASONS).size).toBe(SESSION_DENIAL_REASONS.length);
     expect([...REGISTRY_LOAD_OUTCOMES]).toEqual(["failed", "never_loaded"]);
     expect([...CUT_CHARGE_BASES]).toEqual(["measured", "estimated", "mixed"]);
+    expect([...ADMISSION_DENIAL_REASONS]).toEqual(["app_budget_day", "app_budget_burst"]);
   });
 
   it("keeps the consent-start outcome vocabulary bounded and duplicate-free", () => {

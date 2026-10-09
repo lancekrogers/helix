@@ -131,6 +131,10 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
   // the production exact-origin check).
   const checkOrigin = (): boolean => true;
 
+  // Single-process by construction, but the dev gateway writes to the same
+  // ledger as the edge, so the same denial cap applies.
+  const denialThrottle = new DenialThrottle(new InMemoryCounterStore());
+
   const llmRuntime = {
     config,
     registry: deps.registry,
@@ -139,6 +143,7 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
     anonLimiter: null,
     provider: deps.llmProvider,
     usage: deps.usage,
+    denialThrottle,
   };
   const handleLlmChat = makeLlmHandler(llmRuntime);
   const handleOpenAiChat = makeLlmHandler(llmRuntime, openAiCodec, ROUTE_OPENAI);
@@ -158,9 +163,7 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
     resolveCaller,
     checkOrigin,
     anonLimiter: null,
-    // Single-process by construction, but the dev gateway writes to the same
-    // ledger as the edge, so the same denial cap applies.
-    denialThrottle: new DenialThrottle(new InMemoryCounterStore()),
+    denialThrottle,
     egress: deps.egress,
     usage: deps.usage,
     instructionKey: deps.instructionKey,

@@ -1,7 +1,7 @@
 import type { CounterStore } from "./counterStore.js";
 
 /**
- * Limit fetch allowlist-denial ledger rows per app and time window.
+ * Limit metered admission-denial ledger rows per capability scope, app, and time window.
  * Authenticated callers bypass the anonymous limiter; denied origins return
  * before the daily request budget, which also excludes forbidden outcomes.
  * A retry loop could therefore write denial rows continuously.
@@ -46,13 +46,16 @@ export class DenialThrottle {
   }
 
   /**
-   * Reserve one denial against the (app, env) budget.
+   * Reserve one denial against the (scope, app, env) budget.
    *
    * Keyed on **both** app and env: everything else in this ledger partitions on
    * `caller.env`, so a dev-token loop must not consume the prod app's budget.
+   * An optional `scope` (for example `llm` vs fetch allowlist) keeps capability
+   * buckets independent for the same app and env.
    */
-  async admit(appId: string, env: string): Promise<DenialDecision> {
-    const count = await this.#store.bump(`denial:${env}:${appId}`, this.#windowMs);
+  async admit(appId: string, env: string, scope?: string): Promise<DenialDecision> {
+    const key = scope ? `denial:${scope}:${env}:${appId}` : `denial:${env}:${appId}`;
+    const count = await this.#store.bump(key, this.#windowMs);
     if (count <= this.#max) return { meter: true };
     const suppressed = count - this.#max;
     return suppressed === 1 || suppressed % SUMMARY_EVERY === 0

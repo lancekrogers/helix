@@ -10,9 +10,11 @@ import {
   ATTR_APP_ID,
   ATTR_CAPABILITY,
   ATTR_OUTCOME,
+  ATTR_REASON,
   ATTR_USAGE_BASIS,
   capTargetPath,
   TARGET_PATH_MAX,
+  type AdmissionDenialReason,
   type CutChargeBasis,
 } from "@azx-pbc/shared/telemetry";
 import { instruments } from "../telemetry.js";
@@ -417,6 +419,18 @@ export class PgUsageStore implements UsageStore {
  *
  * They still share a call site, so the `outcome` vocabulary cannot drift.
  */
+export function meterAdmissionDenied(call: {
+  appId: string;
+  capability: string;
+  reason: AdmissionDenialReason;
+}): void {
+  instruments().gatewayAdmissionDenied.add(1, {
+    [ATTR_APP_ID]: call.appId,
+    [ATTR_CAPABILITY]: call.capability,
+    [ATTR_REASON]: call.reason,
+  });
+}
+
 export function meterGatewayCall(call: {
   appId: string;
   capability: string;
