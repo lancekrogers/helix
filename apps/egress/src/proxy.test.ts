@@ -2,7 +2,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { SignJWT } from "jose";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { request as undiciRequest } from "undici";
 import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import {
   INSTRUCTION_AUDIENCE,
@@ -457,5 +458,92 @@ describe("egress /proxy — connection pooling (ADR-0005 perf note)", () => {
 
     await app.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+});
+
+describe("egress /proxy — client hang-up after the first byte (characterization)", () => {
+  // Result on main (792557a): passes — the vendor response closed ~10–15 ms after the hang-up
+  // (10× run in the dev container, no flake). The claim under test is that a hang-up after
+  // the upstream headers arrive already tears down the vendor connection, through Fastify's
+  // sendStream -> capBody pipeline -> undici body destroy. It says nothing about a hang-up
+  // BEFORE the headers arrive; that window is closed by the next change.
+  let slow: Server;
+  let slowOrigin: string;
+  // Count HTTP requests, not TCP connections: after an aborted stream undici's pool can
+  // open an idle connection that carries no request, and that is not a retry.
+  let requests = 0;
+  let closedEarly = false;
+
+  beforeAll(async () => {
+    slow = createServer((req, res) => {
+      requests += 1;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: first\n\n");
+      let sent = 1;
+      const timer = setInterval(() => {
+        res.write("data: more\n\n");
+        // /finite ends by itself after a few chunks; /stream would run for 10 s.
+        if (req.url === "/finite" && ++sent >= 4) {
+          clearInterval(timer);
+          res.end();
+        }
+      }, 25);
+      const stop = setTimeout(() => {
+        clearInterval(timer);
+        res.end();
+      }, 10_000);
+      // 'close' fires when the socket goes away. writableFinished is still false when
+      // the connection was torn down before end() ran.
+      res.on("close", () => {
+        clearInterval(timer);
+        clearTimeout(stop);
+        if (!res.writableFinished) closedEarly = true;
+      });
+    });
+    await new Promise<void>((resolve) => slow.listen(0, "127.0.0.1", resolve));
+    slowOrigin = `http://127.0.0.1:${(slow.address() as AddressInfo).port}`;
+  });
+  afterAll(async () => {
+    slow.closeAllConnections();
+    await new Promise<void>((resolve) => slow.close(() => resolve()));
+  });
+
+  async function callThroughSocket(path: string) {
+    const app = makeApp(true);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    requests = 0;
+    closedEarly = false;
+    const res = await undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint({ origin: slowOrigin }),
+        [TARGET_HEADER]: `${slowOrigin}${path}`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    return { app, res };
+  }
+
+  it("closes the vendor connection when the client hangs up after the first chunk", async () => {
+    const { app, res } = await callThroughSocket("/stream");
+    expect(res.statusCode).toBe(200);
+    await res.body[Symbol.asyncIterator]().next(); // the first chunk has arrived
+    res.body.destroy(); // the hang-up
+    await vi.waitFor(() => expect(closedEarly).toBe(true), { timeout: 2_000, interval: 10 });
+    // Egress did not send a second request to recover or retry.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(requests).toBe(1);
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("control: a client that stays connected sees the upstream finish normally", async () => {
+    const { app, res } = await callThroughSocket("/finite");
+    await res.body.text(); // read to the end
+    await new Promise((r) => setTimeout(r, 100));
+    expect(closedEarly).toBe(false);
+    app.server.closeAllConnections();
+    await app.close();
   });
 });
