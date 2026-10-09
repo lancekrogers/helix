@@ -1,8 +1,29 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { SignJWT } from "jose";
+import { request as undiciRequest } from "undici";
 import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
-import { TARGET_PATH_MAX } from "@azx-pbc/shared/telemetry";
+import {
+  INSTRUCTION_AUDIENCE,
+  INSTRUCTION_HEADER,
+  INSTRUCTION_JWT_TYP,
+  METHOD_HEADER,
+  TARGET_HEADER,
+} from "@azx-pbc/shared";
+import {
+  ATTR_CLIENT_DISCONNECTED,
+  SPAN_EGRESS_PROXY,
+  TARGET_PATH_MAX,
+} from "@azx-pbc/shared/telemetry";
+import { buildApp } from "./app.js";
+import type { EgressConfig } from "./config.js";
+import { deriveInstructionKey } from "./instruction.js";
 import { EGRESS_SPAN_ATTRS, egressSpanAttributes } from "./spanAttributes.js";
 import { tracer } from "./telemetry.js";
+
+const instructionKey = deriveInstructionKey(randomBytes(32));
 
 /**
  * ADR-0037 decision 6, egress half: "Egress attributes are a hardcoded
@@ -178,6 +199,102 @@ describe("a recorded egress span", () => {
       }
       expect(recorded?.events.filter((e) => e.name === "exception")).toEqual([]);
     }
+  });
+
+  it("stays on the allowlist when the edge hangs up before upstream headers", async () => {
+    let headerTimer: ReturnType<typeof setTimeout> | undefined;
+    const upstream = createServer((req, res) => {
+      if (req.url !== "/slow-headers") {
+        res.end("ok");
+        return;
+      }
+      res.on("error", () => {});
+      const stop = () => {
+        if (headerTimer !== undefined) clearTimeout(headerTimer);
+      };
+      res.on("close", stop);
+      req.on("close", stop);
+      headerTimer = setTimeout(() => {
+        res.writeHead(200);
+        res.end("late");
+      }, 3000);
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+
+    const config = {
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+      allowPrivate: true,
+      allowInsecureConnection: true,
+    } as EgressConfig;
+    const app = buildApp({ config, resolver: null, instructionKey, burnStore: null });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+
+    const requestId = randomUUID();
+    const token = await new SignJWT({
+      appId: "app-1",
+      userOid: "user-1",
+      capability: "fetch",
+      origin,
+      requestId,
+    })
+      .setProtectedHeader({ alg: "HS256", typ: INSTRUCTION_JWT_TYP })
+      .setJti(requestId)
+      .setAudience(INSTRUCTION_AUDIENCE)
+      .setIssuedAt()
+      .setExpirationTime("30s")
+      .sign(instructionKey);
+
+    const ac = new AbortController();
+    const pending = undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/slow-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    ac.abort();
+    try {
+      await pending;
+    } catch {
+      // hang-up
+    }
+    await vi.waitFor(
+      () => {
+        expect(
+          recording
+            .spans()
+            .some(
+              (s) =>
+                s.name === SPAN_EGRESS_PROXY && s.attributes[ATTR_CLIENT_DISCONNECTED] === true,
+            ),
+        ).toBe(true);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+
+    const recorded = recording
+      .spans()
+      .filter((s) => s.name === SPAN_EGRESS_PROXY)
+      .find((s) => s.attributes[ATTR_CLIENT_DISCONNECTED] === true);
+    expect(recorded).toBeDefined();
+    expect(recorded?.attributes[ATTR_CLIENT_DISCONNECTED]).toBe(true);
+    expect(recorded?.attributes["helix.outcome"]).toBe("ok");
+    expect(recorded?.attributes["helix.upstream.status"]).toBe(200);
+    expect(recorded?.events.filter((e) => e.name === "exception")).toEqual([]);
+    const serialized = JSON.stringify(recorded?.attributes ?? {});
+    expect(serialized).not.toMatch(/authorization|x-api-key|Bearer/i);
+    for (const key of Object.keys(recorded?.attributes ?? {})) {
+      expect(EGRESS_SPAN_ATTRS, `${key} is not on the egress allowlist`).toContain(key);
+    }
+
+    app.server.closeAllConnections();
+    await app.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
   });
 
   it("records no exception, because an egress error message can carry a secret", async () => {

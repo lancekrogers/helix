@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { Writable } from "node:stream";
 import { SignJWT } from "jose";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { request as undiciRequest } from "undici";
@@ -13,6 +14,11 @@ import {
   OUTCOME_HEADER,
   TARGET_HEADER,
 } from "@azx-pbc/shared";
+import {
+  ATTR_CAPABILITY,
+  INSTR_EGRESS_UPSTREAM_ABORTS,
+  SPAN_EGRESS_PROXY,
+} from "@azx-pbc/shared/telemetry";
 import { buildApp } from "./app.js";
 import type { EgressConfig } from "./config.js";
 import { signTimestamp } from "./hmac.js";
@@ -114,6 +120,7 @@ async function mint(claims: {
   origin: string;
   connection?: string;
   appId?: string;
+  capability?: "fetch" | "llm";
 }): Promise<string> {
   // Unique requestId per call so a shared burn store (where wired) wouldn't
   // reject the second mint as a replay.
@@ -121,7 +128,7 @@ async function mint(claims: {
   const jwt = new SignJWT({
     appId: claims.appId ?? "app-1",
     userOid: "user-1",
-    capability: "fetch",
+    capability: claims.capability ?? "fetch",
     origin: claims.origin,
     requestId,
     ...(claims.connection ? { connection: claims.connection } : {}),
@@ -545,5 +552,260 @@ describe("egress /proxy — client hang-up after the first byte (characterizatio
     expect(closedEarly).toBe(false);
     app.server.closeAllConnections();
     await app.close();
+  });
+});
+
+async function metricTotal(name: string, match: Record<string, string>): Promise<number> {
+  const points = await recording.metrics();
+  return points
+    .filter(
+      (m) => m.name === name && Object.entries(match).every(([k, v]) => m.attributes[k] === v),
+    )
+    .reduce((sum, m) => sum + m.value, 0);
+}
+
+describe("egress /proxy — hang-up before the headers (upstream abort)", () => {
+  let slowHeaders: Server;
+  let slowHeadersOrigin: string;
+  let upstreamSawClose = false;
+  let headerDelayTimer: ReturnType<typeof setTimeout> | undefined;
+
+  beforeAll(async () => {
+    slowHeaders = createServer((req, res) => {
+      if (req.url === "/slow-headers") {
+        res.on("error", () => {});
+        const onGone = () => {
+          if (headerDelayTimer !== undefined) clearTimeout(headerDelayTimer);
+          upstreamSawClose = true;
+        };
+        res.on("close", onGone);
+        req.on("close", onGone);
+        headerDelayTimer = setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("late");
+        }, 3000);
+        return;
+      }
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => slowHeaders.listen(0, "127.0.0.1", resolve));
+    slowHeadersOrigin = `http://127.0.0.1:${(slowHeaders.address() as AddressInfo).port}`;
+  });
+  afterAll(async () => {
+    slowHeaders.closeAllConnections();
+    await new Promise<void>((resolve) => slowHeaders.close(() => resolve()));
+  });
+
+  async function callSlowHeaders(
+    app: ReturnType<typeof makeApp>,
+    capability: "fetch" | "llm" = "fetch",
+  ) {
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    upstreamSawClose = false;
+    headerDelayTimer = undefined;
+    const ac = new AbortController();
+    const token = await mint({ origin: slowHeadersOrigin, capability });
+    const req = undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${slowHeadersOrigin}/slow-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    ac.abort();
+    try {
+      await req;
+    } catch {
+      // hang-up
+    }
+    await vi.waitFor(
+      () => {
+        expect(
+          recording
+            .spans()
+            .some(
+              (s) =>
+                s.name === SPAN_EGRESS_PROXY && s.attributes["helix.client_disconnected"] === true,
+            ),
+        ).toBe(true);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    return app;
+  }
+
+  it("closes the upstream connection well before the header delay elapses", async () => {
+    const app = makeApp(true);
+    await callSlowHeaders(app, "fetch");
+    await vi.waitFor(() => expect(upstreamSawClose).toBe(true), { timeout: 1000, interval: 25 });
+    const span = recording.spans().find((s) => s.name === SPAN_EGRESS_PROXY);
+    expect(span?.attributes["helix.client_disconnected"]).toBe(true);
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("never dials the vendor when the client aborts during secret resolution", async () => {
+    let connections = 0;
+    const dialProbe = createServer((_req, res) => {
+      connections += 1;
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => dialProbe.listen(0, "127.0.0.1", resolve));
+    const probeOrigin = `http://127.0.0.1:${(dialProbe.address() as AddressInfo).port}`;
+
+    let releaseResolve!: () => void;
+    const waitingResolver: SecretResolver = {
+      resolve: async () => {
+        await new Promise<void>((resolve) => {
+          releaseResolve = resolve;
+        });
+        return { value: "ghp_secret", injection: { kind: "header-bearer" } };
+      },
+      close: async () => {},
+    };
+
+    const app = makeApp(true, waitingResolver);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    const ac = new AbortController();
+    const token = await mint({ origin: probeOrigin, connection: "gh" });
+    const pending = undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${probeOrigin}/`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort();
+    try {
+      await pending;
+    } catch {
+      // hang-up
+    }
+    await vi.waitFor(() => expect(connections).toBe(0), { timeout: 2000, interval: 25 });
+    releaseResolve();
+
+    app.server.closeAllConnections();
+    await app.close();
+    await new Promise<void>((resolve) => dialProbe.close(() => resolve()));
+  });
+
+  it("logs no upstream request failed warning on a pre-header hang-up", async () => {
+    const chunks: string[] = [];
+    const capture = new Writable({
+      write(chunk: unknown, _enc: BufferEncoding, cb: (e?: Error | null) => void) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const config = {
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+      allowPrivate: true,
+      allowInsecureConnection: true,
+    } as EgressConfig;
+    const app = buildApp(
+      { config, resolver: fakeResolver, instructionKey: key, burnStore: null },
+      { level: "warn", stream: capture },
+    );
+    await callSlowHeaders(app, "fetch");
+    expect(chunks.join("")).not.toContain("upstream request failed");
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("increments helix.egress.upstream_aborts with helix.capability only (fetch)", async () => {
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    const app = makeApp(true);
+    await callSlowHeaders(app, "fetch");
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "fetch",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    const points = await recording.metrics();
+    const added = points.filter(
+      (m) =>
+        m.name === INSTR_EGRESS_UPSTREAM_ABORTS &&
+        m.attributes[ATTR_CAPABILITY] === "fetch" &&
+        m.value > 0,
+    );
+    for (const p of added) {
+      expect(Object.keys(p.attributes).sort()).toEqual([ATTR_CAPABILITY]);
+    }
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("increments helix.egress.upstream_aborts for an llm instruction", async () => {
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "llm",
+    });
+    const app = makeApp(true);
+    await callSlowHeaders(app, "llm");
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "llm",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("still pools sockets after an abandoned call", async () => {
+    let connections = 0;
+    const server = createServer((_req, res) => res.end("ok"));
+    server.on("connection", () => void connections++);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const localOrigin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    const app = makeApp(true);
+    await callSlowHeaders(app, "fetch");
+
+    const recovery = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint({ origin: localOrigin }),
+        [TARGET_HEADER]: `${localOrigin}/`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(recovery.statusCode).toBe(200);
+
+    const requests = 6;
+    for (let i = 0; i < requests; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/proxy",
+        headers: {
+          [INSTRUCTION_HEADER]: await mint({ origin: localOrigin }),
+          [TARGET_HEADER]: `${localOrigin}/`,
+          [METHOD_HEADER]: "GET",
+        },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+    expect(connections).toBeLessThan(requests + 1);
+
+    app.server.closeAllConnections();
+    await app.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });

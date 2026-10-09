@@ -1,10 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { SignJWT } from "jose";
 import { request as undiciRequest } from "undici";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import {
   INSTRUCTION_AUDIENCE,
   INSTRUCTION_HEADER,
@@ -13,6 +14,7 @@ import {
   OUTCOME_HEADER,
   TARGET_HEADER,
 } from "@azx-pbc/shared";
+import { ATTR_CAPABILITY, INSTR_EGRESS_UPSTREAM_ABORTS } from "@azx-pbc/shared/telemetry";
 import { buildApp } from "./app.js";
 import type { EgressConfig } from "./config.js";
 import { deriveInstructionKey } from "./instruction.js";
@@ -476,8 +478,19 @@ describe("egress body-size cap (issue #8)", () => {
   let capOrigin: string;
   let app: ReturnType<typeof buildApp>;
   let base: string;
+  let recording: RecordingTelemetry;
+
+  async function metricTotal(name: string, match: Record<string, string>): Promise<number> {
+    const points = await recording.metrics();
+    return points
+      .filter(
+        (m) => m.name === name && Object.entries(match).every(([k, v]) => m.attributes[k] === v),
+      )
+      .reduce((sum, m) => sum + m.value, 0);
+  }
 
   beforeAll(async () => {
+    recording = startRecordingTelemetry();
     upstream = createServer((req, res) => {
       if (req.url === "/large") {
         // 320 bytes, chunked (no content-length) — the headline bypass.
@@ -509,7 +522,9 @@ describe("egress body-size cap (issue #8)", () => {
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   });
+  afterEach(() => recording.reset());
   afterAll(async () => {
+    await recording.restore();
     await app.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
   });
@@ -595,6 +610,117 @@ describe("egress body-size cap (issue #8)", () => {
     expect(json.code).toBe("too_large");
     expect(res.headers[OUTCOME_HEADER]).toBe("refusal");
     expect(received).toBe(0); // never forwarded
+  });
+
+  it("does not count a request-cap trip as an upstream abort", async () => {
+    const chunks: string[] = [];
+    const capture = new Writable({
+      write(chunk: unknown, _enc: BufferEncoding, cb: (e?: Error | null) => void) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const config = {
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
+      allowPrivate: true,
+    } as EgressConfig;
+    const capApp = buildApp(
+      { config, resolver, instructionKey: key, burnStore: null },
+      { level: "warn", stream: capture },
+    );
+    await capApp.listen({ port: 0, host: "127.0.0.1" });
+    const capBase = `http://127.0.0.1:${(capApp.server.address() as AddressInfo).port}`;
+
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    received = 0;
+    const body = Readable.from([bytes(64), bytes(64), bytes(64), bytes(64)]);
+    let status = 0;
+    let threw = false;
+    try {
+      const res = await undiciRequest(`${capBase}/proxy`, {
+        method: "POST",
+        headers: {
+          [INSTRUCTION_HEADER]: await mint(capOrigin),
+          [TARGET_HEADER]: `${capOrigin}/sink`,
+          [METHOD_HEADER]: "POST",
+        },
+        body,
+      });
+      status = res.statusCode;
+      await res.body.text().catch(() => {});
+    } catch {
+      threw = true;
+    }
+    expect(threw || status === 413).toBe(true);
+    const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    expect(after).toBe(before);
+    expect(chunks.join("")).not.toContain("upstream request failed");
+    await capApp.close();
+  });
+
+  it("counts a client hang-up mid-upload as an upstream abort", async () => {
+    const chunks: string[] = [];
+    const capture = new Writable({
+      write(chunk: unknown, _enc: BufferEncoding, cb: (e?: Error | null) => void) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const config = {
+      limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000 },
+      allowPrivate: true,
+    } as EgressConfig;
+    const capApp = buildApp(
+      { config, resolver, instructionKey: key, burnStore: null },
+      { level: "warn", stream: capture },
+    );
+    await capApp.listen({ port: 0, host: "127.0.0.1" });
+    const capBase = `http://127.0.0.1:${(capApp.server.address() as AddressInfo).port}`;
+
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    received = 0;
+    const ac = new AbortController();
+    let pushed = 0;
+    const slowBody = new Readable({
+      read() {
+        if (pushed++ >= 3) return;
+        this.push(bytes(16));
+      },
+    });
+    const pending = undiciRequest(`${capBase}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(capOrigin),
+        [TARGET_HEADER]: `${capOrigin}/sink`,
+        [METHOD_HEADER]: "POST",
+      },
+      body: slowBody,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    ac.abort();
+    try {
+      await pending;
+    } catch {
+      // hang-up mid-upload
+    }
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "fetch",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    expect(chunks.join("")).not.toContain("upstream request failed");
+    await capApp.close();
   });
 });
 

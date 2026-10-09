@@ -100,6 +100,10 @@ looked up:
   records `http.route` per surface — `/_api/llm/chat` or
   `/_api/openai/v1/chat/completions` — so throttles on the OpenAI-compatible
   route are findable by route.
+- When the edge hangs up before egress finishes writing a response,
+  `helix.egress.proxy` still records `helix.outcome` = `ok` and
+  `helix.upstream.status` = 200, because no outcome header was committed on
+  that path. `helix.client_disconnected` = true is the distinguishing attribute.
 - `helix.egress.exchange` spans carry `helix.outcome` ∈
   `EGRESS_EXCHANGE_OUTCOMES` (`exchanged`, `rejected`, `provider_unavailable`,
   `exchange_failed`, `unauthorized`, `malformed`, `unconfigured` — the seven
@@ -189,6 +193,7 @@ looked up:
 | `helix.gateway.calls` | counter | `capability`, `outcome`, `appId` |
 | `helix.gateway.duration` | histogram (ms) | `capability`, `outcome` |
 | `helix.egress.proxy.duration` | histogram (ms) | `outcome` |
+| `helix.egress.upstream_aborts` | counter | `capability` (`llm` or `fetch`) |
 | `helix.egress.exchanges` | counter | `outcome`, `env` |
 | `helix.egress.renewals` | counter | `outcome`, `env` (the renewal taxonomy; alert on a run of `temporary_failure`/`admin_action`, and treat any `uncertain_rotation` as a user-visible reconnection) |
 | `helix.egress.retirements` | counter | `outcome`, `env` (the retirement ledger's consumption: `retired` / `failed` / `claimed_lost`. `failed` is the alertable word — it also fires the fixed `egress.connection_retire_failed` warn event, and the entry is restored and retried on a later pass within the 15-minute recovery bound. `claimed_lost` is the sweep losing a claim race to a writer (a reconnect's swap, a newer mark) — the conditional re-check working, never a fault; see ADR-0031 amendment item 12 for why the claim must be CAS) |
