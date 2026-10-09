@@ -160,6 +160,10 @@ export class FakeLlmProvider implements LlmProvider {
     cacheCreationInputTokens: 0,
   };
   stopReason = "end_turn";
+  /** When set, yielded before the first delta (Anthropic `message_start` shape). */
+  earlyUsage?: LlmUsage;
+  /** When set, thrown after all deltas instead of yielding `done`. */
+  errorAfterDeltas: Error | null = null;
   /** When set, stream() throws before yielding anything. */
   error: Error | null = null;
   /** Awaited before each delta — a hook for interleaving/observation. */
@@ -180,6 +184,9 @@ export class FakeLlmProvider implements LlmProvider {
         { once: true },
       );
     }
+    if (this.earlyUsage) {
+      yield { type: "usage", usage: this.earlyUsage };
+    }
     let index = 0;
     for (const text of this.deltas) {
       // Throw rather than return: a real provider surfaces a cancelled stream as
@@ -192,6 +199,7 @@ export class FakeLlmProvider implements LlmProvider {
       await this.onDelta?.(index++);
       yield { type: "delta", text };
     }
+    if (this.errorAfterDeltas) throw this.errorAfterDeltas;
     yield { type: "done", stopReason: this.stopReason, usage: this.usage };
   }
 

@@ -338,6 +338,9 @@ export function makeLlmHandler(
           if (ev.type === "delta") {
             start();
             codec.writeDelta(reply, ctx, ev.text);
+          } else if (ev.type === "usage") {
+            // Interim counts; `done` carries the final totals and still overwrites finalUsage.
+            // Nothing is recorded from an interim event here.
           } else {
             Object.assign(finalUsage, ev.usage);
             finalStopReason = ev.stopReason;
@@ -379,7 +382,10 @@ export function makeLlmHandler(
     try {
       for await (const ev of events) {
         if (ev.type === "delta") content += ev.text;
-        else {
+        else if (ev.type === "usage") {
+          // Interim counts; `done` carries the final totals and still overwrites finalUsage.
+          // Nothing is recorded from an interim event here.
+        } else {
           Object.assign(finalUsage, ev.usage);
           finalStopReason = ev.stopReason;
         }

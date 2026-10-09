@@ -49,7 +49,8 @@ privilege *increase* — see [capabilities-and-manifests.md](./capabilities-and-
 
 `apps/edge/src/gateway/provider.ts` defines a vendor-agnostic `LlmProvider`:
 `stream(req, {signal, appId, userOid, requestId}) → AsyncIterable<LlmStreamEvent>`, where events
-are `{type: "delta", text}` then a final `{type: "done", stopReason, usage}`. It is a deliberate
+are `{type: "delta", text}`, optional interim `{type: "usage", usage}` events as the vendor
+reports token counts, then a final `{type: "done", stopReason, usage}`. It is a deliberate
 **seam, not a cloned vendor API namespace** — the app speaks the platform's own
 `packages/shared/src/llm.ts` wire contract, and the gateway translates. That indirection is what
 keeps the key out of reach: there is no edge surface that echoes the upstream request, so the app

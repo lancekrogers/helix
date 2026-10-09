@@ -136,7 +136,25 @@ describe("EgressLlmProvider", () => {
     const p = provider(stubEgress({}));
     const events = await collect(p.stream(CHAT, opts));
     expect(events).toEqual([
+      {
+        type: "usage",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
       { type: "delta", text: "Hello" },
+      {
+        type: "usage",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
       {
         type: "done",
         stopReason: "end_turn",

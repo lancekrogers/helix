@@ -144,6 +144,27 @@ describe("happy paths", () => {
     expect(edge.usage.records[0]?.durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("meters once with done totals when the provider emits an interim usage event", async () => {
+    const edge = buildLlmEdge();
+    edge.provider.earlyUsage = {
+      inputTokens: 999,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    };
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+
+    expect(res.statusCode).toBe(200);
+    expect(edge.usage.records).toHaveLength(1);
+    expect(edge.usage.records[0]).toMatchObject({
+      inputTokens: 5,
+      outputTokens: 2,
+      costMicroUsd: 75,
+      outcome: "ok",
+    });
+  });
+
   it("returns a single JSON body when stream:false", async () => {
     const edge = buildLlmEdge();
     const token = await seedSession(edge.sessions);
