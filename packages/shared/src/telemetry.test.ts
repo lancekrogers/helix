@@ -72,6 +72,9 @@ describe("the telemetry vocabulary", () => {
       "app_budget_day",
       "app_budget_burst",
       "platform_ceiling",
+      "concurrency_app",
+      "concurrency_user",
+      "concurrency_replica",
     ]);
   });
 

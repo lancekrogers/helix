@@ -28,6 +28,8 @@ import {
 import { LoginThrottle } from "./auth/loginThrottle.js";
 import { IpRateLimiter } from "./gateway/ipRateLimiter.js";
 import { InMemoryCounterStore } from "./gateway/counterStore.js";
+import { InMemoryLeaseStore, type LeaseStore } from "./gateway/leaseStore.js";
+import { ReplicaGate } from "./gateway/replicaGate.js";
 import { makeCallerResolver, makeSessionGate } from "./auth/gate.js";
 import { makeSameOriginCheck } from "./auth/validate.js";
 import { makeLlmHandler } from "./gateway/llm.js";
@@ -104,6 +106,8 @@ export interface EdgeDeps {
   loginThrottle?: LoginThrottle | null;
   /** Anonymous-tier per-IP gateway limiter; tests inject a low-threshold one. */
   anonRateLimiter?: IpRateLimiter | null;
+  /** In-flight LLM lease store; server injects PG-backed, tests may override. */
+  leases?: LeaseStore | null;
   /** Dev TLS material (server.ts reads the mkcert files); tests omit it. */
   https?: { cert: Buffer; key: Buffer } | null;
 }
@@ -211,6 +215,7 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
   // single-process dev / tests working without a DB (both fallbacks share it —
   // keys are namespaced, so no collision).
   const fallbackCounters = new InMemoryCounterStore();
+  const fallbackLeases = new InMemoryLeaseStore();
   const anonRateLimiter =
     deps.anonRateLimiter ?? new IpRateLimiter(config.anonRateLimit, fallbackCounters);
   // Always in-memory, including in prod (see the class docblock): this damps
@@ -268,6 +273,13 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
           usage: deps.usage ?? null,
           denialThrottle,
           platformCeilingDollars: config.llm.platformDollarsPerDay,
+          concurrency: {
+            leases: deps.leases ?? fallbackLeases,
+            gate: new ReplicaGate(config.llm.maxInFlight),
+            maxAppInFlight: config.llm.maxAppInFlight,
+            maxUserInFlight: config.llm.maxUserInFlight,
+          },
+          maxCallMs: config.llm.maxCallMs,
         }
       : null;
   const handleLlmChat = llmRuntime ? makeLlmHandler(llmRuntime) : null;

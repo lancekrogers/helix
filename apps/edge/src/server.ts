@@ -21,6 +21,7 @@ import { PgAppDataStore, type AppDataStore } from "./gateway/data.js";
 import { IpRateLimiter } from "./gateway/ipRateLimiter.js";
 import { LoginThrottle } from "./auth/loginThrottle.js";
 import { PgCounterStore } from "./gateway/counterStore.js";
+import { PgLeaseStore } from "./gateway/leaseStore.js";
 import { PgCspReportStore } from "./serving/cspReport.js";
 import { PgVisitStore } from "./serving/visits.js";
 import type { PoolClientErrorPhase } from "./db/pool.js";
@@ -179,6 +180,10 @@ const counterStore = new PgCounterStore(config.databaseUrl, {
   statementTimeoutMs: config.statementTimeoutMs,
   onClientError,
 });
+const leases = new PgLeaseStore(config.databaseUrl, {
+  statementTimeoutMs: config.statementTimeoutMs,
+  onClientError,
+});
 const anonRateLimiter = new IpRateLimiter(config.anonRateLimit, counterStore);
 const loginThrottle = new LoginThrottle(counterStore);
 
@@ -249,6 +254,7 @@ const app = buildApp({
   visits,
   anonRateLimiter,
   loginThrottle,
+  leases,
   https,
 });
 logRef.current = {
@@ -275,12 +281,19 @@ const counterSweep = setInterval(() => {
     .catch((err: unknown) => app.log.warn({ err }, "rate_counters sweep failed"));
 }, counterSweepMs);
 counterSweep.unref();
+const leaseSweep = setInterval(() => {
+  void leases
+    .sweep()
+    .catch((err: unknown) => app.log.warn({ err }, "inflight_leases sweep failed"));
+}, 60_000);
+leaseSweep.unref();
 app.addHook("onClose", async () => {
   if (observePlatformSpendRatio) {
     instruments().platformSpendRatio.removeCallback(observePlatformSpendRatio);
   }
   sweeper?.stop();
   clearInterval(counterSweep);
+  clearInterval(leaseSweep);
   oidc?.stop();
   await registry.stop();
   await sessions?.close();
@@ -292,6 +305,7 @@ app.addHook("onClose", async () => {
   await visits.close();
   await llmProvider?.close();
   await counterStore.close();
+  await leases.close();
   await blob.close();
   // Last: flush the final batch after everything that could still record.
   await telemetry.shutdown();
@@ -350,6 +364,10 @@ try {
       allowPasswordApps: config.allowPasswordApps,
       llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
       llmPlatformDollarsPerDay: config.llm.platformDollarsPerDay,
+      llmMaxAppInFlight: config.llm.maxAppInFlight,
+      llmMaxUserInFlight: config.llm.maxUserInFlight,
+      llmMaxInFlight: config.llm.maxInFlight,
+      llmMaxCallMs: config.llm.maxCallMs,
       tls: https !== null,
       // Free, and it answers "why do I have no traces" without an exec into
       // the container — the commonest first question about a telemetry

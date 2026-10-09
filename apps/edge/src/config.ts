@@ -209,6 +209,26 @@ export interface GatewayConfig {
      * (`helix_dev` has no `EXECUTE` on the aggregate function).
      */
     platformDollarsPerDay: number;
+    /**
+     * Max concurrent LLM calls per app across all edge replicas (`EDGE_LLM_MAX_APP_IN_FLIGHT`).
+     * `0` disables.
+     */
+    maxAppInFlight: number;
+    /**
+     * Max concurrent LLM calls per authenticated user per app (`EDGE_LLM_MAX_USER_IN_FLIGHT`).
+     * Anonymous callers are not bucketed by user. `0` disables.
+     */
+    maxUserInFlight: number;
+    /**
+     * Max concurrent LLM calls on this replica (`EDGE_LLM_MAX_IN_FLIGHT`). Per replica by
+     * design; cross-replica limits use Postgres leases. `0` disables.
+     */
+    maxInFlight: number;
+    /**
+     * Wall-clock deadline for one upstream LLM call in ms (`EDGE_LLM_MAX_CALL_MS`). Also bounds
+     * lease TTL (deadline plus a grace period). Must be positive — there is no off value.
+     */
+    maxCallMs: number;
   };
   /**
    * Fetch-proxy wiring (M4.5). The policy plane authorizes a `/_api/fetch` call
@@ -715,6 +735,15 @@ function requireNonNegativeNumber(raw: string | undefined, fallback: number, nam
   return value;
 }
 
+function requireNonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    throw new Error(`${name} must be a non-negative integer (got ${JSON.stringify(raw)})`);
+  }
+  return value;
+}
+
 /**
  * Validate an LLM upstream path override. Egress binds
  * `target.pathname === instruction.path` (the path only), so anything URL
@@ -794,6 +823,18 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
         0,
         "EDGE_LLM_PLATFORM_DOLLARS_PER_DAY",
       ),
+      maxAppInFlight: requireNonNegativeInt(
+        env.EDGE_LLM_MAX_APP_IN_FLIGHT,
+        10,
+        "EDGE_LLM_MAX_APP_IN_FLIGHT",
+      ),
+      maxUserInFlight: requireNonNegativeInt(
+        env.EDGE_LLM_MAX_USER_IN_FLIGHT,
+        3,
+        "EDGE_LLM_MAX_USER_IN_FLIGHT",
+      ),
+      maxInFlight: requireNonNegativeInt(env.EDGE_LLM_MAX_IN_FLIGHT, 200, "EDGE_LLM_MAX_IN_FLIGHT"),
+      maxCallMs: requirePositiveMs(env.EDGE_LLM_MAX_CALL_MS, 600_000, "EDGE_LLM_MAX_CALL_MS"),
     },
     fetch: {
       egressUrl: env.EDGE_EGRESS_URL || null,

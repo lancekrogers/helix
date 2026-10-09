@@ -33,6 +33,7 @@ import {
   registryEntry,
 } from "./test/fakes.js";
 import { LlmProviderError } from "./gateway/provider.js";
+import { InMemoryLeaseStore } from "./gateway/leaseStore.js";
 
 /**
  * ADR-0037 decision 10's redaction case — the direct sibling of
@@ -772,6 +773,10 @@ describe("LLM admission denials", () => {
           },
           defaultDollarsPerDay: 50,
           platformDollarsPerDay: 1,
+          maxAppInFlight: 0,
+          maxUserInFlight: 0,
+          maxInFlight: 0,
+          maxCallMs: 600_000,
         },
       }),
       registry: new FakeRegistry([
@@ -816,6 +821,122 @@ describe("LLM admission denials", () => {
     }
     const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
     expect(llmSpan?.attributes[ATTR_REASON]).toBe("platform_ceiling");
+  });
+
+  it("never leaks prompt, oid, or lease scope on a concurrency cap refusal", async () => {
+    const sessions = new FakeSessionStore();
+    const leases = new InMemoryLeaseStore();
+    let resume!: () => void;
+    const hold = new Promise<void>((r) => {
+      resume = r;
+    });
+    const provider = new FakeLlmProvider();
+    provider.onDelta = async () => {
+      await hold;
+    };
+    const usage = new FakeUsageStore();
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({
+        auth: testAuthConfig(),
+        allowUnauthenticated: false,
+        llm: {
+          endpoint: "https://api.anthropic.com",
+          path: "/v1/messages",
+          anthropicVersion: "2023-06-01",
+          connection: "anthropic",
+          openai: {
+            endpoint: "https://api.openai.com",
+            path: "/v1/chat/completions",
+            connection: "openai",
+          },
+          defaultDollarsPerDay: 50,
+          platformDollarsPerDay: 0,
+          maxAppInFlight: 1,
+          maxUserInFlight: 0,
+          maxInFlight: 0,
+          maxCallMs: 600_000,
+        },
+      }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "deny",
+          blobPrefix: "apps/e/3/",
+          llm: { models: [MODEL], dollarsPerDay: 10 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: provider,
+      usage,
+      leases,
+    });
+
+    void app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+        stream: true,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+      },
+    });
+    resume();
+    expect(res.statusCode).toBe(503);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_PROMPT);
+      expect(dump).not.toContain(PLANTED_OID);
+      expect(dump).not.toContain("llm:user:");
+      expect(dump).not.toContain("?");
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(llmSpan?.attributes[ATTR_REASON]).toBe("concurrency_app");
   });
 });
 

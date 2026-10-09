@@ -160,6 +160,11 @@ export class InMemoryLeaseStore implements LeaseStore {
 
   async close(): Promise<void> {}
 
+  /** Unexpired leases on `scope` — for tests only. */
+  held(scope: string): number {
+    return this.#countActive(scope, this.#now());
+  }
+
   #countActive(scope: string, t: number): number {
     const m = this.#leases.get(scope);
     if (!m) return 0;

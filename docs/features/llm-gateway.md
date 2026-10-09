@@ -63,6 +63,31 @@ replica for five seconds — overshoot is at most the ceiling plus calls admitte
 cache catches up. A failed read fails closed (`503`, `retry-after: 5`). `0` or unset disables
 the ceiling locally; deployed installs receive a Bicep-derived default.
 
+### Concurrency and the call deadline
+
+Before a call is admitted, the edge enforces three optional in-flight limits plus a
+per-replica socket guard. Cross-replica caps use Postgres leases on scopes
+`llm:app:<appId>` (`EDGE_LLM_MAX_APP_IN_FLIGHT`, default 10) and, for authenticated
+callers only, `llm:user:<appId>:<userOid>` (`EDGE_LLM_MAX_USER_IN_FLIGHT`, default 3).
+Anonymous visitors on `public` apps share one metering identity, so they are covered by
+the app scope and the existing per-IP limiter, not a per-user lease.
+`EDGE_LLM_MAX_IN_FLIGHT` (default 200) is checked in-process on each replica before the
+lease round trip; effective cluster concurrency is at most that value times the replica
+count. Setting any cap to `0` disables it. A refusal returns `503 capability_unavailable`
+with `retry-after: 1`, increments `helix.gateway.admission_denied` (reason
+`concurrency_app`, `concurrency_user`, or `concurrency_replica`), and writes no ledger
+row. Lease acquire failures fail closed (`503`, `retry-after: 5`). Overshoot past a
+daily budget is bounded by at most `appCap × worst-case call cost` while calls are
+in flight.
+
+Each admitted call also gets a wall-clock deadline (`EDGE_LLM_MAX_CALL_MS`, default ten
+minutes). The upstream `AbortSignal` is the client hang-up signal or that timeout,
+whichever comes first. A deadline abort is charged like a partial stream (ledger
+`error` with `deadline_exceeded;usage=…`), not a quota cut. Lease TTL is the deadline
+plus a one-minute grace period so a live call does not lose its slot before it finishes.
+The lease is released only after the ledger row is written, so freed capacity never
+admits a call that cannot yet see the previous call's spend.
+
 ### Provider seam + streaming
 
 `apps/edge/src/gateway/provider.ts` defines a vendor-agnostic `LlmProvider`:

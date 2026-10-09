@@ -184,6 +184,38 @@ describe("loadConfig", () => {
     ).toThrow(/EDGE_LLM_DEFAULT_DOLLARS_PER_DAY must be a non-negative number/);
   });
 
+  it("parses LLM concurrency caps and the call deadline", () => {
+    expect(loadConfig({ ...ENV }).llm.maxAppInFlight).toBe(10);
+    expect(loadConfig({ ...ENV }).llm.maxUserInFlight).toBe(3);
+    expect(loadConfig({ ...ENV }).llm.maxInFlight).toBe(200);
+    expect(loadConfig({ ...ENV }).llm.maxCallMs).toBe(600_000);
+    expect(loadConfig({ ...ENV, EDGE_LLM_MAX_APP_IN_FLIGHT: "0" }).llm.maxAppInFlight).toBe(0);
+    for (const [key, field] of [
+      ["EDGE_LLM_MAX_APP_IN_FLIGHT", "maxAppInFlight"],
+      ["EDGE_LLM_MAX_USER_IN_FLIGHT", "maxUserInFlight"],
+      ["EDGE_LLM_MAX_IN_FLIGHT", "maxInFlight"],
+    ] as const) {
+      for (const bad of ["-1", "2.5", "abc", "NaN", "Infinity"]) {
+        expect(() => loadConfig({ ...ENV, [key]: bad })).toThrow(
+          new RegExp(`${key} must be a non-negative integer`),
+        );
+      }
+      expect(loadConfig({ ...ENV, [key]: "12" }).llm[field]).toBe(12);
+    }
+    for (const bad of ["0", "-1", "abc"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_LLM_MAX_CALL_MS: bad })).toThrow(
+        /EDGE_LLM_MAX_CALL_MS must be a positive number/,
+      );
+    }
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_LLM_MAX_IN_FLIGHT: "2.5",
+      }),
+    ).toThrow(/EDGE_LLM_MAX_IN_FLIGHT must be a non-negative integer/);
+  });
+
   // A hop count trusts by position, so it structurally ignores the peer address
   // and lets anyone reaching the origin directly spoof X-Forwarded-*
   // (GHSA-3m5p-2c4r-xxw2). Fastify 5.12.1 compiles a number to "trust nothing"

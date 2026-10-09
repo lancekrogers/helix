@@ -13,6 +13,8 @@ import { makeDataHandlers } from "../gateway/data-handler.js";
 import { makeFetchHandler } from "../gateway/fetch.js";
 import { DenialThrottle } from "../gateway/denialThrottle.js";
 import { InMemoryCounterStore } from "../gateway/counterStore.js";
+import { InMemoryLeaseStore } from "../gateway/leaseStore.js";
+import { ReplicaGate } from "../gateway/replicaGate.js";
 import type { LlmProvider } from "../gateway/provider.js";
 import type { EgressProvider } from "../gateway/egressProvider.js";
 import type { UsageStore } from "../gateway/usage.js";
@@ -134,6 +136,8 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
   // Single-process by construction, but the dev gateway writes to the same
   // ledger as the edge, so the same denial cap applies.
   const denialThrottle = new DenialThrottle(new InMemoryCounterStore());
+  // Single process, so in-memory leases are correct; helix_dev has no grant on inflight_leases.
+  const llmLeases = new InMemoryLeaseStore();
 
   const llmRuntime = {
     config,
@@ -146,6 +150,13 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
     denialThrottle,
     // helix_dev has no EXECUTE on platform_llm_spend_micro_usd; no platform ceiling here.
     platformCeilingDollars: 0,
+    concurrency: {
+      leases: llmLeases,
+      gate: new ReplicaGate(config.llm.maxInFlight),
+      maxAppInFlight: config.llm.maxAppInFlight,
+      maxUserInFlight: config.llm.maxUserInFlight,
+    },
+    maxCallMs: config.llm.maxCallMs,
   };
   const handleLlmChat = makeLlmHandler(llmRuntime);
   const handleOpenAiChat = makeLlmHandler(llmRuntime, openAiCodec, ROUTE_OPENAI);

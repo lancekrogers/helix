@@ -121,6 +121,10 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `platformMonthlyUsdCap` | `1000` | Display-only LLM spend line on the admin Activity page. `0` hides it. The enforced daily LLM ceiling defaults to one tenth of this value (`llmPlatformDollarsPerDay`) |
 | `llmDefaultDollarsPerDay` | `50` | Daily LLM spend enforced when an app's manifest omits `dollarsPerDay` (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` on the edge and dev gateway). Matches the approval baseline; raising it enforces more than the classifier showed approvers. `0` = unset is unlimited |
 | `llmPlatformDollarsPerDay` | `-1` | Platform-wide daily LLM ceiling enforced on the edge (`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`). `-1` derives one tenth of `platformMonthlyUsdCap` (or `100` when that is `0`). `0` switches enforcement off. Apply the `platform_llm_spend_micro_usd` migration before the edge image that reads it |
+| `llmMaxAppInFlight` | `10` | Cross-replica cap on concurrent LLM calls per app (`EDGE_LLM_MAX_APP_IN_FLIGHT`). `0` disables |
+| `llmMaxUserInFlight` | `3` | Cross-replica cap per authenticated user per app (`EDGE_LLM_MAX_USER_IN_FLIGHT`). `0` disables |
+| `llmMaxInFlight` | `200` | Per-replica in-flight LLM cap (`EDGE_LLM_MAX_IN_FLIGHT`). `0` disables |
+| `llmMaxCallMs` | `600000` | Wall-clock upstream LLM deadline in ms (`EDGE_LLM_MAX_CALL_MS`) |
 | `deployMaxFileMb` | `50` | Max uncompressed size of any single file in a deployed bundle |
 | `deployMaxBundleMb` | `250` | Max uncompressed size of the whole bundle (and the compressed upload). Raising it a lot wants more CPU/memory on the portal container |
 | `fetchMaxBodyMb` | `25` | Max size of each direction of a `/_api/fetch` call (the request body and the response body). Sets `EDGE_FETCH_MAX_BODY_BYTES` on the edge and dev gateway and `EGRESS_MAX_BODY_BYTES` on egress; each hop enforces it, and a call over it gets a 413 |
@@ -194,6 +198,10 @@ build-time configuration at all):
 | `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` | No spend line on the Activity page |
 | `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` | `llmDefaultDollarsPerDay` | Apps with no manifest `dollarsPerDay` use the install default ($50/day unless raised); `0` on the parameter means unset is unlimited |
 | `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` | `llmPlatformDollarsPerDay` | Edge-only enforced platform daily LLM ceiling in USD; `0` disables. Not set on the dev gateway |
+| `EDGE_LLM_MAX_APP_IN_FLIGHT` | `llmMaxAppInFlight` | Cross-replica concurrent LLM calls per app; `0` disables |
+| `EDGE_LLM_MAX_USER_IN_FLIGHT` | `llmMaxUserInFlight` | Cross-replica concurrent LLM calls per authenticated user per app; `0` disables |
+| `EDGE_LLM_MAX_IN_FLIGHT` | `llmMaxInFlight` | Per-replica concurrent LLM cap; `0` disables |
+| `EDGE_LLM_MAX_CALL_MS` | `llmMaxCallMs` | Wall-clock LLM call deadline in ms |
 
 The OAuth connections feature adds three more template-derived URLs —
 each is the target app's ingress FQDN, so there is nothing to configure:
@@ -211,6 +219,15 @@ parameter:
 | --- | --- | --- | --- |
 | `EDGE_FETCH_MAX_BODY_BYTES` | edge, dev-gateway | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
 | `EGRESS_MAX_BODY_BYTES` | egress | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
+
+LLM concurrency and the call deadline:
+
+| Variable | App(s) | Set from | If absent |
+| --- | --- | --- | --- |
+| `EDGE_LLM_MAX_APP_IN_FLIGHT` | edge, dev-gateway | `llmMaxAppInFlight` | 10 |
+| `EDGE_LLM_MAX_USER_IN_FLIGHT` | edge, dev-gateway | `llmMaxUserInFlight` | 3 |
+| `EDGE_LLM_MAX_IN_FLIGHT` | edge, dev-gateway | `llmMaxInFlight` | 200 |
+| `EDGE_LLM_MAX_CALL_MS` | edge, dev-gateway | `llmMaxCallMs` | 600000 (10 minutes) |
 
 The portal image also carries one setting for the app owner's Visitors view:
 

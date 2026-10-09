@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { request as undiciRequest } from "undici";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { ATTR_REASON, INSTR_GATEWAY_ADMISSION_DENIED, SPAN_LLM } from "@azx-pbc/shared/telemetry";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
@@ -22,6 +22,7 @@ import {
 import { LlmProviderError } from "./provider.js";
 import { ERROR_DETAIL_MAX } from "./usage.js";
 import { secondsUntilNextLocalMidnight } from "./llm.js";
+import { InMemoryLeaseStore, type LeaseStore } from "./leaseStore.js";
 
 /**
  * The `/_api/llm/chat` gateway (architecture §6.1, project plan §4 M4): authn,
@@ -41,25 +42,38 @@ interface LlmEdge {
   sessions: FakeSessionStore;
   provider: FakeLlmProvider;
   usage: FakeUsageStore;
+  leases: InMemoryLeaseStore;
 }
 
 function buildLlmEdge(
   opts: {
-    llm?: { models: string[]; dollarsPerDay?: number } | null;
+    llm?: {
+      models: string[];
+      dollarsPerDay?: number;
+      visibilityMode?: "internal" | "public";
+    } | null;
     withProvider?: boolean;
     defaultDollarsPerDay?: number;
     platformCeilingDollars?: number;
+    maxAppInFlight?: number;
+    maxUserInFlight?: number;
+    maxInFlight?: number;
+    maxCallMs?: number;
+    leases?: LeaseStore;
+    allowUnauthenticated?: boolean;
   } = {},
 ): LlmEdge {
   const sessions = new FakeSessionStore();
   const provider = new FakeLlmProvider();
   const usage = new FakeUsageStore();
+  const leases = opts.leases instanceof InMemoryLeaseStore ? opts.leases : new InMemoryLeaseStore();
   // Default cap is $1/day (1e6 micro-USD); the burst sub-cap is $1/6.
   const llm = opts.llm === undefined ? { models: [MODEL], dollarsPerDay: 1 } : opts.llm;
   const app = buildApp({
     config: testEdgeConfig({
       auth: testAuthConfig(),
-      allowUnauthenticated: false,
+      allowUnauthenticated: opts.allowUnauthenticated ?? false,
+      allowPublicApps: opts.allowUnauthenticated ?? false,
       llm: {
         endpoint: "https://api.anthropic.com",
         path: "/v1/messages",
@@ -72,27 +86,42 @@ function buildLlmEdge(
         },
         defaultDollarsPerDay: opts.defaultDollarsPerDay ?? 50,
         platformDollarsPerDay: opts.platformCeilingDollars ?? 0,
+        maxAppInFlight: opts.maxAppInFlight ?? 0,
+        maxUserInFlight: opts.maxUserInFlight ?? 0,
+        maxInFlight: opts.maxInFlight ?? 0,
+        maxCallMs: opts.maxCallMs ?? 600_000,
       },
     }),
     registry: new FakeRegistry([
-      registryEntry({ appId: APP_ID, slug: "demo", blobPrefix: PREFIX, llm }),
+      registryEntry({
+        appId: APP_ID,
+        slug: "demo",
+        blobPrefix: PREFIX,
+        visibilityMode: opts.llm?.visibilityMode ?? "internal",
+        llm: llm === null ? undefined : { models: llm.models, dollarsPerDay: llm.dollarsPerDay },
+      }),
     ]),
     blob: new FakeBlobReader(),
     sessions,
     oidc: new FakeOidcClient(),
     llmProvider: opts.withProvider === false ? null : provider,
     usage: opts.withProvider === false ? null : usage,
+    leases,
   });
-  return { app, sessions, provider, usage };
+  return { app, sessions, provider, usage, leases };
 }
 
-async function seedSession(sessions: FakeSessionStore, appId = APP_ID): Promise<string> {
+async function seedSession(
+  sessions: FakeSessionStore,
+  appId = APP_ID,
+  oid = "oid-alice",
+): Promise<string> {
   const id = randomUUID();
   await sessions.createPending({
     id,
     appId,
     user: {
-      oid: "oid-alice",
+      oid,
       displayName: "Alice Anders",
       name: null,
       email: null,
@@ -1174,5 +1203,360 @@ describe("platform ceiling", () => {
       );
     });
     expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThanOrEqual(expectedMicro);
+  });
+});
+
+describe("concurrency caps and the call deadline", () => {
+  async function holdFirstDelta(edge: LlmEdge): Promise<() => void> {
+    let resume!: () => void;
+    const gate = new Promise<void>((r) => {
+      resume = r;
+    });
+    edge.provider.onDelta = async () => {
+      await gate;
+    };
+    return resume;
+  }
+
+  it("refuses a second concurrent call per app and admits again after the first finishes", async () => {
+    const edge = buildLlmEdge({
+      maxAppInFlight: 1,
+      maxUserInFlight: 10,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const alice = await seedSession(edge.sessions, APP_ID, "oid-a");
+    const bob = await seedSession(edge.sessions, APP_ID, "oid-b");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, alice, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first call upstream");
+    const blocked = await chat(edge, bob, { ...ASK, stream: true });
+    expect(blocked.statusCode).toBe(503);
+    expect(blocked.json().error.code).toBe("capability_unavailable");
+    expect(edge.provider.calls).toHaveLength(1);
+    resume();
+    await first;
+    const third = await chat(edge, bob, ASK);
+    expect(third.statusCode).toBe(200);
+  });
+
+  it("refuses a second concurrent call from the same user but admits a different user", async () => {
+    const edge = buildLlmEdge({
+      maxAppInFlight: 5,
+      maxUserInFlight: 1,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const alice = await seedSession(edge.sessions, APP_ID, "oid-a");
+    const bob = await seedSession(edge.sessions, APP_ID, "oid-b");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, alice, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first call upstream");
+    const sameUser = await chat(edge, alice, { ...ASK, stream: true });
+    expect(sameUser.statusCode).toBe(503);
+    resume();
+    await first;
+    const otherUser = await chat(edge, bob, { ...ASK, stream: true });
+    expect(otherUser.statusCode).toBe(200);
+  });
+
+  it("does not bucket anonymous callers by user scope", async () => {
+    const edge = buildLlmEdge({
+      allowUnauthenticated: true,
+      maxAppInFlight: 5,
+      maxUserInFlight: 1,
+      llm: { models: [MODEL], dollarsPerDay: 100, visibilityMode: "public" },
+    });
+    const [first, second] = await Promise.all([
+      chat(edge, null, { ...ASK, stream: true }),
+      chat(edge, null, { ...ASK, stream: true }),
+    ]);
+    expect(first.statusCode).not.toBe(503);
+    expect(second.statusCode).not.toBe(503);
+  });
+
+  it("refuses when the replica gate is full", async () => {
+    const edge = buildLlmEdge({
+      maxInFlight: 1,
+      maxAppInFlight: 100,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+    const b = await seedSession(edge.sessions, APP_ID, "oid-b");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, a, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first call");
+    const blocked = await chat(edge, b, { ...ASK, stream: true });
+    expect(blocked.statusCode).toBe(503);
+    expect(blocked.json().error.message).toContain("replica");
+    resume();
+    await first;
+  });
+
+  it("releases the lease only after the ledger row on streaming, non-streaming, upstream-error and hang-up paths", async () => {
+    const cases = [
+      {
+        label: "streaming ok",
+        run: async (edge: LlmEdge, token: string) => chat(edge, token, { ...ASK, stream: true }),
+      },
+      {
+        label: "non-streaming ok",
+        run: async (edge: LlmEdge, token: string) => chat(edge, token, { ...ASK, stream: false }),
+      },
+      {
+        label: "upstream error after delta",
+        run: async (edge: LlmEdge, token: string) => {
+          edge.provider.errorAfterDeltas = new LlmProviderError("boom");
+          edge.provider.deltas = ["x"];
+          return chat(edge, token, { ...ASK, stream: true });
+        },
+      },
+    ];
+
+    for (const c of cases) {
+      const leases = new InMemoryLeaseStore();
+      const releaseRows: number[] = [];
+      const ctx: { edge: LlmEdge | undefined } = { edge: undefined };
+      const baseRelease = leases.release.bind(leases);
+      vi.spyOn(leases, "release").mockImplementation(async (id) => {
+        releaseRows.push(ctx.edge!.usage.records.length);
+        await baseRelease(id);
+      });
+      ctx.edge = buildLlmEdge({
+        maxAppInFlight: 5,
+        leases,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const token = await seedSession(ctx.edge.sessions);
+      await c.run(ctx.edge, token);
+      expect(releaseRows[0], c.label).toBe(1);
+      expect(leases.held(`llm:app:${APP_ID}`), c.label).toBe(0);
+      const ok = await chat(ctx.edge, token, ASK);
+      expect(ok.statusCode, c.label).toBe(200);
+    }
+
+    const leases = new InMemoryLeaseStore();
+    const releaseRows: number[] = [];
+    const hangCtx: { edge: LlmEdge | undefined } = { edge: undefined };
+    const baseRelease = leases.release.bind(leases);
+    vi.spyOn(leases, "release").mockImplementation(async (id) => {
+      releaseRows.push(hangCtx.edge!.usage.records.length);
+      await baseRelease(id);
+    });
+    hangCtx.edge = buildLlmEdge({
+      maxAppInFlight: 5,
+      leases,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const hangToken = await seedSession(hangCtx.edge.sessions);
+    await withServer(hangCtx.edge.app, async (base) => {
+      const res = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${hangToken}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: true }),
+      });
+      for await (const chunk of res.body) {
+        if (String(chunk).includes("event: delta")) break;
+      }
+      res.body.destroy();
+      await until(() => hangCtx.edge!.usage.records.length === 1, "hang-up row");
+    });
+    expect(releaseRows[0]).toBe(1);
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  it("treats 0 as disabling each cap", async () => {
+    const edge = buildLlmEdge({ maxAppInFlight: 0, maxUserInFlight: 0, maxInFlight: 0 });
+    const a = await seedSession(edge.sessions, APP_ID, "oid-1");
+    const b = await seedSession(edge.sessions, APP_ID, "oid-2");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, a, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first");
+    const second = chat(edge, b, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 2, "second");
+    resume();
+    const [r1, r2] = await Promise.all([first, second]);
+    expect(r1.statusCode).toBe(200);
+    expect(r2.statusCode).toBe(200);
+  });
+
+  it("fails closed when lease acquire throws and returns the replica gate", async () => {
+    class BrokenStore extends InMemoryLeaseStore {
+      #fail = true;
+      override async acquire(...args: Parameters<LeaseStore["acquire"]>) {
+        if (this.#fail) {
+          this.#fail = false;
+          throw new Error("db down");
+        }
+        return super.acquire(...args);
+      }
+    }
+    const broken = new BrokenStore();
+    const edge = buildLlmEdge({ maxAppInFlight: 5, maxInFlight: 5, leases: broken });
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(503);
+    expect(edge.provider.calls).toHaveLength(0);
+    const ok = await chat(edge, token, ASK);
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("charges a deadline abort and returns an in-band streaming error", async () => {
+    const edge = buildLlmEdge({ maxCallMs: 50, llm: { models: [MODEL], dollarsPerDay: 100 } });
+    edge.provider.deltas = Array.from({ length: 20 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    };
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("event: error");
+    const row = edge.usage.records[0];
+    expect(row?.outcome).toBe("error");
+    expect(row?.errorDetail).toMatch(/^deadline_exceeded;usage=/);
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+    expect(row?.stopReason).toBeNull();
+    expect(edge.leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  it("passes maxCallMs plus grace as the lease TTL", async () => {
+    const leases = new InMemoryLeaseStore();
+    const acquire = vi.spyOn(leases, "acquire");
+    const edge = buildLlmEdge({ maxCallMs: 12_000, maxAppInFlight: 5, leases });
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, ASK);
+    expect(acquire).toHaveBeenCalledWith(expect.any(Array), 12_000 + 60_000);
+  });
+
+  it("records admission_denied metrics for concurrency reasons without personal dimensions", async () => {
+    const assertReason = async (
+      reason: "concurrency_app" | "concurrency_user" | "concurrency_replica",
+      run: () => Promise<void>,
+    ): Promise<void> => {
+      const recording = startRecordingTelemetry();
+      try {
+        await run();
+        const points = (await recording.metrics()).filter(
+          (p) => p.name === INSTR_GATEWAY_ADMISSION_DENIED,
+        );
+        const match = points.filter((p) => p.attributes["helix.reason"] === reason);
+        expect(match.length).toBeGreaterThan(0);
+        for (const point of match) {
+          expect(Object.keys(point.attributes).sort()).toEqual([
+            "helix.app_id",
+            "helix.capability",
+            "helix.reason",
+          ]);
+        }
+      } finally {
+        await recording.restore();
+      }
+    };
+    await assertReason("concurrency_app", async () => {
+      const edge = buildLlmEdge({
+        maxAppInFlight: 1,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+      const b = await seedSession(edge.sessions, APP_ID, "oid-b");
+      const resume = await holdFirstDelta(edge);
+      const first = chat(edge, a, { ...ASK, stream: true });
+      await until(() => edge.provider.calls.length === 1, "first");
+      await chat(edge, b, { ...ASK, stream: true });
+      resume();
+      await first;
+    });
+    await assertReason("concurrency_user", async () => {
+      const edge = buildLlmEdge({
+        maxAppInFlight: 10,
+        maxUserInFlight: 1,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+      const resume = await holdFirstDelta(edge);
+      const first = chat(edge, a, { ...ASK, stream: true });
+      await until(() => edge.provider.calls.length === 1, "first");
+      const denied = await chat(edge, a, { ...ASK, stream: true });
+      expect(denied.statusCode).toBe(503);
+      resume();
+      await first;
+    });
+    await assertReason("concurrency_replica", async () => {
+      const edge = buildLlmEdge({
+        maxInFlight: 1,
+        maxAppInFlight: 10,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+      const b = await seedSession(edge.sessions, APP_ID, "oid-b");
+      const resume = await holdFirstDelta(edge);
+      const first = chat(edge, a, { ...ASK, stream: true });
+      await until(() => edge.provider.calls.length === 1, "first");
+      await chat(edge, b, { ...ASK, stream: true });
+      resume();
+      await first;
+    });
+  });
+
+  it("charges eight hung-up streams against the platform ceiling (KP-2 end to end)", async () => {
+    const edge = buildLlmEdge({
+      maxAppInFlight: 20,
+      maxUserInFlight: 20,
+      maxInFlight: 20,
+      // High enough for eight sequential hang-ups (~30 micro each), low enough to block a ninth.
+      platformCeilingDollars: 0.000_22,
+      llm: { models: [MODEL], dollarsPerDay: 1000 },
+    });
+    edge.provider.deltas = Array.from({ length: 50 }, (_, n) => `d${n}`);
+    edge.provider.onDelta = async () => {
+      for (let n = 0; n < 500; n++) {
+        if (edge.provider.sawAbort) return;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+    const token = await seedSession(edge.sessions);
+    await withServer(edge.app, async (base) => {
+      const headers = {
+        host: HOST.host,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      };
+      for (let i = 0; i < 8; i += 1) {
+        edge.provider.sawAbort = false;
+        const ac = new AbortController();
+        const pending = undiciRequest(`${base}/_api/llm/chat`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...ASK, stream: true }),
+          signal: ac.signal,
+        }).catch(() => undefined);
+        await until(() => edge.provider.calls.length === i + 1, `call ${i + 1}`);
+        ac.abort();
+        await pending;
+        await until(() => edge.usage.records.length === i + 1, `row ${i + 1}`);
+      }
+      for (const row of edge.usage.records) {
+        expect(row.outcome).toBe("error");
+        expect(row.errorDetail).toMatch(/;usage=/);
+        expect(row.costMicroUsd).toBeGreaterThan(0);
+      }
+      expect(edge.leases.held(`llm:app:${APP_ID}`)).toBe(0);
+      const totalMicro = edge.usage.records.reduce((n, r) => n + (r.costMicroUsd ?? 0), 0);
+      const platform = await edge.usage.platformLlmSpendMicroUsd("prod");
+      expect(platform.todayMicro).toBe(totalMicro);
+      expect(totalMicro).toBeGreaterThan(50);
+      const blocked = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(ASK),
+      });
+      expect(blocked.statusCode).toBe(503);
+    });
   });
 });

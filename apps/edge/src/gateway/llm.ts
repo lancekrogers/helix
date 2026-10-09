@@ -27,6 +27,8 @@ import {
   type UsageStore,
 } from "./usage.js";
 import type { DenialThrottle } from "./denialThrottle.js";
+import type { AcquireResult, LeaseRequest, LeaseStore } from "./leaseStore.js";
+import { ReplicaGate } from "./replicaGate.js";
 import { truncate } from "../auth/identity.js";
 import { trace } from "@opentelemetry/api";
 import {
@@ -73,6 +75,9 @@ import { withRootSpan } from "../telemetry.js";
 const BURST_WINDOW_DIVISOR = 6;
 const BURST_BUDGET_FRACTION = 1 / BURST_WINDOW_DIVISOR;
 
+/** Lease TTL is the call deadline plus this, so a live call never loses its slot. */
+const LEASE_GRACE_MS = 60_000;
+
 /**
  * Ledger `errorDetail` for a call the app abandoned. `GatewayOutcome` has no
  * `cancelled` member and adding one would migrate an enum shared with the portal
@@ -95,6 +100,15 @@ export interface LlmGatewayRuntime {
   denialThrottle: DenialThrottle | null;
   /** Platform-wide daily LLM ceiling in USD; `0` disables. */
   platformCeilingDollars: number;
+  /** Concurrency control; null disables every cap (tests that do not exercise it). */
+  concurrency: {
+    leases: LeaseStore;
+    gate: ReplicaGate | null;
+    maxAppInFlight: number;
+    maxUserInFlight: number;
+  } | null;
+  /** Wall-clock deadline for one upstream call, ms. Also bounds the lease TTL. */
+  maxCallMs: number;
 }
 
 /**
@@ -298,153 +312,267 @@ export function makeLlmHandler(
       }
     }
 
-    // Admitted. Abort the upstream if the client goes away.
-    //
-    // Watch the *response*, not the request. `req.raw` emits 'close' when the
-    // request body finishes arriving, which on this route has already happened
-    // before the handler runs (Fastify's JSON parser drained it), so a listener
-    // here was attached after the event and never fired at all — the disconnect
-    // abort below has never actually run. The ServerResponse's 'close' fires when
-    // the connection goes away, and `writableEnded` separates "we finished
-    // answering" from "they hung up". Fastify's own `request.signal` is wired to
-    // the same unguarded `req.on('close')` — do not substitute it.
-    //
-    // `writableEnded`, not `writableFinished`: the two agree on a real socket,
-    // but light-my-request's null socket never settles `writableFinished`, so
-    // under `app.inject()` every ordinary response would look like a hang-up.
-    const abort = new AbortController();
-    let clientGone = false;
-    reply.raw.on("close", () => {
-      if (reply.raw.writableEnded) return;
-      clientGone = true;
-      abort.abort();
-      // Mark the span so an abandoned stream is filterable. Read off the active
-      // context rather than threaded in: the span is opened by the wrapper at
-      // the bottom of this factory, and this listener already closes over
-      // enough.
-      trace.getActiveSpan()?.setAttribute(ATTR_CLIENT_DISCONNECTED, true);
-    });
-
-    const startedAt = performance.now();
-    let recorded = false;
-    let finalStopReason = "end_turn";
-    const finalUsage: LlmUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadInputTokens: 0,
-      cacheCreationInputTokens: 0,
-    };
-    // What a cut call is charged from, when the vendor never sent `done`.
-    const requestBytes =
-      Buffer.byteLength(chat.system ?? "", "utf8") +
-      chat.messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0);
-    let relayedBytes = 0;
-    let measured: LlmUsage | undefined;
-    let eventsSeen = 0;
-    const recordOnce = async (
-      outcome: GatewayOutcome,
-      extra: { errorDetail?: string; cut?: boolean } = {},
-    ): Promise<void> => {
-      if (recorded) return;
-      recorded = true;
-      const durationMs = Math.round(performance.now() - startedAt);
-      // `recordOnce` runs after the stream has drained (the handler drives the
-      // `for await` itself), so this duration is the real end-to-end time, not
-      // time-to-first-header.
-      meterGatewayCall({ appId: entry.appId, capability: "llm", outcome, durationMs });
-      let stopReason: string | null = finalStopReason;
-      let errorDetail = extra.errorDetail ?? null;
-      if (extra.cut) {
-        const estimate = estimateCutUsage({ measured, requestBytes, relayedBytes });
-        Object.assign(finalUsage, estimate.usage);
-        // The default "end_turn" is false for a call that never finished.
-        stopReason = null;
-        // The marker goes LAST and the text before it is cut to fit: clampRecord truncates
-        // errorDetail at ERROR_DETAIL_MAX and would otherwise drop the marker.
-        const marker = `;usage=${estimate.basis}`;
-        errorDetail =
-          truncate(extra.errorDetail ?? "", ERROR_DETAIL_MAX - marker.length - 1) + marker;
-        meterCutCharge({ appId: entry.appId, basis: estimate.basis });
-        trace.getActiveSpan()?.setAttribute(ATTR_USAGE_BASIS, estimate.basis);
-      }
-      // Freeze the as-charged cost at write time (micro-USD) from the final
-      // token counts + the requested model's current rate. This is what both
-      // the spend gate and the portal dollar figures read back.
-      const costMicroUsd = Math.round(costUsd({ model: chat.model, ...finalUsage }) * 1_000_000);
-      await usage
-        .record({
-          appId: entry.appId,
-          env: caller.env,
-          ...identity,
-          capability: "llm",
-          model: chat.model,
-          inputTokens: finalUsage.inputTokens,
-          outputTokens: finalUsage.outputTokens,
-          cacheReadInputTokens: finalUsage.cacheReadInputTokens,
-          cacheCreationInputTokens: finalUsage.cacheCreationInputTokens,
-          costMicroUsd,
-          outcome,
-          durationMs,
-          // LLM streams over a 200; the stop reason is the useful signal here.
-          stopReason,
-          errorDetail,
-        })
-        .catch((err: unknown) =>
-          req.log.warn(
-            {
-              err,
-              event: "gateway.usage_record_failed",
-              appId: entry.appId,
-              capability: "llm",
-              outcome,
-            },
-            "gateway usage record failed",
-          ),
-        );
-    };
-
-    // Two distinct ids: `requestId` is internal — it correlates the egress call
-    // and becomes the attested instruction's `jti` (burned for replay
-    // protection), so it must never reach app code. `completionId` is the
-    // app-visible `chatcmpl-<id>`. `created` is stamped once so all chunks agree.
-    const requestId = randomUUID();
-    const ctx: LlmWireContext = {
-      completionId: randomUUID(),
-      model: chat.model,
-      created: Math.floor(Date.now() / 1000),
-      corsOrigin: req.devCorsOrigin,
-      includeUsage: parsed.includeUsage,
-    };
-    const events = rt.provider.stream(chat, {
-      signal: abort.signal,
-      appId: entry.appId,
-      // The opaque id ONLY — this reaches egress via the attested instruction.
-      userOid,
-      requestId,
-      // The log correlation id, NOT the jti above — see `LlmStreamOpts`.
-      correlationId: String(req.id),
-      env: caller.env,
-    });
-
-    // Whether a schema was requested, so an upstream 400 can name the likely cause
-    // (ADR-0034) without blaming a schema the app never sent.
-    const structured = chat.responseFormat !== undefined;
-
-    if (chat.stream) {
-      let started = false;
-      const start = (): void => {
-        if (!started) {
-          codec.startStream(reply, ctx);
-          started = true;
-        }
+    const conc = rt.concurrency;
+    let release: (() => Promise<void>) | null = null;
+    if (conc) {
+      const refuse = (reason: AdmissionDenialReason, message: string): void => {
+        meterAdmissionDenied({ appId: entry.appId, capability: "llm", reason });
+        trace.getActiveSpan()?.setAttribute(ATTR_REASON, reason);
+        reply.header("retry-after", "1");
+        codec.error(reply, 503, "capability_unavailable", message);
       };
+      if (conc.gate && !conc.gate.tryEnter()) {
+        refuse("concurrency_replica", "this replica is at its in-flight LLM limit");
+        return;
+      }
+      const requests: LeaseRequest[] = [
+        { scope: `llm:app:${entry.appId}`, cap: conc.maxAppInFlight },
+        // An anonymous caller shares one identity; the per-IP limiter covers them.
+        ...(caller.authenticated
+          ? [{ scope: `llm:user:${entry.appId}:${userOid}`, cap: conc.maxUserInFlight }]
+          : []),
+      ];
+      let acquired: AcquireResult;
+      try {
+        acquired = await conc.leases.acquire(requests, rt.maxCallMs + LEASE_GRACE_MS);
+      } catch (err) {
+        conc.gate?.leave();
+        req.log.warn({ err, event: "gateway.lease_unavailable" }, "lease acquire failed");
+        reply.header("retry-after", "5");
+        codec.error(reply, 503, "capability_unavailable", "concurrency check unavailable");
+        return;
+      }
+      if (!acquired.ok) {
+        conc.gate?.leave();
+        const app = acquired.scope.startsWith("llm:app:");
+        refuse(
+          app ? "concurrency_app" : "concurrency_user",
+          app
+            ? "too many concurrent LLM calls for this app"
+            : "too many concurrent LLM calls for this user",
+        );
+        return;
+      }
+      release = async () => {
+        conc.gate?.leave();
+        await conc.leases
+          .release(acquired.leaseId)
+          .catch((err: unknown) =>
+            req.log.warn({ err, event: "gateway.lease_release_failed" }, "lease release failed"),
+          );
+      };
+    }
+
+    try {
+      // Admitted. Abort the upstream if the client goes away.
+      //
+      // Watch the *response*, not the request. `req.raw` emits 'close' when the
+      // request body finishes arriving, which on this route has already happened
+      // before the handler runs (Fastify's JSON parser drained it), so a listener
+      // here was attached after the event and never fired at all — the disconnect
+      // abort below has never actually run. The ServerResponse's 'close' fires when
+      // the connection goes away, and `writableEnded` separates "we finished
+      // answering" from "they hung up". Fastify's own `request.signal` is wired to
+      // the same unguarded `req.on('close')` — do not substitute it.
+      //
+      // `writableEnded`, not `writableFinished`: the two agree on a real socket,
+      // but light-my-request's null socket never settles `writableFinished`, so
+      // under `app.inject()` every ordinary response would look like a hang-up.
+      const abort = new AbortController();
+      let clientGone = false;
+      reply.raw.on("close", () => {
+        if (reply.raw.writableEnded) return;
+        clientGone = true;
+        abort.abort();
+        // Mark the span so an abandoned stream is filterable. Read off the active
+        // context rather than threaded in: the span is opened by the wrapper at
+        // the bottom of this factory, and this listener already closes over
+        // enough.
+        trace.getActiveSpan()?.setAttribute(ATTR_CLIENT_DISCONNECTED, true);
+      });
+
+      const startedAt = performance.now();
+      let recorded = false;
+      let finalStopReason = "end_turn";
+      const finalUsage: LlmUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      };
+      // What a cut call is charged from, when the vendor never sent `done`.
+      const requestBytes =
+        Buffer.byteLength(chat.system ?? "", "utf8") +
+        chat.messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0);
+      let relayedBytes = 0;
+      let measured: LlmUsage | undefined;
+      let eventsSeen = 0;
+      const recordOnce = async (
+        outcome: GatewayOutcome,
+        extra: { errorDetail?: string; cut?: boolean } = {},
+      ): Promise<void> => {
+        if (recorded) return;
+        recorded = true;
+        const durationMs = Math.round(performance.now() - startedAt);
+        // `recordOnce` runs after the stream has drained (the handler drives the
+        // `for await` itself), so this duration is the real end-to-end time, not
+        // time-to-first-header.
+        meterGatewayCall({ appId: entry.appId, capability: "llm", outcome, durationMs });
+        let stopReason: string | null = finalStopReason;
+        let errorDetail = extra.errorDetail ?? null;
+        if (extra.cut) {
+          const estimate = estimateCutUsage({ measured, requestBytes, relayedBytes });
+          Object.assign(finalUsage, estimate.usage);
+          // The default "end_turn" is false for a call that never finished.
+          stopReason = null;
+          // The marker goes LAST and the text before it is cut to fit: clampRecord truncates
+          // errorDetail at ERROR_DETAIL_MAX and would otherwise drop the marker.
+          const marker = `;usage=${estimate.basis}`;
+          errorDetail =
+            truncate(extra.errorDetail ?? "", ERROR_DETAIL_MAX - marker.length - 1) + marker;
+          meterCutCharge({ appId: entry.appId, basis: estimate.basis });
+          trace.getActiveSpan()?.setAttribute(ATTR_USAGE_BASIS, estimate.basis);
+        }
+        // Freeze the as-charged cost at write time (micro-USD) from the final
+        // token counts + the requested model's current rate. This is what both
+        // the spend gate and the portal dollar figures read back.
+        const costMicroUsd = Math.round(costUsd({ model: chat.model, ...finalUsage }) * 1_000_000);
+        await usage
+          .record({
+            appId: entry.appId,
+            env: caller.env,
+            ...identity,
+            capability: "llm",
+            model: chat.model,
+            inputTokens: finalUsage.inputTokens,
+            outputTokens: finalUsage.outputTokens,
+            cacheReadInputTokens: finalUsage.cacheReadInputTokens,
+            cacheCreationInputTokens: finalUsage.cacheCreationInputTokens,
+            costMicroUsd,
+            outcome,
+            durationMs,
+            // LLM streams over a 200; the stop reason is the useful signal here.
+            stopReason,
+            errorDetail,
+          })
+          .catch((err: unknown) =>
+            req.log.warn(
+              {
+                err,
+                event: "gateway.usage_record_failed",
+                appId: entry.appId,
+                capability: "llm",
+                outcome,
+              },
+              "gateway usage record failed",
+            ),
+          );
+      };
+
+      // Two distinct ids: `requestId` is internal — it correlates the egress call
+      // and becomes the attested instruction's `jti` (burned for replay
+      // protection), so it must never reach app code. `completionId` is the
+      // app-visible `chatcmpl-<id>`. `created` is stamped once so all chunks agree.
+      const requestId = randomUUID();
+      const ctx: LlmWireContext = {
+        completionId: randomUUID(),
+        model: chat.model,
+        created: Math.floor(Date.now() / 1000),
+        corsOrigin: req.devCorsOrigin,
+        includeUsage: parsed.includeUsage,
+      };
+      const deadline = AbortSignal.timeout(rt.maxCallMs);
+      const callSignal = AbortSignal.any([abort.signal, deadline]);
+      const events = rt.provider.stream(chat, {
+        signal: callSignal,
+        appId: entry.appId,
+        // The opaque id ONLY — this reaches egress via the attested instruction.
+        userOid,
+        requestId,
+        // The log correlation id, NOT the jti above — see `LlmStreamOpts`.
+        correlationId: String(req.id),
+        env: caller.env,
+      });
+
+      // Whether a schema was requested, so an upstream 400 can name the likely cause
+      // (ADR-0034) without blaming a schema the app never sent.
+      const structured = chat.responseFormat !== undefined;
+
+      if (chat.stream) {
+        let started = false;
+        const start = (): void => {
+          if (!started) {
+            codec.startStream(reply, ctx);
+            started = true;
+          }
+        };
+        try {
+          for await (const ev of events) {
+            if (ev.type === "delta") {
+              eventsSeen += 1;
+              relayedBytes += Buffer.byteLength(ev.text, "utf8");
+              start();
+              codec.writeDelta(reply, ctx, ev.text);
+            } else if (ev.type === "usage") {
+              eventsSeen += 1;
+              measured = ev.usage;
+            } else {
+              measured = ev.usage; // the final counts are measured too
+              Object.assign(finalUsage, ev.usage);
+              finalStopReason = ev.stopReason;
+            }
+          }
+          start();
+          codec.writeDone(reply, ctx, { stopReason: finalStopReason, usage: finalUsage });
+          codec.endStream(reply);
+          await recordOnce(outcomeFor(finalStopReason));
+        } catch (err) {
+          // The app hung up: the abort above is what ended this stream, so there is
+          // no upstream failure to describe and no socket left to describe it on.
+          // Meter it as an `error` carrying a distinct detail — `GatewayOutcome` has
+          // no `cancelled` member, and adding one would mean migrating a shared enum
+          // for something the detail already distinguishes.
+          if (clientGone) {
+            await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
+            return;
+          }
+          const deadlineHit = deadline.aborted;
+          await recordOnce("error", {
+            errorDetail: deadlineHit ? "deadline_exceeded" : errorDetailOf(err),
+            cut: deadlineHit || eventsSeen > 0,
+          });
+          const { status, code, message, param, retryAfter } = deadlineHit
+            ? {
+                status: 502,
+                code: "internal" as const,
+                message: "LLM call exceeded its time limit",
+                param: undefined,
+                retryAfter: undefined,
+              }
+            : describeError(err, { structured });
+          if (!started) {
+            // `start()` is lazy, so a failure before the first delta has written
+            // nothing — a real status is still possible, and matches how every other
+            // pre-stream refusal on this route (authz, quota, validation) answers.
+            if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
+            codec.error(reply, status, code, message, param);
+            return;
+          }
+          // The head is already out; an in-band error frame is the only channel left.
+          codec.writeStreamError(reply, ctx, { code, message });
+          codec.endStream(reply);
+        }
+        return;
+      }
+
+      // Non-streaming: accumulate into a single JSON body.
+      let content = "";
       try {
         for await (const ev of events) {
           if (ev.type === "delta") {
             eventsSeen += 1;
             relayedBytes += Buffer.byteLength(ev.text, "utf8");
-            start();
-            codec.writeDelta(reply, ctx, ev.text);
+            content += ev.text;
           } else if (ev.type === "usage") {
             eventsSeen += 1;
             measured = ev.usage;
@@ -454,77 +582,42 @@ export function makeLlmHandler(
             finalStopReason = ev.stopReason;
           }
         }
-        start();
-        codec.writeDone(reply, ctx, { stopReason: finalStopReason, usage: finalUsage });
-        codec.endStream(reply);
         await recordOnce(outcomeFor(finalStopReason));
+        codec.sendResponse(reply, ctx, {
+          content,
+          stopReason: finalStopReason,
+          usage: finalUsage,
+        });
       } catch (err) {
-        // The app hung up: the abort above is what ended this stream, so there is
-        // no upstream failure to describe and no socket left to describe it on.
-        // Meter it as an `error` carrying a distinct detail — `GatewayOutcome` has
-        // no `cancelled` member, and adding one would mean migrating a shared enum
-        // for something the detail already distinguishes.
+        // As above: our own abort ended this, not the vendor.
         if (clientGone) {
           await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
           return;
         }
-        // Charged only if the upstream answered 200 and something arrived. A vendor 4xx/5xx
-        // before the stream started generated nothing, so it stays a $0 error row.
-        await recordOnce("error", { errorDetail: errorDetailOf(err), cut: eventsSeen > 0 });
-        const { status, code, message, param, retryAfter } = describeError(err, { structured });
-        if (!started) {
-          // `start()` is lazy, so a failure before the first delta has written
-          // nothing — a real status is still possible, and matches how every other
-          // pre-stream refusal on this route (authz, quota, validation) answers.
-          if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
-          codec.error(reply, status, code, message, param);
-          return;
-        }
-        // The head is already out; an in-band error frame is the only channel left.
-        codec.writeStreamError(reply, ctx, { code, message });
-        codec.endStream(reply);
+        const deadlineHit = deadline.aborted;
+        await recordOnce("error", {
+          errorDetail: deadlineHit ? "deadline_exceeded" : errorDetailOf(err),
+          cut: deadlineHit || eventsSeen > 0,
+        });
+        const { status, code, message, param, retryAfter } = deadlineHit
+          ? {
+              status: 502,
+              code: "internal" as const,
+              message: "LLM call exceeded its time limit",
+              param: undefined,
+              retryAfter: undefined,
+            }
+          : describeError(err, { structured });
+        // 502 for upstream failures, 400 when the vendor rejected the app's request,
+        // 429 (with retry-after) when it throttled one; the code stays within the
+        // shared set.
+        if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
+        codec.error(reply, status, code, message, param);
       }
-      return;
-    }
-
-    // Non-streaming: accumulate into a single JSON body.
-    let content = "";
-    try {
-      for await (const ev of events) {
-        if (ev.type === "delta") {
-          eventsSeen += 1;
-          relayedBytes += Buffer.byteLength(ev.text, "utf8");
-          content += ev.text;
-        } else if (ev.type === "usage") {
-          eventsSeen += 1;
-          measured = ev.usage;
-        } else {
-          measured = ev.usage; // the final counts are measured too
-          Object.assign(finalUsage, ev.usage);
-          finalStopReason = ev.stopReason;
-        }
-      }
-      await recordOnce(outcomeFor(finalStopReason));
-      codec.sendResponse(reply, ctx, {
-        content,
-        stopReason: finalStopReason,
-        usage: finalUsage,
-      });
-    } catch (err) {
-      // As above: our own abort ended this, not the vendor.
-      if (clientGone) {
-        await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
-        return;
-      }
-      // Charged only if the upstream answered 200 and something arrived. A vendor 4xx/5xx
-      // before the stream started generated nothing, so it stays a $0 error row.
-      await recordOnce("error", { errorDetail: errorDetailOf(err), cut: eventsSeen > 0 });
-      const { status, code, message, param, retryAfter } = describeError(err, { structured });
-      // 502 for upstream failures, 400 when the vendor rejected the app's request,
-      // 429 (with retry-after) when it throttled one; the code stays within the
-      // shared set.
-      if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
-      codec.error(reply, status, code, message, param);
+    } finally {
+      // `recordOnce` runs on every exit path before this; releasing the lease after
+      // the ledger row is what keeps spend visible to the next admission check.
+      await release?.();
     }
   }
 

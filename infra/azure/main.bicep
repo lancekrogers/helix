@@ -65,6 +65,22 @@ param llmDefaultDollarsPerDay int = 50
 @minValue(-1)
 param llmPlatformDollarsPerDay int = -1
 
+@description('Max concurrent LLM calls per app across all edge replicas (EDGE_LLM_MAX_APP_IN_FLIGHT on the edge and dev gateway). 0 disables.')
+@minValue(0)
+param llmMaxAppInFlight int = 10
+
+@description('Max concurrent LLM calls per authenticated user per app (EDGE_LLM_MAX_USER_IN_FLIGHT). Anonymous callers are not bucketed by user. 0 disables.')
+@minValue(0)
+param llmMaxUserInFlight int = 3
+
+@description('Max concurrent LLM calls on each edge replica (EDGE_LLM_MAX_IN_FLIGHT). Per replica by design. 0 disables.')
+@minValue(0)
+param llmMaxInFlight int = 200
+
+@description('Wall-clock deadline for one upstream LLM call in milliseconds (EDGE_LLM_MAX_CALL_MS). Also bounds lease TTL on the edge.')
+@minValue(1000)
+param llmMaxCallMs int = 600000
+
 @description('Max uncompressed size in MB of any single file in a deployed bundle.')
 param deployMaxFileMb int = 50
 
@@ -1239,6 +1255,10 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
       { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
       { name: 'EDGE_LLM_PLATFORM_DOLLARS_PER_DAY', value: string(effectiveLlmPlatformDollarsPerDay) }
+      { name: 'EDGE_LLM_MAX_APP_IN_FLIGHT', value: string(llmMaxAppInFlight) }
+      { name: 'EDGE_LLM_MAX_USER_IN_FLIGHT', value: string(llmMaxUserInFlight) }
+      { name: 'EDGE_LLM_MAX_IN_FLIGHT', value: string(llmMaxInFlight) }
+      { name: 'EDGE_LLM_MAX_CALL_MS', value: string(llmMaxCallMs) }
       // Behind ACA's Envoy ingress the socket peer is the ingress, so the
       // per-IP anon rate limiter and the password-login throttle need the
       // ingress address named to recover the real client IP (issue #13). See
@@ -1450,6 +1470,10 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_LLM_OPENAI_PATH', value: llm.openaiPath }
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
       { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
+      { name: 'EDGE_LLM_MAX_APP_IN_FLIGHT', value: string(llmMaxAppInFlight) }
+      { name: 'EDGE_LLM_MAX_USER_IN_FLIGHT', value: string(llmMaxUserInFlight) }
+      { name: 'EDGE_LLM_MAX_IN_FLIGHT', value: string(llmMaxInFlight) }
+      { name: 'EDGE_LLM_MAX_CALL_MS', value: string(llmMaxCallMs) }
       { name: 'EDGE_EGRESS_URL', value: egressBaseUrl }
       { name: 'EDGE_FETCH_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
       // The dev-gateway's consent surface consults the portal

@@ -83,6 +83,10 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
       },
       defaultDollarsPerDay: 50,
       platformDollarsPerDay: 0,
+      maxAppInFlight: 0,
+      maxUserInFlight: 0,
+      maxInFlight: 0,
+      maxCallMs: 600_000,
     },
     // Off by default in unit tests; suites that exercise it pass a low `max`.
     anonRateLimit: { max: 0, windowMs: 60_000 },
@@ -135,6 +139,10 @@ export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}):
       },
       defaultDollarsPerDay: 50,
       platformDollarsPerDay: 0,
+      maxAppInFlight: 0,
+      maxUserInFlight: 0,
+      maxInFlight: 0,
+      maxCallMs: 600_000,
     },
     fetch: {
       egressUrl: null,
