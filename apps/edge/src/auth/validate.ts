@@ -1,6 +1,7 @@
 import type { FastifyRequest } from "fastify";
 import { SLUG_PATTERN } from "@azx-pbc/shared";
 import { publicOrigin, type EdgeConfig } from "../config.js";
+import { RESERVED_SUBDOMAINS } from "../routing/hosts.js";
 import type { RegistryEntry, RegistryReader } from "../registry/projection.js";
 
 /**
@@ -43,6 +44,15 @@ export function validateReturnPath(rd: string | undefined): string | null {
     return null;
   }
   if (resolved.origin !== "https://rd-probe.invalid") return null;
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(resolved.pathname);
+  } catch {
+    return null;
+  }
+  // Decoded path may contain spaces (`%20`); still reject other controls (e.g. `%0d%0a`).
+  // eslint-disable-next-line no-control-regex -- intentional: reject decoded control bytes in rd
+  if (/[\x00-\x1f\x7f]/.test(decodedPath)) return null;
   // Checked post-resolution so `/x/../_api/y` and encoded separators can't slip by.
   const path = resolved.pathname.toLowerCase();
   if (path === "/_api" || path.startsWith("/_api/")) return null;
@@ -59,7 +69,9 @@ export type AppForAuth =
 /** Resolve and vet the `app` parameter / host slug for the login flow. */
 export function resolveAppForAuth(registry: RegistryReader, slug: string | undefined): AppForAuth {
   if (!registry.isLoaded()) return { kind: "registry-unavailable" };
-  if (!slug || !SLUG_PATTERN.test(slug)) return { kind: "unknown" };
+  if (!slug || !SLUG_PATTERN.test(slug) || RESERVED_SUBDOMAINS.has(slug)) {
+    return { kind: "unknown" };
+  }
   const entry = registry.getApp(slug);
   // Archived apps answer like unknown ones here — no session minting, and no
   // distinguishing the two through the auth host.

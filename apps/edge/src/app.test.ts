@@ -12,6 +12,7 @@ const PREFIX = `apps/${APP_ID}/1/`;
 function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     databaseUrl: "postgresql://unused",
     blob: {
       provider: "azure",

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { BASELINE_DOLLARS_PER_DAY } from "@azx-pbc/shared";
 import { DEFAULT_STATEMENT_TIMEOUT_MS } from "./db/pool.js";
+import { RESERVED_SUBDOMAINS } from "./routing/hosts.js";
 import { isCspSafeHostname } from "./serving/csp.js";
 
 /**
@@ -116,6 +117,8 @@ export interface AuthConfig {
 export interface GatewayConfig {
   /** Apps are served on `<slug>.<baseDomain>` (architecture §4.1). */
   baseDomain: string;
+  /** Control hosts (`auth.`, `portal.`, `dev-api.`) live on this domain. Equal to `baseDomain` in the single-domain layout. */
+  controlDomain: string;
   /**
    * Edge-terminated TLS (mkcert in dev). **Required outside production** — the
    * platform is HTTPS-only (`__Host-` cookies need Secure; app crypto APIs
@@ -847,6 +850,38 @@ function llmPath(value: string | undefined, fallback: string, envKey: string): s
   return path;
 }
 
+const HOSTNAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+/** Resolve and validate the control domain pair against the apps base domain. */
+export function resolveControlDomain(baseDomain: string, raw: string | undefined): string {
+  const control = raw?.trim().toLowerCase();
+  if (!control || control === baseDomain) return baseDomain; // today's layout
+  for (const [name, value] of [
+    ["EDGE_CONTROL_DOMAIN", control],
+    ["EDGE_BASE_DOMAIN", baseDomain],
+  ] as const) {
+    if (!HOSTNAME.test(value)) {
+      throw new Error(`${name} is not a valid hostname: ${value}`);
+    }
+  }
+  if (control.endsWith(`.${baseDomain}`)) {
+    throw new Error(
+      `EDGE_CONTROL_DOMAIN (${control}) must not be a subdomain of EDGE_BASE_DOMAIN (${baseDomain}): ` +
+        "an app could set a Domain= cookie that reaches the control hosts. Refusing to start.",
+    );
+  }
+  for (const label of ["auth", "portal", "dev-api"] as const) {
+    const onLabel = `${label}.${control}`;
+    if (baseDomain === onLabel || baseDomain.endsWith(`.${onLabel}`)) {
+      throw new Error(
+        `EDGE_BASE_DOMAIN (${baseDomain}) must not be on or under ${onLabel} (EDGE_CONTROL_DOMAIN ${control}): ` +
+          "an app could set a Domain= cookie that reaches the control hosts. Refusing to start.",
+      );
+    }
+  }
+  return control;
+}
+
 /**
  * Parse the config the gateway machinery shares across the edge and the
  * dev-gateway (see {@link GatewayConfig}). Neither the helix_edge DSN nor blob
@@ -876,8 +911,12 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
     );
   }
 
+  const baseDomain = (env.EDGE_BASE_DOMAIN ?? "local.helix.azxlabs.io").toLowerCase();
+  const controlDomain = resolveControlDomain(baseDomain, env.EDGE_CONTROL_DOMAIN);
+
   return {
-    baseDomain: (env.EDGE_BASE_DOMAIN ?? "local.helix.azxlabs.io").toLowerCase(),
+    baseDomain,
+    controlDomain,
     tls,
     reconcileIntervalMs: requirePositiveMs(
       env.EDGE_RECONCILE_INTERVAL_MS,
@@ -1067,15 +1106,28 @@ function loadInternalSecret(env: NodeJS.ProcessEnv): Buffer | null {
 }
 
 /**
- * The externally visible origin for a given host label + base domain —
- * redirect targets, cookie URLs, and the dev journey's popup URL are always
- * built from config, never from request headers. Scheme-default ports are
- * omitted. Takes the shared {@link GatewayConfig} because the dev-gateway
- * builds public URLs too (the popup URL's auth host) and structurally omits
- * the edge-only fields.
+ * Builds app origins (`<slug>.<baseDomain>`). Control-plane labels (`auth`,
+ * `portal`, …) must use {@link controlOrigin} — passing them here throws so an
+ * unmigrated call site fails in tests instead of emitting `auth.<appsDomain>`.
  */
 export function publicOrigin(config: GatewayConfig, hostLabelOrNull: string | null): string {
+  if (hostLabelOrNull !== null && RESERVED_SUBDOMAINS.has(hostLabelOrNull)) {
+    throw new Error(
+      `publicOrigin() builds app origins; "${hostLabelOrNull}" is a control host, use controlOrigin()`,
+    );
+  }
   const host = hostLabelOrNull ? `${hostLabelOrNull}.${config.baseDomain}` : config.baseDomain;
+  return originFor(config, host);
+}
+
+export type ControlLabel = "auth" | "portal" | "dev-api";
+
+/** Origin for a control-plane host on {@link GatewayConfig.controlDomain}. */
+export function controlOrigin(config: GatewayConfig, label: ControlLabel): string {
+  return originFor(config, `${label}.${config.controlDomain}`);
+}
+
+function originFor(config: GatewayConfig, host: string): string {
   // HTTPS-only: omit the port only when it is the https default (443).
   const port = config.publicPort === 443 ? "" : `:${config.publicPort}`;
   return `${config.publicScheme}://${host}${port}`;

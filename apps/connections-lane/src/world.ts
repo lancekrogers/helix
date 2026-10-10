@@ -288,7 +288,7 @@ export class LaneWorld {
   }
 
   /** The callback URL every plane derives: the edge builds it from its config
-   * (publicOrigin(config, "auth")), the portal from APP_PUBLIC_BASE — the lane
+   * (controlOrigin(config, "auth")), the portal from APP_PUBLIC_BASE — the lane
    * sets both to this one value. */
   get callbackUrl(): string {
     return `https://${AUTH_HOST}:${this.edgeTlsPort}${CONNECTIONS_CALLBACK_PATH}`;

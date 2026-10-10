@@ -1,6 +1,13 @@
 import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
-import { loadConfig, loadDevGatewayConfig, parseConnectionString, publicOrigin } from "./config.js";
+import { classifyHost, RESERVED_SUBDOMAINS } from "./routing/hosts.js";
+import {
+  controlOrigin,
+  loadConfig,
+  loadDevGatewayConfig,
+  parseConnectionString,
+  publicOrigin,
+} from "./config.js";
 
 // The well-known Azurite dev credentials (public, not a secret).
 const AZURITE_KEY =
@@ -827,7 +834,7 @@ describe("publicOrigin", () => {
 
   it("builds https host URLs from config, omitting the default 443", () => {
     const dev = loadConfig({ ...ENV, EDGE_PUBLIC_PORT: "8080" });
-    expect(publicOrigin(dev, "auth")).toBe("https://auth.local.helix.azxlabs.io:8080");
+    expect(controlOrigin(dev, "auth")).toBe("https://auth.local.helix.azxlabs.io:8080");
     expect(publicOrigin(dev, "demo")).toBe("https://demo.local.helix.azxlabs.io:8080");
 
     // Production: ingress terminates TLS (no edge cert), public port 443, and
@@ -840,8 +847,91 @@ describe("publicOrigin", () => {
       EDGE_PUBLIC_PORT: "443",
       NODE_ENV: "production",
     });
-    expect(publicOrigin(prod, "auth")).toBe("https://auth.azx.helix.azxlabs.io");
+    expect(controlOrigin(prod, "auth")).toBe("https://auth.azx.helix.azxlabs.io");
     expect(publicOrigin(prod, null)).toBe("https://azx.helix.azxlabs.io");
+  });
+
+  it("refuses reserved control labels", () => {
+    const dev = loadConfig({ ...ENV, EDGE_PUBLIC_PORT: "8080" });
+    for (const label of RESERVED_SUBDOMAINS) {
+      expect(() => publicOrigin(dev, label)).toThrow(/controlOrigin/);
+    }
+    const split = loadConfig({
+      ...ENV,
+      EDGE_PUBLIC_PORT: "8080",
+      EDGE_BASE_DOMAIN: "helix-apps.localhost",
+      EDGE_CONTROL_DOMAIN: "local.helix.azxlabs.io",
+    });
+    for (const label of RESERVED_SUBDOMAINS) {
+      expect(() => publicOrigin(split, label)).toThrow(/controlOrigin/);
+    }
+  });
+});
+
+describe("resolveControlDomain / EDGE_CONTROL_DOMAIN boot validation", () => {
+  const ENV = {
+    DATABASE_URL: "postgresql://helix:helix@db:5432/helix",
+    EDGE_DATABASE_URL: "postgresql://helix_edge:helix_edge@db:5432/helix",
+    AZURE_STORAGE_CONNECTION_STRING: AZURITE_CS,
+    EDGE_TLS_CERT_FILE: "/certs/local-helix.pem",
+    EDGE_TLS_KEY_FILE: "/certs/local-helix-key.pem",
+    EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+  };
+  const base = "local.helix.azxlabs.io";
+
+  it("unset, blank, or equal to base keeps legacy single-domain mode", () => {
+    for (const control of [undefined, "", "  ", base, base.toUpperCase()]) {
+      const cfg = loadConfig({
+        ...ENV,
+        ...(control !== undefined ? { EDGE_CONTROL_DOMAIN: control } : {}),
+      });
+      expect(cfg.controlDomain).toBe(base);
+      expect(cfg.baseDomain).toBe(base);
+    }
+  });
+
+  it("rejects a control subdomain of the apps domain", () => {
+    expect(() => loadConfig({ ...ENV, EDGE_CONTROL_DOMAIN: `ctl.${base}` })).toThrow(
+      /subdomain of EDGE_BASE_DOMAIN/,
+    );
+    expect(() => loadDevGatewayConfig({ ...ENV, EDGE_CONTROL_DOMAIN: `ctl.${base}` })).toThrow(
+      /subdomain of EDGE_BASE_DOMAIN/,
+    );
+  });
+
+  it.each([
+    ["http://x.test", /valid hostname/],
+    ["x.test:8443", /valid hostname/],
+    ["x", /valid hostname/],
+    [".x.test", /valid hostname/],
+    ["x_y.test", /valid hostname/],
+  ])("rejects malformed control domain %s", (control, pattern) => {
+    expect(() => loadConfig({ ...ENV, EDGE_CONTROL_DOMAIN: control })).toThrow(pattern);
+    expect(() => loadDevGatewayConfig({ ...ENV, EDGE_CONTROL_DOMAIN: control })).toThrow(pattern);
+  });
+
+  it("allows control parent of apps and lowercases input", () => {
+    const cfg = loadConfig({
+      ...ENV,
+      EDGE_BASE_DOMAIN: "apps.helix.customer.test",
+      EDGE_CONTROL_DOMAIN: "HELIX.CUSTOMER.TEST",
+    });
+    expect(cfg.controlDomain).toBe("helix.customer.test");
+    expect(classifyHost("auth.helix.customer.test", cfg.baseDomain, cfg.controlDomain)).toEqual({
+      kind: "auth",
+    });
+  });
+
+  it("rejects an apps domain on a reserved control label", () => {
+    const control = "example.test";
+    for (const base of [`auth.${control}`, `tenant.auth.${control}`, `portal.${control}`]) {
+      expect(() =>
+        loadConfig({ ...ENV, EDGE_BASE_DOMAIN: base, EDGE_CONTROL_DOMAIN: control }),
+      ).toThrow(/EDGE_BASE_DOMAIN/);
+      expect(() =>
+        loadDevGatewayConfig({ ...ENV, EDGE_BASE_DOMAIN: base, EDGE_CONTROL_DOMAIN: control }),
+      ).toThrow(/EDGE_BASE_DOMAIN/);
+    }
   });
 });
 

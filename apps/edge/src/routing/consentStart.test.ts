@@ -19,7 +19,8 @@ import { buildApp } from "../app.js";
 import { deriveInternalKey } from "../internalJwt.js";
 import { SESSION_COOKIE } from "../auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "../auth/sessions.js";
-import { testAuthConfig, testEdgeConfig } from "../test/config.js";
+import { controlOrigin, publicOrigin } from "../config.js";
+import { splitEdgeConfig, testAuthConfig, testEdgeConfig } from "../test/config.js";
 import {
   FakeBlobReader,
   FakeOidcClient,
@@ -137,6 +138,7 @@ function buildConsentEdge(
     visibilityGroupIds?: string[];
     withPortal?: boolean;
     withInternalSecret?: boolean;
+    config?: ReturnType<typeof testEdgeConfig>;
   } = {},
 ): Harness {
   const portal = new FakeConsultPortal();
@@ -148,11 +150,14 @@ function buildConsentEdge(
     visibilityMode: opts.visibilityMode ?? "internal",
     visibilityGroupIds: opts.visibilityGroupIds ?? [],
   });
-  const app = buildApp({
-    config: testEdgeConfig({
+  const edgeConfig =
+    opts.config ??
+    testEdgeConfig({
       auth: testAuthConfig(),
       internalSecret: opts.withInternalSecret === false ? null : INTERNAL_SECRET,
-    }),
+    });
+  const app = buildApp({
+    config: edgeConfig,
     registry: new FakeRegistry([entry]),
     blob: new FakeBlobReader(),
     sessions,
@@ -814,5 +819,29 @@ describe("the consent-start span", () => {
       .map((s) => s.attributes["helix.outcome"]);
     expect(outcomes).toContain("forbidden");
     expect(outcomes).toContain("signin_required");
+  });
+
+  it("split layout: consult uses control callback and apps opener origin", async () => {
+    const cfg = splitEdgeConfig({ auth: testAuthConfig(), internalSecret: INTERNAL_SECRET });
+    const h = buildConsentEdge({ config: cfg });
+    h.portal.response = { outcome: "started", authorizeUrl: authorizeUrl() };
+    const token = await h.signIn();
+    const appOrigin = publicOrigin(cfg, SLUG);
+    const res = await h.app.inject({
+      method: "GET",
+      url: `${START_URL}?attempt=corr-tag-1`,
+      headers: {
+        host: new URL(appOrigin).host,
+        cookie: `${SESSION_COOKIE}=${token}`,
+        ...POPUP_HEADERS,
+        referer: `${appOrigin}/page`,
+      },
+    });
+    expect(res.statusCode).toBe(302);
+    expect(h.portal.requests).toHaveLength(1);
+    const body = ConsultRequestSchema.parse(JSON.parse(h.portal.requests[0]!.body));
+    expect(body.openerOrigin).toBe(appOrigin);
+    expect(body.callbackUrl).toBe(`${controlOrigin(cfg, "auth")}/connections/callback`);
+    await h.app.close();
   });
 });

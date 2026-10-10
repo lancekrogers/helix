@@ -392,7 +392,7 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
 
   app.decorateRequest("hostClass");
   app.addHook("onRequest", async (req) => {
-    req.hostClass = classifyHost(req.headers.host, config.baseDomain);
+    req.hostClass = classifyHost(req.headers.host, config.baseDomain, config.controlDomain);
   });
 
   // The trust-proxy self-report (ADR-0011): watch whether the forwarded walk

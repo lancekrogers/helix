@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { installGracefulShutdown } from "@azx-pbc/shared/lifecycle";
 import { startTelemetry } from "@azx-pbc/telemetry";
 import { buildApp, SERVICE_NAME } from "./app.js";
-import { loadConfig, publicOrigin } from "./config.js";
+import { controlOrigin, loadConfig } from "./config.js";
 import { createBlobReader } from "./blob/client.js";
 import { LiveRegistry, type RegistryLogger } from "./registry/listener.js";
 import { OpenIdConnectClient } from "./auth/oidc.js";
@@ -132,7 +132,7 @@ const sessions = config.auth
     })
   : null;
 const oidc = config.auth
-  ? new OpenIdConnectClient(config.auth, `${publicOrigin(config, "auth")}/callback`, {
+  ? new OpenIdConnectClient(config.auth, `${controlOrigin(config, "auth")}/callback`, {
       // Straight through to the late-bound registry ref. `info` used to take a
       // bare message and interpolate the issuer into it; it takes an object now
       // so discovery carries an `event` a rule can key on, like every other
@@ -390,6 +390,8 @@ try {
       service: SERVICE_NAME,
       port,
       baseDomain: config.baseDomain,
+      controlDomain: config.controlDomain,
+      split: config.controlDomain !== config.baseDomain,
       allowUnauthenticated: config.allowUnauthenticated,
       allowPublicApps: config.allowPublicApps,
       allowPasswordApps: config.allowPasswordApps,

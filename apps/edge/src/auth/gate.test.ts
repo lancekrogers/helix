@@ -4,7 +4,8 @@ import type { FastifyInstance, LightMyRequestResponse } from "fastify";
 import { buildApp } from "../app.js";
 import { SESSION_COOKIE } from "./cookies.js";
 import { hashSessionToken, newSessionToken } from "./sessions.js";
-import { testAuthConfig, testEdgeConfig } from "../test/config.js";
+import { controlOrigin, publicOrigin } from "../config.js";
+import { splitEdgeConfig, testAuthConfig, testEdgeConfig } from "../test/config.js";
 import {
   FakeBlobReader,
   FakeOidcClient,
@@ -474,5 +475,68 @@ describe("the dev bypass and the unconfigured edge", () => {
     const res = await app.inject({ url: "/", headers: HOST });
     expect(res.statusCode).toBe(503);
     await app.close();
+  });
+});
+
+describe("split layout gate redirects", () => {
+  function splitEdge(registry?: FakeRegistry): GatedEdge {
+    const sessions = new FakeSessionStore();
+    const blob = new FakeBlobReader();
+    blob.set(`${PREFIX}index.html`, { body: "<body>app</body>", contentType: "text/html" });
+    const app = buildApp({
+      config: splitEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+      registry:
+        registry ??
+        new FakeRegistry([
+          registryEntry({
+            appId: APP_ID,
+            slug: "demo",
+            blobPrefix: PREFIX,
+            visibilityMode: "internal",
+          }),
+        ]),
+      blob,
+      sessions,
+      oidc: new FakeOidcClient(),
+    });
+    return { app, sessions, blob };
+  }
+
+  it("sends SSO navigations to auth on the control domain", async () => {
+    const cfg = splitEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false });
+    const edge = splitEdge();
+    const res = await edge.app.inject({
+      url: "/deep/link?q=1",
+      headers: {
+        host: new URL(publicOrigin(cfg, "demo")).host,
+        ...NAVIGATE,
+      },
+    });
+    expect(res.statusCode).toBe(302);
+    const location = new URL(res.headers.location as string);
+    expect(location.origin).toBe(controlOrigin(cfg, "auth"));
+    expect(location.pathname).toBe("/start");
+  });
+
+  it("sends password-app cold navigations to the apps-domain login form", async () => {
+    const cfg = splitEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false });
+    const edge = splitEdge(
+      new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "demo",
+          blobPrefix: PREFIX,
+          visibilityMode: "password",
+        }),
+      ]),
+    );
+    const res = await edge.app.inject({
+      url: "/",
+      headers: { host: new URL(publicOrigin(cfg, "demo")).host, ...NAVIGATE },
+    });
+    expect(res.statusCode).toBe(302);
+    const loc = new URL(res.headers.location as string);
+    expect(loc.origin).toBe(publicOrigin(cfg, "demo"));
+    expect(loc.pathname).toBe("/_auth/login");
   });
 });

@@ -57,6 +57,7 @@ export function testManagedIdentityBlob(overrides: Partial<AzureBlobConfig> = {}
 export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     databaseUrl: "postgresql://unused",
     blob: testBlobConfig(),
     auth: null,
@@ -123,6 +124,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
 export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}): DevGatewayConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     tls: null,
     reconcileIntervalMs: 60_000,
     statementTimeoutMs: 10_000,
@@ -164,4 +166,24 @@ export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}):
     },
     ...overrides,
   };
+}
+
+/** Distinct registrable domain from legacy `local.helix.azxlabs.io` so split auth URLs differ from single-domain fixtures. */
+export const SPLIT_CONTROL_DOMAIN = "helix-control.localhost";
+export const SPLIT_APPS_DOMAIN = "helix-apps.localhost";
+
+export function splitEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
+  return testEdgeConfig({
+    baseDomain: SPLIT_APPS_DOMAIN,
+    controlDomain: SPLIT_CONTROL_DOMAIN,
+    ...overrides,
+  });
+}
+
+export function splitDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}): DevGatewayConfig {
+  return testDevGatewayConfig({
+    baseDomain: SPLIT_APPS_DOMAIN,
+    controlDomain: SPLIT_CONTROL_DOMAIN,
+    ...overrides,
+  });
 }

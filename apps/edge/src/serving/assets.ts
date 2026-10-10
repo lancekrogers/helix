@@ -1,7 +1,7 @@
 import { extname } from "node:path";
 import type { Readable } from "node:stream";
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { publicOrigin, type EdgeConfig } from "../config.js";
+import { controlOrigin, publicOrigin, type EdgeConfig } from "../config.js";
 import type { BlobReader, BlobGetResult } from "../blob/client.js";
 import type { RegistryEntry, RegistryReader } from "../registry/projection.js";
 import type { SessionGate } from "../auth/gate.js";
@@ -199,7 +199,7 @@ export function makeAssetHandler(deps: AssetHandlerDeps) {
       if (wantsConnect) {
         scripts.push(
           buildConnectScript({
-            platformOrigins: [publicOrigin(config, slug), publicOrigin(config, "auth")],
+            platformOrigins: [publicOrigin(config, slug), controlOrigin(config, "auth")],
           }),
         );
       }

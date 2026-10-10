@@ -14,7 +14,13 @@ import { buildApp } from "../app.js";
 import { OpenIdConnectClient } from "./oidc.js";
 import { PgSessionStore, hashSessionToken } from "./sessions.js";
 import { FLOW_COOKIE, SESSION_COOKIE } from "./cookies.js";
-import { testAuthConfig, testEdgeConfig } from "../test/config.js";
+import { publicOrigin } from "../config.js";
+import {
+  SPLIT_CONTROL_DOMAIN,
+  splitEdgeConfig,
+  testAuthConfig,
+  testEdgeConfig,
+} from "../test/config.js";
 import { FakeBlobReader, FakeRegistry, registryEntry } from "../test/fakes.js";
 import { TEST_DATABASE_URL, deleteApp, seedApp, type SeededApp } from "../test/seed.js";
 
@@ -26,7 +32,9 @@ import { TEST_DATABASE_URL, deleteApp, seedApp, type SeededApp } from "../test/s
  */
 
 const REDIRECT_URI = "https://auth.local.helix.azxlabs.io:8080/callback";
+const SPLIT_REDIRECT_URI = `https://auth.${SPLIT_CONTROL_DOMAIN}:8080/callback`;
 const AUTH_HOST = { host: "auth.local.helix.azxlabs.io" };
+const SPLIT_AUTH_HOST = { host: `auth.${SPLIT_CONTROL_DOMAIN}` };
 
 let idp: RunningDevIdp;
 let pool: Pool;
@@ -48,6 +56,7 @@ async function browseIdpLogin(
   authorizeUrl: string,
   userEmail: string,
   browser: TestHttpSession = new TestHttpSession(),
+  redirectUri: string = REDIRECT_URI,
 ): Promise<URL> {
   const session = browser;
   let current = authorizeUrl;
@@ -56,7 +65,7 @@ async function browseIdpLogin(
     if (res.status >= 300 && res.status < 400) {
       const next = new URL(res.headers.get("location") ?? "/", current);
       await res.body?.cancel();
-      if (next.toString().startsWith(REDIRECT_URI)) return next; // back to the edge
+      if (next.toString().startsWith(redirectUri)) return next; // back to the edge
       current = next.toString();
       continue;
     }
@@ -76,28 +85,41 @@ async function loginAs(
   slug: string,
   rd = "/page",
   browser: TestHttpSession = new TestHttpSession(),
+  opts: {
+    targetApp?: FastifyInstance;
+    authHost?: { host: string };
+    redirectUri?: string;
+  } = {},
 ): Promise<{
   callbackRes: LightMyRequestResponse;
   completeUrl?: URL;
   redeemRes?: LightMyRequestResponse;
   sessionCookie?: string;
 }> {
-  const start = await app.inject({
+  const edgeApp = opts.targetApp ?? app;
+  const authHost = opts.authHost ?? AUTH_HOST;
+  const redirectUri = opts.redirectUri ?? REDIRECT_URI;
+  const start = await edgeApp.inject({
     url: `/start?app=${slug}&rd=${encodeURIComponent(rd)}`,
-    headers: AUTH_HOST,
+    headers: authHost,
   });
   expect(start.statusCode).toBe(302);
   const flowCookie = cookieValue(start, FLOW_COOKIE);
 
-  const callbackUrl = await browseIdpLogin(start.headers.location as string, userEmail, browser);
-  const callbackRes = await app.inject({
+  const callbackUrl = await browseIdpLogin(
+    start.headers.location as string,
+    userEmail,
+    browser,
+    redirectUri,
+  );
+  const callbackRes = await edgeApp.inject({
     url: callbackUrl.pathname + callbackUrl.search,
-    headers: { ...AUTH_HOST, cookie: `${FLOW_COOKIE}=${flowCookie}` },
+    headers: { ...authHost, cookie: `${FLOW_COOKIE}=${flowCookie}` },
   });
   if (callbackRes.statusCode !== 302) return { callbackRes };
 
   const completeUrl = new URL(callbackRes.headers.location as string);
-  const redeemRes = await app.inject({
+  const redeemRes = await edgeApp.inject({
     url: completeUrl.pathname + completeUrl.search,
     headers: { host: completeUrl.host },
   });
@@ -110,7 +132,7 @@ async function loginAs(
 }
 
 beforeAll(async () => {
-  idp = await startDevIdp({ edgeRedirectUris: [REDIRECT_URI] });
+  idp = await startDevIdp({ edgeRedirectUris: [REDIRECT_URI, SPLIT_REDIRECT_URI] });
   pool = new Pool({ connectionString: TEST_DATABASE_URL, max: 4 });
   internalApp = await seedApp(pool, { live: true });
   groupApp = await seedApp(pool, {
@@ -468,5 +490,154 @@ describe("a token without an oid claim refuses the login (ADR-0048 decision 2)",
     );
     // The refusal is the only complaint — no code_exchange_failed noise on top.
     expect(warnings.filter((w) => w.obj.event === "auth.code_exchange_failed")).toHaveLength(0);
+  });
+});
+
+describe("split layout against real oidc-provider + Postgres", () => {
+  let splitApp: FastifyInstance;
+  let splitOidc: OpenIdConnectClient;
+
+  beforeAll(async () => {
+    const auth = testAuthConfig({
+      issuerUrl: idp.issuer,
+      clientId: "helix-edge",
+      credential: { kind: "secret", clientSecret: "edge-dev-secret" },
+      allowInsecureIdp: true,
+    });
+    splitOidc = new OpenIdConnectClient(auth, SPLIT_REDIRECT_URI, {
+      info: () => {},
+      warn: () => {},
+    });
+    await splitOidc.start();
+    const cfg = splitEdgeConfig({ auth, allowUnauthenticated: false });
+    splitApp = buildApp({
+      config: cfg,
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: internalApp.appId,
+          slug: internalApp.slug,
+          blobPrefix: internalApp.blobPrefix,
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: splitOidc,
+    });
+    await splitApp.ready();
+  });
+
+  afterAll(async () => {
+    await splitApp.close();
+    splitOidc.stop();
+  });
+
+  it("logs in through control auth and lands on the apps host", async () => {
+    const cfg = splitEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false });
+    const { redeemRes, completeUrl } = await loginAs(
+      "alice@azx.dev",
+      internalApp.slug,
+      "/page",
+      new TestHttpSession(),
+      { targetApp: splitApp, authHost: SPLIT_AUTH_HOST, redirectUri: SPLIT_REDIRECT_URI },
+    );
+    expect(redeemRes?.statusCode).toBe(302);
+    expect(completeUrl?.origin).toBe(publicOrigin(cfg, internalApp.slug));
+  });
+
+  it("silently refreshes via prompt=none on the control auth host", async () => {
+    const browser = new TestHttpSession();
+    const appsHost = { host: `${internalApp.slug}.${splitEdgeConfig().baseDomain}` };
+    const { sessionCookie } = await loginAs("alice@azx.dev", internalApp.slug, "/page", browser, {
+      targetApp: splitApp,
+      authHost: SPLIT_AUTH_HOST,
+      redirectUri: SPLIT_REDIRECT_URI,
+    });
+
+    await pool.query(
+      `UPDATE sessions SET "refreshDueAt" = now() - interval '1 minute' WHERE "tokenHash" = $1`,
+      [hashSessionToken(sessionCookie as string)],
+    );
+    const nav = await splitApp.inject({
+      url: "/page",
+      headers: {
+        ...appsHost,
+        "sec-fetch-mode": "navigate",
+        cookie: `${SESSION_COOKIE}=${sessionCookie}`,
+      },
+    });
+    expect(nav.statusCode).toBe(302);
+    const startUrl = new URL(nav.headers.location as string);
+    expect(startUrl.host).toBe(`${SPLIT_AUTH_HOST.host}:8080`);
+    expect(startUrl.searchParams.get("silent")).toBe("1");
+
+    const start = await splitApp.inject({
+      url: startUrl.pathname + startUrl.search,
+      headers: SPLIT_AUTH_HOST,
+    });
+    expect(start.statusCode).toBe(302);
+    const authorizeUrl = new URL(start.headers.location as string);
+    expect(authorizeUrl.searchParams.get("prompt")).toBe("none");
+    const flowCookie = cookieValue(start, FLOW_COOKIE);
+
+    const res = await browser.request(authorizeUrl.toString());
+    expect([302, 303]).toContain(res.status);
+    let next = new URL(res.headers.get("location") ?? "/", authorizeUrl);
+    await res.body?.cancel();
+    while (!next.toString().startsWith(SPLIT_REDIRECT_URI)) {
+      const hop = await browser.request(next.toString());
+      expect(hop.status, `unexpected interaction at ${next}`).toBeGreaterThanOrEqual(300);
+      expect(hop.status).toBeLessThan(400);
+      next = new URL(hop.headers.get("location") ?? "/", next);
+      await hop.body?.cancel();
+    }
+
+    const callbackRes = await splitApp.inject({
+      url: next.pathname + next.search,
+      headers: { ...SPLIT_AUTH_HOST, cookie: `${FLOW_COOKIE}=${flowCookie}` },
+    });
+    expect(callbackRes.statusCode).toBe(302);
+    const completeUrl = new URL(callbackRes.headers.location as string);
+    expect(completeUrl.origin).toBe(publicOrigin(splitEdgeConfig(), internalApp.slug));
+    const redeemRes = await splitApp.inject({
+      url: completeUrl.pathname + completeUrl.search,
+      headers: { host: completeUrl.host },
+    });
+    expect(redeemRes.statusCode).toBe(302);
+    expect(redeemRes.headers.location).toBe("/page");
+    const fresh = cookieValue(redeemRes, SESSION_COOKIE);
+    expect(fresh).toBeTruthy();
+    expect(fresh).not.toBe(sessionCookie);
+  });
+
+  it("concurrent redeem allows exactly one session cookie", async () => {
+    const browser = new TestHttpSession();
+    const start = await splitApp.inject({
+      url: `/start?app=${internalApp.slug}&rd=${encodeURIComponent("/page")}`,
+      headers: SPLIT_AUTH_HOST,
+    });
+    const flowCookie = cookieValue(start, FLOW_COOKIE);
+    const callbackUrl = await browseIdpLogin(
+      start.headers.location as string,
+      "alice@azx.dev",
+      browser,
+      SPLIT_REDIRECT_URI,
+    );
+    const callbackRes = await splitApp.inject({
+      url: callbackUrl.pathname + callbackUrl.search,
+      headers: { ...SPLIT_AUTH_HOST, cookie: `${FLOW_COOKIE}=${flowCookie}` },
+    });
+    const completeUrl = new URL(callbackRes.headers.location as string);
+    const url = completeUrl!.pathname + completeUrl!.search;
+    const host = { host: completeUrl!.host };
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => splitApp.inject({ url, headers: host })),
+    );
+    const winners = results.filter((r) => cookieValue(r, SESSION_COOKIE));
+    expect(winners).toHaveLength(1);
+    for (const r of results) {
+      if (!cookieValue(r, SESSION_COOKIE)) {
+        expect(r.statusCode).toBe(403);
+      }
+    }
   });
 });

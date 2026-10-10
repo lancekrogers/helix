@@ -20,6 +20,7 @@ const APP_ID = "11111111-1111-4111-8111-111111111111";
 function testConfig(): EdgeConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     databaseUrl: "postgresql://unused",
     blob: {
       provider: "azure",

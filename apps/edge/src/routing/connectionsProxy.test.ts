@@ -11,7 +11,8 @@ import {
 import { buildApp } from "../app.js";
 import { deriveInternalKey } from "../internalJwt.js";
 import { FLOW_COOKIE } from "../auth/cookies.js";
-import { testAuthConfig, testEdgeConfig } from "../test/config.js";
+import { controlOrigin } from "../config.js";
+import { splitEdgeConfig, testAuthConfig, testEdgeConfig } from "../test/config.js";
 import {
   FakeBlobReader,
   FakeOidcClient,
@@ -279,6 +280,39 @@ describe("the /connections/* reverse proxy on the auth host", () => {
     });
     expect(res.statusCode).toBe(413);
     expect(portal.requests).toHaveLength(0);
+    await app.close();
+  });
+
+  it("split layout: callbacks on auth.<apps> 404 without calling the portal", async () => {
+    const portal = new FakePortalProvider();
+    const cfg = splitEdgeConfig({ auth: testAuthConfig(), internalSecret: SECRET });
+    const app = buildApp({
+      config: cfg,
+      registry: new FakeRegistry([
+        registryEntry({ appId: APP_ID, slug: "demo", blobPrefix: "apps/a/1/" }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions: new FakeSessionStore(),
+      oidc: new FakeOidcClient(),
+      portal,
+    });
+    const appsAuth = { host: `auth.${cfg.baseDomain}:8080` };
+    const res = await app.inject({
+      method: "GET",
+      url: "/connections/callback?code=x&state=y",
+      headers: appsAuth,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(portal.requests).toHaveLength(0);
+
+    const controlAuth = { host: new URL(controlOrigin(cfg, "auth")).host };
+    const ok = await app.inject({
+      method: "GET",
+      url: "/connections/callback?code=x&state=y",
+      headers: controlAuth,
+    });
+    expect(ok.statusCode).toBe(200);
+    expect(portal.requests).toHaveLength(1);
     await app.close();
   });
 });

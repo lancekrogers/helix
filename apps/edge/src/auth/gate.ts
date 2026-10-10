@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Env, PrincipalKind } from "@azx-pbc/shared";
 import type { AuthConfig, EdgeConfig } from "../config.js";
-import { publicOrigin } from "../config.js";
+import { controlOrigin, publicOrigin } from "../config.js";
 import type { RegistryEntry } from "../registry/projection.js";
 import { ATTR_REASON, type SessionDenialReason } from "@azx-pbc/shared/telemetry";
 import { sendForbidden } from "../errors.js";
@@ -178,7 +178,7 @@ function ssoStartUrl(
   rd: string,
   silent: boolean,
 ): URL {
-  const start = new URL(`${publicOrigin(deps.config, "auth")}/start`);
+  const start = new URL(`${controlOrigin(deps.config, "auth")}/start`);
   start.searchParams.set("app", entry.slug);
   start.searchParams.set("rd", rd);
   if (silent) start.searchParams.set("silent", "1");
