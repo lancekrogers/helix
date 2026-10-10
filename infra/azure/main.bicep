@@ -484,6 +484,10 @@ param imgSrcReportOnly bool = false
 @description('Puts https: back in every hosted app\'s img-src (EDGE_IMG_SRC_ALLOW_ALL). For one-org installs that accept the open image channel. Default false; object-src stays none either way.')
 param imgSrcAllowAll bool = false
 
+var imgSrcFlagsValidation = (imgSrcReportOnly && imgSrcAllowAll)
+  ? fail('imgSrcReportOnly and imgSrcAllowAll cannot both be true — the edge refuses to boot when EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL are both set.')
+  : true
+
 @description('Fastify trustProxy for the edge (EDGE_TRUST_PROXY) — the ADDRESS of the trusted ingress, as a CIDR/IP list or a proxy-addr preset ("uniquelocal"). Behind ACA Envoy ingress req.ip is the ingress hop unless this names it, collapsing per-IP rate limits + the login throttle into one bucket (issue #13). "auto" (the default) resolves to 100.64.0.0/10 — the RFC 6598 shared address space ACA draws its ingress pod addresses from on a workload-profile environment (100.100.0.0/17 + the three /19s), measured against a live deployment 2026-09-03. It is NOT the apps subnet: that is where the containers get their addresses, not the ingress that connects to them, and trusting it trusted nothing; EMPTY, "false" or a stale "0" trusts nothing (the socket peer is the client), matching the code default; anything else passes to the edge validator, which additionally refuses a /0 range ("0.0.0.0/0" trusts every peer — the GHSA-3m5p-2c4r-xxw2 shape) and the dotted-netmask form ("10.0.2.0/255.255.254.0" — spell the prefix length, "10.0.2.0/23"). A hop COUNT is refused at deploy: fastify 5.12.1 removed the form (GHSA-3m5p-2c4r-xxw2), the edge refuses to boot on one, and this template rejects it before it deploys. "true" is refused with it — it trusts every peer, so anyone reaching the edge directly sets its own req.ip. Re-verify if anything else fronts the edge (CDN, WAF, second proxy): too narrow collapses every client into one bucket, too broad makes X-Forwarded-For spoofable.')
 param edgeTrustProxy string = 'auto'
 
@@ -1434,9 +1438,9 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       // EDGE_ALLOW_DEV_MODE below is a literal.
       { name: 'EDGE_ALLOW_PUBLIC_APPS', value: allowPublicApps ? 'true' : 'false' }
       { name: 'EDGE_ALLOW_PASSWORD_APPS', value: allowPasswordApps ? 'true' : 'false' }
-      { name: 'EDGE_IMG_SRC_EXTRA', value: imgSrcExtra }
-      { name: 'EDGE_IMG_SRC_REPORT_ONLY', value: imgSrcReportOnly ? 'true' : 'false' }
-      { name: 'EDGE_IMG_SRC_ALLOW_ALL', value: imgSrcAllowAll ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_EXTRA', value: imgSrcFlagsValidation ? imgSrcExtra : imgSrcExtra }
+      { name: 'EDGE_IMG_SRC_REPORT_ONLY', value: imgSrcFlagsValidation && imgSrcReportOnly ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_ALLOW_ALL', value: imgSrcFlagsValidation && imgSrcAllowAll ? 'true' : 'false' }
       // LLM upstreams (ADR-0046): first-party by default, the Foundry account
       // when deployFoundry is set, or a BYO endpoint via the llm* params.
       { name: 'EDGE_LLM_ENDPOINT', value: llm.anthropicEndpoint }

@@ -58,6 +58,8 @@ beforeAll(async () => {
         "report-to": '{"group":"x","max_age":1,"endpoints":[{"url":"https://evil.example/r"}]}',
         "reporting-endpoints": 'x="https://evil.example/r"',
         nel: '{"report_to":"x","max_age":1}',
+        "service-worker-allowed": "/",
+        "alt-svc": 'h3="evil.example:443"',
         link: '<https://evil.example/p2>; rel="next"',
       });
       res.end("{}");
@@ -221,6 +223,8 @@ describe("egress /proxy", () => {
     "report-to",
     "reporting-endpoints",
     "nel",
+    "service-worker-allowed",
+    "alt-svc",
   ] as const;
 
   it.each(NEW_HEADERS)("strips %s from the upstream response", async (name) => {

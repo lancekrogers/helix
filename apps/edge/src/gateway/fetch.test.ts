@@ -556,6 +556,10 @@ describe("/_api/fetch", () => {
       ["sec-fetch-mode: navigate", { "sec-fetch-mode": "navigate" }],
       ["sec-fetch-dest: document", { "sec-fetch-dest": "document" }],
       ["sec-fetch-dest: iframe", { "sec-fetch-dest": "iframe" }],
+      ["sec-fetch-dest: worker", { "sec-fetch-dest": "worker" }],
+      ["sec-fetch-dest: sharedworker", { "sec-fetch-dest": "sharedworker" }],
+      ["sec-fetch-dest: serviceworker", { "sec-fetch-dest": "serviceworker" }],
+      ["service-worker header", { "service-worker": "script" }],
     ])("refuses a navigation even when same-origin (%s)", async (_label, extra) => {
       expect(await call({ "sec-fetch-site": "same-origin", ...extra })).toEqual({
         status: 403,
@@ -569,6 +573,12 @@ describe("/_api/fetch", () => {
     it("does not mistake an app fetching HTML for a navigation", async () => {
       expect(
         await call({ "sec-fetch-site": "same-origin", accept: "text/html,*/*" }),
+      ).toMatchObject({ status: 200 });
+    });
+
+    it("allows a fetch()-shaped request with sec-fetch-dest empty", async () => {
+      expect(
+        await call({ "sec-fetch-site": "same-origin", "sec-fetch-dest": "empty" }),
       ).toMatchObject({ status: 200 });
     });
 
@@ -663,12 +673,13 @@ describe("/_api/fetch", () => {
 
   const NEW_HEADERS = [
     "clear-site-data",
-    "content-security-policy",
     "content-security-policy-report-only",
     "refresh",
     "report-to",
     "reporting-endpoints",
     "nel",
+    "service-worker-allowed",
+    "alt-svc",
   ] as const;
 
   it.each(NEW_HEADERS)("does not copy %s from egress's response onto the app's", async (name) => {
@@ -681,6 +692,8 @@ describe("/_api/fetch", () => {
       "report-to": '{"group":"x","max_age":1,"endpoints":[{"url":"https://evil.example/r"}]}',
       "reporting-endpoints": 'x="https://evil.example/r"',
       nel: '{"report_to":"x","max_age":1}',
+      "service-worker-allowed": "/",
+      "alt-svc": 'h3="evil.example:443"',
       link: '<https://evil.example/p2>; rel="next"',
       etag: '"v1"',
       "retry-after": "30",
@@ -697,6 +710,19 @@ describe("/_api/fetch", () => {
     expect(res.headers["etag"]).toBe('"v1"');
     expect(res.headers["retry-after"]).toBe("30");
     expect(res.headers["x-ratelimit-remaining"]).toBe("41");
+    await app.close();
+  });
+
+  it("sets a backstop content-security-policy on every proxied response", async () => {
+    const { app, egress } = buildFetchEdge();
+    egress.responseHeaders = { "content-security-policy": "default-src https:" };
+    const res = await app.inject({
+      method: "GET",
+      url: "/_api/fetch/https://api.github.com/x",
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
     await app.close();
   });
 

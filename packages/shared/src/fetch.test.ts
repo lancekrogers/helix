@@ -31,6 +31,8 @@ const POLICY_RESPONSE_HEADERS = [
   "report-to",
   "reporting-endpoints",
   "nel",
+  "service-worker-allowed",
+  "alt-svc",
 ] as const;
 
 describe("RESPONSE_HEADER_BLOCKLIST", () => {

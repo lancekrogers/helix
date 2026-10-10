@@ -40,19 +40,22 @@ export const CSP_REPORT_PATH = "/_csp-report";
 
 export const CSP_REPORT_ONLY_HEADER = "content-security-policy-report-only";
 
-/**
- * Reduce approved external origins to bare CSP sources (scheme+host+port). They
- * arrive as validated URLs; `new URL().origin` strips any path so a stored
- * `https://api.foo.com/v1` doesn't become a path-restricted source. Invalid
- * entries are dropped (fail-closed — never widen on garbage).
- */
-function originSources(origins: readonly string[]): string[] {
+/** Hostnames safe to embed in a CSP source list (LDH labels, IPv4, or IPv6). */
+export function isCspSafeHostname(hostname: string): boolean {
+  if (hostname.includes(":")) {
+    return /^[0-9a-f:.]+$/i.test(hostname);
+  }
+  return /^[a-z0-9.-]+$/.test(hostname);
+}
+
+function originSources(origins: readonly string[], schemes: readonly string[]): string[] {
   const out: string[] = [];
   for (const o of origins) {
     try {
       const parsed = new URL(o);
-      if (parsed.protocol !== "https:") continue;
+      if (!schemes.includes(parsed.protocol)) continue;
       if (parsed.hostname.includes("*")) continue;
+      if (!isCspSafeHostname(parsed.hostname)) continue;
       const origin = parsed.origin;
       if (origin !== "null" && !out.includes(origin)) out.push(origin);
     } catch {
@@ -60,6 +63,14 @@ function originSources(origins: readonly string[]): string[] {
     }
   }
   return out;
+}
+
+function connectOriginSources(origins: readonly string[]): string[] {
+  return originSources(origins, ["https:", "wss:"]);
+}
+
+function imgOriginSources(origins: readonly string[]): string[] {
+  return originSources(origins, ["https:"]);
 }
 
 export interface AppCspOptions {
@@ -79,12 +90,12 @@ interface PolicyOptions {
 }
 
 function buildPolicy(o: PolicyOptions): string {
-  const connectSources = originSources(o.externalOrigins);
+  const connectSources = connectOriginSources(o.externalOrigins);
   const connectSuffix = connectSources.length ? ` ${connectSources.join(" ")}` : "";
   const imgSources =
     o.imgMode === "legacy"
-      ? connectSources
-      : originSources([...o.externalOrigins, ...o.imgSrcExtra]);
+      ? imgOriginSources(o.externalOrigins)
+      : imgOriginSources([...o.externalOrigins, ...o.imgSrcExtra]);
   const imgSuffix = imgSources.length ? ` ${imgSources.join(" ")}` : "";
   const img =
     o.imgMode === "tight"

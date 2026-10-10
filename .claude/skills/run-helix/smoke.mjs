@@ -11,7 +11,15 @@
  * See ./SKILL.md for prerequisites and the flag reference.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, openSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -22,6 +30,7 @@ import { resolveStack } from "../../../scripts/stack-env.mjs";
 import { ensureDatabase } from "../../../scripts/ensure-db.mjs";
 
 const ROOT = new URL("../../../", import.meta.url).pathname.replace(/\/$/, "");
+const SMOKE_FIXTURES = join(ROOT, ".claude/skills/run-helix/fixtures");
 const CA = join(ROOT, ".devcontainer/certs/caroot/rootCA.pem");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -310,9 +319,10 @@ async function seedRegistry() {
   const plainHtml =
     "<!doctype html><html><head><title>helix smoke</title></head>" +
     "<body><h1>helix smoke fixture</h1></body></html>\n";
+  const publicPixelOrigin = `https://smoke-public.${BASE_DOMAIN}:${STACK.ports.edge}`;
   const cspHtml =
     "<!doctype html><html><head><title>helix smoke csp</title></head><body>" +
-    `<img id="remote" src="https://auth.${BASE_DOMAIN}:${STACK.ports.edge}/health">` +
+    `<img id="remote" src="${publicPixelOrigin}/pixel.gif">` +
     '<img id="inline" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">' +
     "</body></html>\n";
 
@@ -321,12 +331,15 @@ async function seedRegistry() {
   // smoke-csp redeploys every run so the served page always matches cspHtml;
   // the browser check depends on its exact images.
   for (const [slug, visibility, html, redeploy] of [
-    ["smoke-public", "public", plainHtml, false],
+    ["smoke-public", "public", plainHtml, true],
     ["smoke-internal", "internal", plainHtml, false],
     ["smoke-csp", "public", cspHtml, true],
   ]) {
     await check(`live ${visibility} app (${slug})`, async () => {
       writeFileSync(join(dir, "index.html"), html);
+      if (slug === "smoke-public") {
+        copyFileSync(join(SMOKE_FIXTURES, "pixel.gif"), join(dir, "pixel.gif"));
+      }
       // scope=all, not the default mine: the question is "does this slug exist
       // with a live version", not "is it mine". A principal-id re-base (e.g.
       // ADR-0048 changing the dev-token actor's oid) otherwise makes rows
@@ -452,10 +465,22 @@ async function checkEdge() {
       const csp = headers.get("content-security-policy");
       const reportOnly = headers.get("content-security-policy-report-only");
       assert(csp, "no CSP header");
-      assert(!reportOnly, "unexpected Report-Only CSP header");
+      const measurement = SVC_ENV.EDGE_IMG_SRC_REPORT_ONLY === "true";
+      const allowAll = SVC_ENV.EDGE_IMG_SRC_ALLOW_ALL === "true";
+      if (measurement) {
+        assert(
+          !reportOnly || csp.includes("img-src https:"),
+          "measurement mode expected open enforced img-src",
+        );
+      } else if (allowAll) {
+        assert(csp.includes("img-src https:"), "allow-all mode expected open img-src");
+        assert(!reportOnly, "unexpected Report-Only CSP header");
+      } else {
+        assert(!reportOnly, "unexpected Report-Only CSP header");
+        assert(csp.includes("img-src 'self' data: blob:"), "enforced img-src not tightened");
+        assert(csp.includes("object-src 'none'"), "enforced missing object-src");
+      }
       assert(csp.includes("frame-ancestors 'none'"), "frame-ancestors not locked down");
-      assert(csp.includes("img-src 'self' data: blob:"), "enforced img-src not tightened");
-      assert(csp.includes("object-src 'none'"), "enforced missing object-src");
     });
   }
 
@@ -667,11 +692,16 @@ async function checkBrowser() {
   let cspBrowser;
   try {
     browser = await launchBrowser({ port: STACK.cdpPort });
-    cspBrowser = await launchBrowser({
-      port: STACK.cdpPort + 1,
-      ignoreCertErrors: true,
-      baseDomain: BASE_DOMAIN,
-    });
+    try {
+      cspBrowser = await launchBrowser({
+        port: STACK.cdpPort + 1,
+        ignoreCertErrors: true,
+        baseDomain: BASE_DOMAIN,
+      });
+    } catch (e) {
+      browser.close();
+      throw e;
+    }
   } catch (e) {
     return skip("SPA renders in a real browser", e.message);
   }
@@ -727,7 +757,8 @@ async function checkBrowser() {
     await check(
       "enforced CSP blocks remote image and records violation for smoke-csp",
       async () => {
-        const authOrigin = `https://auth.${BASE_DOMAIN}:${STACK.ports.edge}`;
+        const remoteOrigin = `https://smoke-public.${BASE_DOMAIN}:${STACK.ports.edge}`;
+        const seenBefore = Date.now();
         cspBrowser.reset();
         await cspBrowser.navigate(EDGE("smoke-csp"));
         const remote = await cspBrowser.evaluate(`(() => {
@@ -748,6 +779,25 @@ async function checkBrowser() {
         assert(inlineW === 1, `inline data: image naturalWidth expected 1, got ${inlineW}`);
         await sleep(3000);
         const reportPostData = cspBrowser.cspReportPosts.at(-1) ?? null;
+        assert(reportPostData, "no /_csp-report POST captured");
+        let inner;
+        try {
+          inner = JSON.parse(reportPostData)["csp-report"] ?? {};
+        } catch {
+          throw new Error("could not parse report POST body");
+        }
+        assert(
+          String(inner["blocked-uri"] ?? "").startsWith(remoteOrigin),
+          `blocked-uri expected to start with ${remoteOrigin}, got ${inner["blocked-uri"]}`,
+        );
+        const dispositionNote =
+          inner.disposition === undefined
+            ? "disposition absent (unknown)"
+            : `disposition=${JSON.stringify(inner.disposition)}`;
+        assert(
+          inner.disposition === "enforce",
+          `expected disposition enforce, got ${inner.disposition}`,
+        );
 
         const { body: violations } = await jget(`${PORTAL}/api/v1/csp/violations`, {
           headers: auth,
@@ -756,63 +806,57 @@ async function checkBrowser() {
           (v) =>
             v.appSlug === "smoke-csp" &&
             v.directive?.includes("img-src") &&
-            String(v.blockedUri ?? "").startsWith(authOrigin),
+            String(v.blockedUri ?? "").startsWith(remoteOrigin) &&
+            new Date(v.lastSeen).getTime() >= seenBefore - 5000,
         );
-        assert(hit, `no img-src violation for smoke-csp against ${authOrigin}`);
-        let dispositionNote = "no /_csp-report POST captured";
-        if (reportPostData) {
-          let inner;
-          try {
-            inner = JSON.parse(reportPostData)["csp-report"] ?? {};
-          } catch {
-            dispositionNote = "could not parse report POST body";
-          }
-          if (inner) {
-            dispositionNote =
-              inner.disposition === undefined
-                ? "disposition absent (unknown)"
-                : `disposition=${JSON.stringify(inner.disposition)}`;
-            assert(
-              inner.disposition === "enforce",
-              `expected disposition enforce, got ${inner.disposition}`,
-            );
-          }
-        }
+        assert(hit, `no recent img-src violation for smoke-csp against ${remoteOrigin}`);
         return `${hit.count} report(s); ${dispositionNote}`;
       },
     );
 
     await check("granted origin appears in smoke-csp CSP", async () => {
-      const authOrigin = `https://auth.${BASE_DOMAIN}:${STACK.ports.edge}`;
+      const grantOrigin = `https://smoke-public.${BASE_DOMAIN}:${STACK.ports.edge}`;
       const dbUrl = SVC_ENV.DATABASE_URL;
       assert(dbUrl, "DATABASE_URL required for grant check");
-      const cap = JSON.stringify({ externalOrigins: [authOrigin] });
-      const grant = spawnSync(
-        "psql",
-        [dbUrl, "-qtc", `UPDATE apps SET capabilities='${cap}'::jsonb WHERE slug='smoke-csp';`],
-        {
-          encoding: "utf8",
-        },
-      );
-      assert(grant.status === 0, `psql grant failed: ${grant.stderr}`);
-      const deadline = Date.now() + 15_000;
-      let csp;
-      for (;;) {
-        const { headers } = await jget(EDGE("smoke-csp"));
-        csp = headers.get("content-security-policy") ?? "";
-        if (csp.includes(authOrigin)) break;
-        if (Date.now() > deadline) throw new Error("CSP never picked up granted origin");
-        await sleep(250);
+      const cap = JSON.stringify({ externalOrigins: [grantOrigin] });
+      try {
+        const grant = spawnSync(
+          "psql",
+          [dbUrl, "-qtc", `UPDATE apps SET capabilities='${cap}'::jsonb WHERE slug='smoke-csp';`],
+          {
+            encoding: "utf8",
+          },
+        );
+        assert(grant.status === 0, `psql grant failed: ${grant.stderr}`);
+        const deadline = Date.now() + 15_000;
+        let csp;
+        for (;;) {
+          const { headers } = await jget(EDGE("smoke-csp"));
+          csp = headers.get("content-security-policy") ?? "";
+          if (csp.includes(grantOrigin)) break;
+          if (Date.now() > deadline) throw new Error("CSP never picked up granted origin");
+          await sleep(250);
+        }
+        assert(
+          csp.includes("connect-src") && csp.includes(grantOrigin),
+          "connect-src missing grant",
+        );
+        assert(csp.includes("img-src") && csp.includes(grantOrigin), "img-src missing grant");
+        cspBrowser.reset();
+        await cspBrowser.navigate(EDGE("smoke-csp"));
+        const remoteW = await cspBrowser.evaluate(
+          "document.querySelector('#remote')?.naturalWidth ?? 0",
+        );
+        assert(remoteW === 1, `granted remote image naturalWidth expected 1, got ${remoteW}`);
+        return grantOrigin;
+      } finally {
+        const clear = spawnSync(
+          "psql",
+          [dbUrl, "-qtc", `UPDATE apps SET capabilities='{}'::jsonb WHERE slug='smoke-csp';`],
+          { encoding: "utf8" },
+        );
+        assert(clear.status === 0, `psql clear grant failed: ${clear.stderr}`);
       }
-      assert(csp.includes("connect-src") && csp.includes(authOrigin), "connect-src missing grant");
-      assert(csp.includes("img-src") && csp.includes(authOrigin), "img-src missing grant");
-      const clear = spawnSync(
-        "psql",
-        [dbUrl, "-qtc", `UPDATE apps SET capabilities='{}'::jsonb WHERE slug='smoke-csp';`],
-        { encoding: "utf8" },
-      );
-      assert(clear.status === 0, `psql clear grant failed: ${clear.stderr}`);
-      return authOrigin;
     });
   } finally {
     browser.close();

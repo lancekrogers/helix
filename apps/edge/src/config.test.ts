@@ -286,6 +286,12 @@ describe("loadConfig", () => {
         EDGE_IMG_SRC_EXTRA: "https://a.example,https://a.example",
       }).imgSrcExtra,
     ).toEqual(["https://a.example"]);
+    expect(() => loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "wss://live.example" })).toThrow(
+      /EDGE_IMG_SRC_EXTRA is not a list of https origins/,
+    );
+    expect(() => loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "https://x;connect-src" })).toThrow(
+      /EDGE_IMG_SRC_EXTRA is not a list of https origins/,
+    );
     for (const bad of [
       "http://a.example",
       "https:",

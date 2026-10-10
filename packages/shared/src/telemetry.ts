@@ -283,6 +283,9 @@ export const CSP_REPORT_DIRECTIVES = [
 export type CspReportDirective = (typeof CSP_REPORT_DIRECTIVES)[number];
 export const CSP_REPORT_DISPOSITIONS = ["enforce", "report", "unknown"] as const;
 export type CspReportDisposition = (typeof CSP_REPORT_DISPOSITIONS)[number];
+/** Whether a parsed CSP report row reached `csp_reports` (`helix.edge.csp_reports` / {@link ATTR_OUTCOME}). */
+export const CSP_REPORT_OUTCOMES = ["recorded", "dropped", "failed"] as const;
+export type CspReportOutcome = (typeof CSP_REPORT_OUTCOMES)[number];
 
 /**
  * Why a provider-cache reconcile was counted — the `helix.providers.reconciles`

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { BASELINE_DOLLARS_PER_DAY } from "@azx-pbc/shared";
 import { DEFAULT_STATEMENT_TIMEOUT_MS } from "./db/pool.js";
+import { isCspSafeHostname } from "./serving/csp.js";
 
 /**
  * Edge configuration, resolved once at boot from the environment (project plan
@@ -652,21 +653,8 @@ const isDottedNetmaskCidr = (part: string): boolean =>
   /^\d+\.\d+\.\d+\.\d+\/\d+\.\d+\.\d+\.\d+$/.test(part);
 
 /**
- * Parse EDGE_TRUST_PROXY: unset/blank means false; true/false select booleans;
- * otherwise accept a comma-separated list of IPs, CIDRs, or proxy-addr presets.
- * Reject invalid values before Fastify starts. An incorrect trusted address
- * can collapse rate limits and collection audit hashes to the ingress IP.
- *
- * Validate more strictly than proxy-addr/ipaddr.js, which accepts legacy short
- * IPv4 forms: 10.0.2 can become 10.0.0.2 instead of the intended network.
- * Reject /0 (use the explicit boolean form), zone-suffixed IPv6, and dotted
- * netmasks (use prefix lengths). Reject hop counts removed by Fastify 5.12.1
- * (GHSA-3m5p-2c4r-xxw2); accept 0 only as false. `auto` belongs to the Azure
- * template and must be resolved before reaching this parser.
- */
-/**
  * Parse EDGE_IMG_SRC_EXTRA: comma-separated https origins widened into every
- * every app's `img-src` (enforced by default; Report-Only only during measurement).
+ * app's `img-src` (enforced by default; Report-Only only during measurement).
  * Refuse boot on any part that is not a bare
  * origin — paths, queries, credentials, wildcards, and http: are all errors.
  */
@@ -693,6 +681,7 @@ export function parseImgSrcExtra(raw: string | undefined): string[] {
       url.username ||
       url.password ||
       url.hostname.includes("*") ||
+      !isCspSafeHostname(url.hostname) ||
       url.search !== "" ||
       url.hash !== "" ||
       url.pathname !== "/" ||
@@ -709,6 +698,19 @@ export function parseImgSrcExtra(raw: string | undefined): string[] {
   return out;
 }
 
+/**
+ * Parse EDGE_TRUST_PROXY: unset/blank means false; true/false select booleans;
+ * otherwise accept a comma-separated list of IPs, CIDRs, or proxy-addr presets.
+ * Reject invalid values before Fastify starts. An incorrect trusted address
+ * can collapse rate limits and collection audit hashes to the ingress IP.
+ *
+ * Validate more strictly than proxy-addr/ipaddr.js, which accepts legacy short
+ * IPv4 forms: 10.0.2 can become 10.0.0.2 instead of the intended network.
+ * Reject /0 (use the explicit boolean form), zone-suffixed IPv6, and dotted
+ * netmasks (use prefix lengths). Reject hop counts removed by Fastify 5.12.1
+ * (GHSA-3m5p-2c4r-xxw2); accept 0 only as false. `auto` belongs to the Azure
+ * template and must be resolved before reaching this parser.
+ */
 function parseTrustProxy(raw: string | undefined): boolean | string {
   const v = (raw ?? "").trim();
   if (!v) return false;

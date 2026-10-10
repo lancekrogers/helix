@@ -148,6 +148,13 @@ function isDocumentRequest(req: FastifyRequest): boolean {
   );
 }
 
+/** Service-worker registration and worker-destination loads on same-origin URLs. */
+function isWorkerRegistrationRequest(req: FastifyRequest): boolean {
+  if (req.headers["service-worker"] !== undefined) return true;
+  const dest = req.headers["sec-fetch-dest"];
+  return dest === "worker" || dest === "sharedworker" || dest === "serviceworker";
+}
+
 /**
  * The gateway's CSRF seam (dev-mode §5.4). The `/_api/*` handlers call this to
  * decide whether a request's Origin is allowed. On the edge it is the
@@ -186,6 +193,7 @@ export type OriginCheck = (req: FastifyRequest, entry: RegistryEntry) => boolean
 export function makeSameOriginCheck(config: EdgeConfig): OriginCheck {
   return (req, entry) =>
     !isDocumentRequest(req) &&
+    !isWorkerRegistrationRequest(req) &&
     (fetchMetadataSameOrigin(req.headers["sec-fetch-site"]) ??
       isSameOrigin(req.headers.origin, config, entry.slug));
 }

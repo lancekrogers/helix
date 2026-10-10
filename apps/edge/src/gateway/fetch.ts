@@ -454,6 +454,8 @@ export function makeFetchHandler(rt: FetchGatewayRuntime) {
       for (const [k, v] of Object.entries(res.headers)) {
         if (!RESPONSE_BLOCKED.has(k) && v !== undefined) reply.header(k, v);
       }
+      // Backstop for any non-fetch() consumer (worker script, misclassified load).
+      reply.header("content-security-policy", "default-src 'none'");
       // Count the response bytes on the way to the app: egress already caps, but
       // the edge caps independently (defense-in-depth — the two hops don't trust
       // each other). Status + headers are committed, so a trip truncates the

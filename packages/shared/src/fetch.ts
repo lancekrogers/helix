@@ -110,10 +110,14 @@ export const REQUEST_HEADER_SAFELIST: readonly string[] = [
  * Policy and reporting headers belong to the app origin, not a vendor. The
  * gateway's response is same-origin with the app, so a copied clear-site-data
  * or nel applies to the app's origin even on a fetch() response (clearing its
- * cookies and storage, or registering a reporting policy), and the CSP, refresh
- * and reporting headers apply if the response is opened as a document. Keep this
- * a denylist; an allowlist would drop headers apps rely on (etag, retry-after,
- * rate-limit headers).
+ * cookies and storage, or registering a reporting policy). Navigations that would
+ * treat the body as a document are refused on `/_api/fetch/*`; worker-destination
+ * loads and `Service-Worker` registration fetches are refused too. The edge still
+ * sets a backstop `content-security-policy: default-src 'none'` on every proxied
+ * response so a misclassified load cannot inherit vendor policy. Strip upstream
+ * CSP and reporting headers here anyway — they must never replace the app CSP.
+ * Keep this a denylist; an allowlist would drop headers apps rely on (etag,
+ * retry-after, rate-limit headers).
  */
 export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
   "set-cookie",
@@ -134,6 +138,8 @@ export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
   "report-to",
   "reporting-endpoints",
   "nel",
+  "service-worker-allowed",
+  "alt-svc",
 ];
 
 // ── App-facing error shape ────────────────────────────────────────────────────

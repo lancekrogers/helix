@@ -4,10 +4,13 @@ import {
   ATTR_APP_ID,
   ATTR_CSP_DIRECTIVE,
   ATTR_CSP_DISPOSITION,
+  ATTR_OUTCOME,
   CSP_REPORT_DIRECTIVES,
   type CspReportDirective,
   type CspReportDisposition,
+  type CspReportOutcome,
 } from "@azx-pbc/shared/telemetry";
+import type { CspReportInsertThrottle } from "./cspReportThrottle.js";
 import { createEdgePool, type EdgePoolOpts } from "../db/pool.js";
 import type { RegistryReader } from "../registry/projection.js";
 import { sendNotFound } from "../errors.js";
@@ -134,6 +137,8 @@ export interface CspReportRuntime {
   registry: RegistryReader;
   /** null = accept-and-drop (no DB writer wired). */
   store: CspReportStore | null;
+  /** null ⇒ uncapped (tests). */
+  insertThrottle: CspReportInsertThrottle | null;
 }
 
 /**
@@ -155,18 +160,27 @@ export function makeCspReportHandler(rt: CspReportRuntime) {
     const parsed = extractReport(req.body);
     if (parsed) {
       const { disposition, ...record } = parsed;
+      const decision = rt.insertThrottle
+        ? await rt.insertThrottle.admit(entry.appId)
+        : { insert: true as const };
+      let outcome: CspReportOutcome = "dropped";
+      if (rt.store && decision.insert) {
+        try {
+          await rt.store.record({ appId: entry.appId, ...record });
+          outcome = "recorded";
+        } catch (err) {
+          outcome = "failed";
+          req.log.warn({ err }, "failed to record CSP report");
+        }
+      } else if (!rt.store || decision.insert) {
+        outcome = "recorded";
+      }
       instruments().cspReports.add(1, {
         [ATTR_APP_ID]: entry.appId,
         [ATTR_CSP_DIRECTIVE]: foldDirective(record.directive),
         [ATTR_CSP_DISPOSITION]: disposition,
+        [ATTR_OUTCOME]: outcome,
       });
-      if (rt.store) {
-        try {
-          await rt.store.record({ appId: entry.appId, ...record });
-        } catch (err) {
-          req.log.warn({ err }, "failed to record CSP report");
-        }
-      }
     }
     reply.status(204).send();
   };

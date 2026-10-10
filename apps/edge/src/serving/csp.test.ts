@@ -72,6 +72,19 @@ describe("buildAppCsp — per-app external origins (§6.2)", () => {
     expect(d.get("connect-src")).toBe("'self'");
   });
 
+  it("includes wss origins in connect-src but not img-src", () => {
+    const origins = ["https://api.foo.com", "wss://live.foo.com"];
+    const d = parse(buildAppCsp(origins));
+    expect(d.get("connect-src")).toBe("'self' https://api.foo.com wss://live.foo.com");
+    expect(d.get("img-src")).toBe("'self' data: blob: https://api.foo.com");
+  });
+
+  it("drops hostnames with CSP metacharacters", () => {
+    const d = parse(buildAppCsp(["https://x;connect-src"]));
+    expect(d.get("connect-src")).toBe("'self'");
+    expect(d.get("img-src")).toBe("'self' data: blob:");
+  });
+
   it("with no origins equals the strict baseline", () => {
     const d = parse(buildAppCsp());
     expect(d.get("connect-src")).toBe("'self'");
@@ -99,8 +112,11 @@ describe("buildAppCsp — per-app external origins (§6.2)", () => {
   });
 
   it("restores https: in img-src when imgSrcAllowAll is true", () => {
-    const d = parse(buildAppCsp(["https://api.foo.com"], { imgSrcAllowAll: true }));
+    const d = parse(
+      buildAppCsp(["https://api.foo.com", "wss://live.foo.com"], { imgSrcAllowAll: true }),
+    );
     expect(d.get("img-src")).toBe("https: data: blob: https://api.foo.com");
+    expect(d.get("connect-src")).toContain("wss://live.foo.com");
     expect(d.get("object-src")).toBe("'none'");
   });
 
@@ -132,6 +148,19 @@ describe("measurement mode (EDGE_IMG_SRC_REPORT_ONLY)", () => {
       if (key === "img-src" || key === "object-src") continue;
       expect(reportOnly.get(key), key).toBe(value);
     }
+  });
+
+  it("puts wss in connect-src only across measurement mode", () => {
+    const enforced = parse(
+      buildLegacyEnforcedAppCsp(["wss://live.foo.com", "https://api.foo.com"]),
+    );
+    expect(enforced.get("connect-src")).toContain("wss://live.foo.com");
+    expect(enforced.get("img-src")).toBe("https: data: blob: https://api.foo.com");
+    const reportOnly = parse(
+      buildMeasurementReportOnlyCsp(["wss://live.foo.com", "https://api.foo.com"]),
+    );
+    expect(reportOnly.get("connect-src")).toContain("wss://live.foo.com");
+    expect(reportOnly.get("img-src")).toBe("'self' data: blob: https://api.foo.com");
   });
 
   it("puts approved origins in img-src and connect-src; imgSrcExtra only in img-src", () => {

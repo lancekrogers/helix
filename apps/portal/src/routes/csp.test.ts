@@ -171,6 +171,36 @@ describe("GET /api/v1/csp/violations", () => {
     expect(find("object-src", "https://granted.example/x.swf")?.resolved).toBe(false);
     expect(find("img-src", "data")?.resolved).toBe(false);
   });
+
+  it("excludes violations older than the lookback window", async () => {
+    const slug = uniqueSlug();
+    const created = await t.app.inject({
+      method: "POST",
+      url: "/api/v1/apps",
+      headers: owner,
+      payload: { slug, displayName: "old" },
+    });
+    const appId = created.json().id as string;
+
+    await t.prisma.cspReport.create({
+      data: { appId, directive: "img-src", blockedUri: "https://recent.example/x" },
+    });
+    await t.prisma.$executeRaw`
+      INSERT INTO csp_reports (id, "appId", directive, "blockedUri", "createdAt")
+      VALUES (gen_random_uuid(), ${appId}::uuid, 'img-src', 'https://stale.example/x', NOW() - INTERVAL '31 days')`;
+
+    const res = await t.app.inject({
+      method: "GET",
+      url: "/api/v1/csp/violations",
+      headers: admin,
+    });
+    expect(res.statusCode).toBe(200);
+    const mine = (res.json().violations as Array<{ appSlug: string; blockedUri: string }>).filter(
+      (v) => v.appSlug === slug,
+    );
+    expect(mine.some((v) => v.blockedUri === "https://recent.example/x")).toBe(true);
+    expect(mine.some((v) => v.blockedUri === "https://stale.example/x")).toBe(false);
+  });
 });
 
 describe("POST /api/v1/apps/:slug/access/origin", () => {

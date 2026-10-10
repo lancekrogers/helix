@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { INSTR_CSP_REPORTS } from "@azx-pbc/shared/telemetry";
+import { ATTR_OUTCOME, INSTR_CSP_REPORTS, type CspReportOutcome } from "@azx-pbc/shared/telemetry";
+import { InMemoryCounterStore } from "../gateway/counterStore.js";
+import { CspReportInsertThrottle } from "./cspReportThrottle.js";
 import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { buildApp } from "../app.js";
 import type { EdgeConfig } from "../config.js";
@@ -261,7 +263,10 @@ describe("POST /_csp-report", () => {
     });
   }
 
-  function buildMetricEdge(reportStore: FakeCspReportStore): FastifyInstance {
+  function buildMetricEdge(
+    reportStore: FakeCspReportStore,
+    insertThrottle: CspReportInsertThrottle | null = null,
+  ): FastifyInstance {
     const registry = new FakeRegistry([
       registryEntry({ appId: APP_ID, slug: "demo", blobPrefix: `apps/${APP_ID}/1/` }),
     ]);
@@ -270,6 +275,7 @@ describe("POST /_csp-report", () => {
       registry,
       blob: new FakeBlobReader(),
       cspReports: reportStore,
+      cspReportInsertThrottle: insertThrottle,
     });
   }
 
@@ -293,7 +299,9 @@ describe("POST /_csp-report", () => {
       "helix.app_id",
       "helix.csp.directive",
       "helix.csp.disposition",
+      "helix.outcome",
     ]);
+    expect(hit?.attributes[ATTR_OUTCOME]).toBe("recorded");
     expect(hit?.attributes["helix.csp.directive"]).toBe("img-src");
     expect(hit?.attributes["helix.csp.disposition"]).toBe("report");
     await recording.restore();
@@ -351,6 +359,34 @@ describe("POST /_csp-report", () => {
     expect(points.filter((p) => p.name === INSTR_CSP_REPORTS)).toHaveLength(0);
     await recording.restore();
   });
+
+  it.each([
+    ["recorded", { fail: false, overCap: false }, "recorded"],
+    ["dropped", { fail: false, overCap: true }, "dropped"],
+    ["failed", { fail: true, overCap: false }, "failed"],
+  ] as const)(
+    "sets helix.outcome to %s on the counter",
+    async (_label, opts, expected: CspReportOutcome) => {
+      const recording = startRecordingTelemetry();
+      const localStore = new FakeCspReportStore();
+      localStore.fail = opts.fail;
+      const throttle = opts.overCap
+        ? new CspReportInsertThrottle(new InMemoryCounterStore(), { max: 0, windowMs: 60_000 })
+        : null;
+      const app = buildMetricEdge(localStore, throttle);
+      await app.ready();
+      await injectReport(app, {
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": "https://x.io/a.png",
+        },
+      });
+      await app.close();
+      const hit = (await recording.metrics()).find((p) => p.name === INSTR_CSP_REPORTS);
+      expect(hit?.attributes[ATTR_OUTCOME]).toBe(expected);
+      await recording.restore();
+    },
+  );
 
   it("does not count on unknown slug", async () => {
     const recording = startRecordingTelemetry();
