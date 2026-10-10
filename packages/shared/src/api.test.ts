@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ApiErrorSchema,
   CreateAppRequestSchema,
+  CreateAppResultSchema,
   UpdateAppRequestSchema,
   UploadVersionResponseSchema,
 } from "./api.js";
@@ -38,6 +39,42 @@ describe("CreateAppRequestSchema", () => {
         description: "a".repeat(501),
       }),
     ).toThrow();
+  });
+});
+
+describe("CreateAppResultSchema", () => {
+  const appFields = {
+    id: "11111111-1111-4111-8111-111111111111",
+    slug: "my-app",
+    displayName: "My App",
+    visibility: { mode: "internal" as const },
+    currentVersionId: null,
+    archivedAt: null,
+    createdAt: "2026-06-11T00:00:00.000Z",
+    updatedAt: "2026-06-11T00:00:00.000Z",
+  };
+
+  it("extends the app wire shape with write-gate fields", () => {
+    const parsed = CreateAppResultSchema.parse({
+      ...appFields,
+      applied: [{ path: "llm.models[+gpt-5]", to: "gpt-5" }],
+      pending: "aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee",
+    });
+    expect(parsed.slug).toBe("my-app");
+    expect(parsed.applied).toHaveLength(1);
+    expect(parsed.pending).toBe("aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee");
+  });
+
+  it("parses with AppSchema alone — the published CLI ignores applied and pending", () => {
+    const wire = CreateAppResultSchema.parse({
+      ...appFields,
+      applied: [],
+      pending: null,
+    });
+    const legacy = AppSchema.parse(wire);
+    expect(legacy.slug).toBe("my-app");
+    expect(legacy).not.toHaveProperty("applied");
+    expect(legacy).not.toHaveProperty("pending");
   });
 });
 

@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   ApiErrorSchema,
   AppSchema,
+  CreateAppResultSchema,
   AuthConfigResponseSchema,
   PortalMeResponseSchema,
   UploadVersionResponseSchema,
@@ -46,8 +47,8 @@ export class PortalClient {
     this.#tokenProvider = typeof token === "string" ? async () => token : token;
   }
 
-  createApp(input: CreateAppInput): Promise<App> {
-    return this.#json(AppSchema, "POST", "/api/v1/apps", {
+  async createApp(input: CreateAppInput): Promise<App> {
+    const result = await this.#json(CreateAppResultSchema, "POST", "/api/v1/apps", {
       auth: true,
       body: {
         slug: input.slug,
@@ -58,6 +59,7 @@ export class PortalClient {
         ...(input.visibility !== undefined ? { visibility: input.visibility } : {}),
       },
     });
+    return result;
   }
 
   /** Public IdP discovery info — how `helix login` finds the issuer. */

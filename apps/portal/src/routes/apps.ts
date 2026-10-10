@@ -3,6 +3,7 @@ import {
   AppListScopeSchema,
   CapabilitiesSchema,
   CreateAppRequestSchema,
+  type CreateAppResult,
   OriginGrantRequestSchema,
   PasswordCredentialResponseSchema,
   SetManifestRequestSchema,
@@ -30,7 +31,11 @@ import {
   visibilityToColumns,
   type DeployAggregates,
 } from "../db/mappers.js";
-import { applyCapabilityChange, createApprovalRequest } from "../approvals/service.js";
+import {
+  applyCapabilityChange,
+  createApprovalRequest,
+  gateCapabilitiesAtCreate,
+} from "../approvals/service.js";
 import { manifestWithBindings } from "../connections/bindings.js";
 import { Prisma } from "../db/client.js";
 import {
@@ -76,65 +81,75 @@ export async function appRoutes(app: FastifyInstance): Promise<void> {
     // Best-effort, like the visibility route's: a name the directory could not
     // supply costs the audit row its names and nothing else.
     const createGroupNames = await resolveGroupNamesForAudit(visibilityColumns.visibilityGroupIds);
-    // Fill capability defaults so the stored shape always parses on read.
-    const capabilities = CapabilitiesSchema.parse(body.capabilities ?? {});
+    const requested = CapabilitiesSchema.parse(body.capabilities ?? {});
+    const visibilityState = {
+      mode: body.visibility.mode,
+      groupIds: visibilityColumns.visibilityGroupIds,
+    };
 
-    let row;
-    try {
-      row = await app.prisma.app.create({
+    const result: CreateAppResult = await app.prisma.$transaction(async (tx) => {
+      let row;
+      try {
+        row = await tx.app.create({
+          data: {
+            slug: body.slug,
+            displayName: body.displayName,
+            description: body.description ?? null,
+            ownerId: actor.oid,
+            ownerName: actor.name ?? null,
+            ownerEmail: actor.email ?? null,
+            ...visibilityColumns,
+            // Baseline capabilities only; elevated grants wait on approval.
+            capabilities: { mcp: [], externalOrigins: [] },
+          },
+        });
+      } catch (err) {
+        if (isUniqueViolation(err, "slug")) {
+          throw new AppError("slug_taken", `slug "${body.slug}" is already taken`);
+        }
+        throw err;
+      }
+
+      const { applied, baselineDeltas, pending } = await gateCapabilitiesAtCreate(tx, {
+        appId: row.id,
+        requested,
+        visibility: visibilityState,
+        actor: actor.sub,
+        actorOid: actor.oid,
+      });
+
+      if (baselineDeltas.length > 0) {
+        row = await tx.app.update({
+          where: { id: row.id },
+          data: { capabilities: applied as unknown as Prisma.InputJsonValue },
+        });
+      }
+
+      await tx.auditEvent.create({
         data: {
-          slug: body.slug,
-          displayName: body.displayName,
-          description: body.description ?? null,
-          // The identity half — the creator's Entra `oid` (ADR-0048): the one
-          // id the edge session also holds for the same human, so `ownsApp`
-          // and `scope=mine` compare a value that actually corresponds across
-          // planes. Never rendered.
-          ownerId: actor.oid,
-          // Capture the actor's display claims alongside the identity. The
-          // portal never resolves an owner against the directory later, so this
-          // is the only moment they are available; they may go stale if the
-          // person is renamed, which is the trade documented on the columns.
-          ownerName: actor.name ?? null,
-          ownerEmail: actor.email ?? null,
-          ...visibilityColumns,
-          capabilities,
+          appId: row.id,
+          actor: actor.sub,
+          action: "app.create",
+          metadata: {
+            slug: row.slug,
+            visibility: visibilityLabel(body.visibility),
+            ...(visibilityColumns.visibilityGroupIds.length > 0
+              ? {
+                  groupIds: visibilityColumns.visibilityGroupIds,
+                  ...(Object.keys(createGroupNames).length > 0
+                    ? { groupNames: createGroupNames }
+                    : {}),
+                }
+              : {}),
+          } as unknown as Prisma.InputJsonValue,
         },
       });
-    } catch (err) {
-      if (isUniqueViolation(err, "slug")) {
-        throw new AppError("slug_taken", `slug "${body.slug}" is already taken`);
-      }
-      throw err;
-    }
 
-    await app.prisma.auditEvent.create({
-      data: {
-        appId: row.id,
-        actor: actor.sub,
-        action: "app.create",
-        // Visibility is recorded here for the same reason the visibility route
-        // records it (ADR-0040 §7: an audit entry is the ONE place a group name
-        // is kept). An app can be group-scoped from birth — `CreateAppRequest`
-        // accepts the full union and `helix create --visibility group:a,b`
-        // produces exactly that; only the SPA declines to offer the mode — so
-        // without this, the groups an app was created with were recorded nowhere.
-        metadata: {
-          slug: row.slug,
-          visibility: visibilityLabel(body.visibility),
-          ...(visibilityColumns.visibilityGroupIds.length > 0
-            ? {
-                groupIds: visibilityColumns.visibilityGroupIds,
-                ...(Object.keys(createGroupNames).length > 0
-                  ? { groupNames: createGroupNames }
-                  : {}),
-              }
-            : {}),
-        } as unknown as Prisma.InputJsonValue,
-      },
+      const created = toApp(row);
+      return { ...created, applied: baselineDeltas, pending };
     });
 
-    reply.status(201).send(toApp(row));
+    reply.status(201).send(result);
   });
 
   /**

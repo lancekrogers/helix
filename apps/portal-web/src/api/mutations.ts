@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AppSchema,
   ApprovalRequestSchema,
+  CreateAppResultSchema,
   DevTokenMintResponseSchema,
   DisconnectResponseSchema,
   ManifestUpdateResultSchema,
@@ -58,9 +59,18 @@ function useAppMutation<Args>(mutationFn: (args: Args) => Promise<App>) {
 export function useCreateApp() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (body: CreateAppRequest) =>
-      fetchJson(AppSchema, "/api/v1/apps", { method: "POST", body }),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["apps"] }),
+    mutationFn: async (body: CreateAppRequest) => {
+      const result = await fetchJson(CreateAppResultSchema, "/api/v1/apps", {
+        method: "POST",
+        body,
+      });
+      return result;
+    },
+    onSuccess: (app) => {
+      void queryClient.invalidateQueries({ queryKey: ["apps"] });
+      void queryClient.invalidateQueries({ queryKey: ["apps", app.slug] });
+      void queryClient.invalidateQueries({ queryKey: ["approvals"] });
+    },
   });
 }
 

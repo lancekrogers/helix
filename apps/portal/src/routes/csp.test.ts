@@ -142,7 +142,9 @@ describe("POST /api/v1/apps/:slug/access/origin", () => {
     // Not applied until approved.
     expect(res.json().manifest.capabilities.externalOrigins).toEqual([]);
 
-    const reqs = await t.prisma.approvalRequest.findMany({ where: { appId: created.json().id } });
+    const reqs = await t.prisma.approvalRequest.findMany({
+      where: { appId: created.json().id },
+    });
     expect(reqs).toHaveLength(1);
     expect(reqs[0]?.risk).toBe("med");
   });

@@ -34,7 +34,7 @@ describe("classifyChange — LLM", () => {
     const r = classifyChange(EMPTY, {
       mcp: [],
       externalOrigins: [],
-      llm: { models: ["claude-fable-5", "gpt-5"] },
+      llm: { models: ["claude-fable-5", "gpt-5"], dollarsPerDay: BASELINE_DOLLARS_PER_DAY },
     });
     expect(paths(r.baselineDeltas)).toContain("llm.models[+claude-fable-5]");
     expect(paths(r.elevatedDeltas)).toEqual(["llm.models[+gpt-5]"]);
@@ -116,6 +116,42 @@ describe("classifyChange — LLM", () => {
     });
     expect(stillUnset.baselineDeltas).toHaveLength(0);
     expect(stillUnset.elevatedDeltas).toHaveLength(0);
+  });
+
+  it("elevates a brand-new LLM grant with no spend cap (unset counts as unlimited)", () => {
+    const r = classifyChange(EMPTY, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: ["claude-opus-4-8"] },
+    });
+    expect(paths(r.baselineDeltas)).toContain("llm.models[+claude-opus-4-8]");
+    expect(paths(r.elevatedDeltas)).toEqual(["llm.dollarsPerDay"]);
+  });
+
+  it("baselines a brand-new LLM grant when the cap is at or under the threshold", () => {
+    const atBaseline = classifyChange(EMPTY, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: ["claude-opus-4-8"], dollarsPerDay: BASELINE_DOLLARS_PER_DAY },
+    });
+    expect(atBaseline.elevatedDeltas).toHaveLength(0);
+    expect(paths(atBaseline.baselineDeltas)).toContain("llm.dollarsPerDay");
+
+    const under = classifyChange(EMPTY, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: [], dollarsPerDay: 10 },
+    });
+    expect(under.elevatedDeltas).toHaveLength(0);
+  });
+
+  it("elevates a brand-new LLM grant when the cap is above the threshold", () => {
+    const r = classifyChange(EMPTY, {
+      mcp: [],
+      externalOrigins: [],
+      llm: { models: [], dollarsPerDay: BASELINE_DOLLARS_PER_DAY + 1 },
+    });
+    expect(paths(r.elevatedDeltas)).toEqual(["llm.dollarsPerDay"]);
   });
 
   it("still treats removing data and fetch caps as elevated (unset remains unlimited)", () => {
@@ -608,7 +644,7 @@ describe("classifyChange — mixed submission splits and risk = max", () => {
     const r = classifyChange(EMPTY, {
       mcp: ["pagerduty"], // high, elevated
       externalOrigins: ["https://api.foo.com"], // med, elevated
-      llm: { models: ["claude-fable-5"] }, // baseline
+      llm: { models: ["claude-fable-5"], dollarsPerDay: BASELINE_DOLLARS_PER_DAY }, // baseline
       data: { user: true, collections: [], sharedRead: [], sharedWrite: [] }, // baseline
     });
     expect(r.baselineDeltas.length).toBeGreaterThan(0);

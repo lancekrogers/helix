@@ -69,6 +69,9 @@ by the mappers.
    (`apps/portal/src/routes/apps.ts`), validated through `CapabilitiesSchema`. The PUT is a full
    **replace**, but it is **not** committed wholesale — it is routed through the approval
    write-gate (next section), which splits it into a part that commits now and a part that waits.
+   The same classifier runs on optional `capabilities` in `POST /api/v1/apps`: baseline deltas land
+   on the new row, elevated ones open a pending request, and the response carries
+   `{ app, applied, pending }` like a manifest PUT.
 2. **Project** — the committed `capabilities` JSONB lands in `apps`, and the edge's LISTEN/NOTIFY
    projection picks it up (`apps/edge/src/registry/projection.ts`, parsing `llm`/`data`/`fetch`
    fail-closed). The live registry entry now carries `entry.llm` / `entry.data` / `entry.fetch`.
@@ -115,7 +118,7 @@ SPA's pre-submit warning never drift:
 | Area | Baseline (applies now) | Elevated (needs approval) | Risk |
 |---|---|---|---|
 | LLM models | `CURATED_LLM_MODELS` (= every model in `MODEL_PRICING`: the `claude-*` family plus the OpenAI `gpt-*` models) | any other model | med |
-| LLM budget | `dollarsPerDay ≤ BASELINE_DOLLARS_PER_DAY` ($50) | above threshold | med |
+| LLM budget | `dollarsPerDay ≤ BASELINE_DOLLARS_PER_DAY` ($50) | above threshold; also a **brand-new** `llm` grant with no `dollarsPerDay` (unset counts as unlimited vs effective none) | med |
 | data scopes | user store, collections, shared keys (literal) | shared read/write **prefixes** (ADR-0042 — one element covers unboundedly many runtime-chosen keys; a write prefix is refused without a `writesPerDay` budget, so the grant and its bound approve together) | low |
 | data budgets | writes/bytes ≤ thresholds | above threshold | med |
 | mcp | `CURATED_MCP_ALLOWLIST` (**empty** ⇒ *every* MCP grant elevates) | any MCP server | high |

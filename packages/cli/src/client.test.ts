@@ -50,7 +50,11 @@ describe("PortalClient authentication", () => {
     ],
     ["getSkill", (c) => c.getSkill(), "# Helix skill\n"],
     ["listVersions", (c) => c.listVersions("demo"), []],
-    ["createApp", (c) => c.createApp({ slug: "demo", displayName: "Demo" }), APP],
+    [
+      "createApp",
+      (c) => c.createApp({ slug: "demo", displayName: "Demo" }),
+      { ...APP, applied: [], pending: null },
+    ],
     ["promote", (c) => c.promote("demo", 1), APP],
     ["rollback", (c) => c.rollback("demo"), APP],
   ];

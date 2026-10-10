@@ -267,7 +267,7 @@ async function seedFixture(
     visibility: { mode: "internal" },
   });
   expect(created.statusCode).toBe(201);
-  const appId = created.body.id as string;
+  const appId = (created.body as { id: string }).id;
   await seedLiveVersion(appId);
 
   // The provider row(s) — created through the portal's real route, so the
@@ -1186,7 +1186,7 @@ describe("two approved apps share one connection", () => {
       visibility: { mode: "internal" },
     });
     expect(created.statusCode).toBe(201);
-    const appIdB = created.body.id as string;
+    const appIdB = (created.body as { id: string }).id;
     await seedLiveVersion(appIdB);
     const put = await portalApi("PUT", `/api/v1/apps/${bSlug}/manifest`, "owner", {
       capabilities: {

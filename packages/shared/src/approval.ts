@@ -331,7 +331,8 @@ export function classifyChange(effective: unknown, requested: unknown): Classify
   // ── LLM spend budget (USD/day) ──
   const effDollars = eff.llm?.dollarsPerDay;
   const reqDollars = req.llm?.dollarsPerDay;
-  if (effDollars !== reqDollars) {
+  const addingLlmGrant = eff.llm === undefined && req.llm !== undefined;
+  if (effDollars !== reqDollars || addingLlmGrant) {
     const reqPriv = budgetPrivilege(req.llm !== undefined, reqDollars);
     const effPriv = budgetPrivilege(eff.llm !== undefined, effDollars, BASELINE_DOLLARS_PER_DAY);
     const increase = reqPriv > effPriv;
