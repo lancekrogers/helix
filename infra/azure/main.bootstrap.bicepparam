@@ -90,6 +90,7 @@ param acmeServer = readEnvironmentVariable('HELIX_ACME_SERVER', 'https://acme-st
 param wildcardTlsBound = false
 // Hosted apps on a separate domain (see the hostedAppsDomain description in main.bicep).
 // param hostedAppsDomain = 'apps.example.test'
+// param hostedAppsLive = false  // false = provision zone and certbot only; true = cut over app URLs
 // param hostedAppsTlsBound = false
 // param legacyAppRedirect = false
 

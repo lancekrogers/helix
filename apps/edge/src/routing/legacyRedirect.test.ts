@@ -117,6 +117,18 @@ describe("legacy app host redirect", () => {
     expect(decideLegacyRedirect(backslash, SLUG, { config, registry }).kind).toBe("refused_path");
   });
 
+  it.each(["/%2F_api/me", "/%2f_auth/complete?token=x"])(
+    "refuses normalized first-segment reserved path %s",
+    (url) => {
+      const registry = new FakeRegistry([
+        registryEntry({ appId: APP_ID, slug: SLUG, blobPrefix: PREFIX }),
+      ]);
+      const config = splitEdgeConfig({ legacyAppRedirect: true });
+      const req = { method: "GET", raw: { url } } as FastifyRequest;
+      expect(decideLegacyRedirect(req, SLUG, { config, registry }).kind).toBe("refused_path");
+    },
+  );
+
   it("answers unknown_app cases with identical 404 bodies", async () => {
     recording = startRecordingTelemetry();
     const bodies: string[] = [];

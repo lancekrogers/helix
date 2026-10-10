@@ -472,6 +472,9 @@ param hostedAppsDomain string = ''
 @description('Declare the hosted-apps wildcard binding in-template, the second gate beside wildcardTlsBound (ADR-0044). TRUE only after the second certbot job has run: a declarative binding to a certificate that does not exist fails the edge app PUT loudly. Set it literally in the params file, never from an env var. Only meaningful with hostedAppsDomain. UNVERIFIED IN AZURE.')
 param hostedAppsTlsBound bool = false
 
+@description('Move hosted apps onto hostedAppsDomain: switches EDGE_BASE_DOMAIN and EDGE_CONTROL_DOMAIN (edge and dev gateway), APP_PUBLIC_BASE and CONTROL_PUBLIC_BASE (portal), EDGE_LEGACY_APP_REDIRECT, and the control-zone wildcard. False (default) with hostedAppsDomain set provisions only: the apps zone, the second certbot job and, with hostedAppsTlsBound, its edge binding exist while apps stay on appsDomain. Only meaningful with hostedAppsDomain.')
+param hostedAppsLive bool = false
+
 @description('Redirect old <slug>.<appsDomain> app URLs to the new apps domain with a 307 (EDGE_LEGACY_APP_REDIRECT), and keep the control zone wildcard DNS record while it is on. Only meaningful with hostedAppsDomain. Turn it off when the helix.edge.legacy_app_redirects counter has been zero for a period you choose. Default false.')
 param legacyAppRedirect bool = false
 
@@ -1098,6 +1101,15 @@ var availabilityTargets = concat(
         }
       ]
     : [],
+  // Platform /health on www.<hostedAppsDomain> once the apps-domain cert is bound (reserved label → platform host).
+  declarativeHostedTls
+    ? [
+        {
+          name: 'edge-health-apps'
+          url: 'https://www.${hostedAppsDomainLc}/health'
+        }
+      ]
+    : [],
   availabilityExtraTargets
 )
 
@@ -1344,12 +1356,24 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
 // resource id is computable here — no existing-reference, no chicken-egg at
 // compile time. The SAME name is passed into the certbot module (injected as
 // CERT_NAME), so the job's uploads and these bindings cannot drift apart.
-var wildcardCertName = 'wildcard-${replace(appsDomain, '.', '-')}'
+var appsDomainLc = toLower(trim(appsDomain))
+var hostedAppsDomainLc = toLower(trim(hostedAppsDomain))
+var wildcardCertName = 'wildcard-${replace(appsDomainLc, '.', '-')}'
 var wildcardCertId = '${appsEnv.outputs.environmentId}/certificates/${wildcardCertName}'
-var hostedSplit = !empty(hostedAppsDomain) && hostedAppsDomain != appsDomain
-var appHostsDomain = hostedSplit ? hostedAppsDomain : appsDomain
-var hostedCertName = 'wildcard-${replace(hostedAppsDomain, '.', '-')}'
+var hostedSplit = !empty(hostedAppsDomainLc) && hostedAppsDomainLc != appsDomainLc
+var hostedCutover = hostedSplit && hostedAppsLive
+var appHostsDomain = hostedCutover ? hostedAppsDomainLc : appsDomainLc
+var hostedCertName = 'wildcard-${replace(hostedAppsDomainLc, '.', '-')}'
 var hostedCertId = '${appsEnv.outputs.environmentId}/certificates/${hostedCertName}'
+// Refuse domain pairs the edge rejects at boot — a failed Container Apps revision is silent.
+var hostedAppsOnReservedControlHost = hostedSplit && (hostedAppsDomainLc == 'auth.${appsDomainLc}' || endsWith(hostedAppsDomainLc, '.auth.${appsDomainLc}') || hostedAppsDomainLc == 'portal.${appsDomainLc}' || endsWith(hostedAppsDomainLc, '.portal.${appsDomainLc}') || hostedAppsDomainLc == 'dev-api.${appsDomainLc}' || endsWith(hostedAppsDomainLc, '.dev-api.${appsDomainLc}'))
+var splitDomainValidation = hostedSplit && hostedCertName == wildcardCertName
+  ? fail('hostedAppsDomain and appsDomain derive the same ACA certificate name (${hostedCertName}). Choose domains whose dotted labels differ after replacing dots with dashes.')
+  : hostedSplit && endsWith(appsDomainLc, '.${hostedAppsDomainLc}')
+    ? fail('appsDomain (control) must not be a subdomain of hostedAppsDomain: an app could set a Domain= cookie that reaches the control hosts.')
+    : hostedAppsOnReservedControlHost
+      ? fail('hostedAppsDomain must not be on or under auth., portal. or dev-api. of appsDomain (control): an app could set a Domain= cookie that reaches the control hosts.')
+      : true
 var certbotEnabled = deployApps && deployCertbot && !empty(acmeEmail)
 // The gate: bindings are declared only once the bootstrap has run. Ungated
 // (fresh install, or an install that never flipped), customDomains comes
@@ -1357,14 +1381,14 @@ var certbotEnabled = deployApps && deployCertbot && !empty(acmeEmail)
 // byte-identical pre-ADR-0044 shape.
 var declarativeTls = certbotEnabled && wildcardTlsBound
 var declarativeHostedTls = hostedSplit && certbotEnabled && hostedAppsTlsBound
-// Omitted entirely when hostedSplit is false so a single-domain install sees no
+// Omitted entirely when hostedCutover is false so a single-domain install sees no
 // new environment variables (not blank placeholders).
 var splitEdgeEnv = concat(
-  hostedSplit ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomain } ] : [],
-  hostedSplit && legacyAppRedirect ? [ { name: 'EDGE_LEGACY_APP_REDIRECT', value: 'true' } ] : []
+  hostedCutover ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomainLc } ] : [],
+  hostedCutover && legacyAppRedirect ? [ { name: 'EDGE_LEGACY_APP_REDIRECT', value: 'true' } ] : []
 )
-var splitPortalEnv = hostedSplit ? [ { name: 'CONTROL_PUBLIC_BASE', value: 'https://${appsDomain}' } ] : []
-var splitDevGatewayEnv = hostedSplit ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomain } ] : []
+var splitPortalEnv = hostedCutover ? [ { name: 'CONTROL_PUBLIC_BASE', value: 'https://${appsDomainLc}' } ] : []
+var splitDevGatewayEnv = hostedCutover ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomainLc } ] : []
 
 module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
   name: 'app-edge'
@@ -1382,7 +1406,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
     customDomains: concat(
       declarativeTls ? [ { name: '*.${appsDomain}', bindingType: 'SniEnabled', certificateId: wildcardCertId } ] : [],
       // Hosted-apps wildcard on a second cert when the domain split is configured (UNVERIFIED IN AZURE).
-      declarativeHostedTls ? [ { name: '*.${hostedAppsDomain}', bindingType: 'SniEnabled', certificateId: hostedCertId } ] : []
+      declarativeHostedTls ? [ { name: '*.${hostedAppsDomainLc}', bindingType: 'SniEnabled', certificateId: hostedCertId } ] : []
     )
     secretValues: {
       'edge-database-url': {
@@ -1457,9 +1481,9 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       // EDGE_ALLOW_DEV_MODE below is a literal.
       { name: 'EDGE_ALLOW_PUBLIC_APPS', value: allowPublicApps ? 'true' : 'false' }
       { name: 'EDGE_ALLOW_PASSWORD_APPS', value: allowPasswordApps ? 'true' : 'false' }
-      { name: 'EDGE_IMG_SRC_EXTRA', value: imgSrcFlagsValidation ? imgSrcExtra : imgSrcExtra }
-      { name: 'EDGE_IMG_SRC_REPORT_ONLY', value: imgSrcFlagsValidation && imgSrcReportOnly ? 'true' : 'false' }
-      { name: 'EDGE_IMG_SRC_ALLOW_ALL', value: imgSrcFlagsValidation && imgSrcAllowAll ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_EXTRA', value: (imgSrcFlagsValidation && splitDomainValidation) ? imgSrcExtra : imgSrcExtra }
+      { name: 'EDGE_IMG_SRC_REPORT_ONLY', value: (imgSrcFlagsValidation && splitDomainValidation) && imgSrcReportOnly ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_ALLOW_ALL', value: (imgSrcFlagsValidation && splitDomainValidation) && imgSrcAllowAll ? 'true' : 'false' }
       // LLM upstreams (ADR-0046): first-party by default, the Foundry account
       // when deployFoundry is set, or a BYO endpoint via the llm* params.
       { name: 'EDGE_LLM_ENDPOINT', value: llm.anthropicEndpoint }
@@ -1722,14 +1746,14 @@ module dns 'modules/dns.bicep' = {
     edgeStaticIp: appsEnv.outputs.staticIp
     domainVerificationId: domainVerificationId
     deployDevGateway: deployDevGateway
-    hostsWildcard: !hostedSplit || legacyAppRedirect
+    hostsWildcard: !hostedCutover || legacyAppRedirect
   }
 }
 
 module dnsHosted 'modules/dns.bicep' = if (hostedSplit) {
   name: 'dns-hosted'
   params: {
-    appsDomain: hostedAppsDomain
+    appsDomain: hostedAppsDomainLc
     edgeStaticIp: appsEnv.outputs.staticIp
     domainVerificationId: domainVerificationId
     hostsControlPlane: false
@@ -1782,7 +1806,7 @@ module certbotHosted 'modules/certbot.bicep' = if (hostedSplit && certbotEnabled
     // Distinct identity and job names (certbot.bicep:80, :148). Short on purpose: an ACA job name is
     // limited to 32 characters, and <namePrefix>-ap-certbot must fit.
     namePrefix: '${namePrefix}-ap'
-    appsDomain: hostedAppsDomain
+    appsDomain: hostedAppsDomainLc
     wildcardCertName: hostedCertName
     acaEnvName: '${namePrefix}-apps-env'
     acaEnvId: appsEnv.outputs.environmentId
@@ -1885,6 +1909,9 @@ output migrateJobName string = migrateJob.?outputs.jobName ?? ''
 output connectionsVaultUri string = connectionsVaultUri
 output delegatedVaultUri string = delegatedVaultUri
 output dnsNameServers array = dns.outputs.nameServers
+
+@description('Name servers for the hosted-apps DNS zone when hostedAppsDomain is set; empty when single-domain.')
+output hostedDnsNameServers array = dnsHosted.?outputs.nameServers ?? []
 output edgeFqdn string = edgeApp.?outputs.fqdn ?? ''
 output egressFqdn string = egressApp.?outputs.fqdn ?? ''
 output portalFqdn string = portalApp.?outputs.fqdn ?? ''

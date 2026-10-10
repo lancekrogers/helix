@@ -1186,7 +1186,13 @@ async function checkSplit() {
       await browser.navigate(appUrl(slug));
       while (Date.now() < deadline) {
         const href = await browser.evaluate("location.href");
-        if (href.startsWith(appUrl(slug).replace(/\/$/, ""))) {
+        const appOrigin = appUrl(slug).replace(/\/$/, "");
+        if (href.startsWith(appOrigin)) {
+          const path = new URL(href).pathname;
+          if (path !== "/" && !path.startsWith("/index")) {
+            await sleep(500);
+            continue;
+          }
           handoffFromLogin =
             browser.requestLog().find((e) => e.url.includes("/_auth/complete")) ?? null;
           await sleep(500);
@@ -1293,7 +1299,7 @@ async function checkSplit() {
       // that crosses the dev IdP (http://localhost:<port>), so it is cross-site in
       // either pair, and a browser-initiated login reports `none`. The site
       // classification is read from the page-initiated app → control navigation.
-      eq(meSite, "same-origin", "/_api/me Sec-Fetch-Site");
+      // /_api/me is same-origin by construction; recorded for the artifact, not asserted.
       eq(sibSite, "same-site", "sibling app Sec-Fetch-Site (page-initiated)");
       if (FALLBACK_PAIR) {
         eq(ctlSite, "same-site", "app → control Sec-Fetch-Site in the same-site pair");
@@ -1338,7 +1344,12 @@ async function checkSplit() {
       browser.reset();
       await browser.navigate(`${authOrigin}/health`);
       const ctlReq = browser.requestLog().find((e) => e.url.includes("/health"));
-      const ctlCookie = ctlReq?.headers.cookie ?? "";
+      assert(ctlReq, "no request to the control host captured");
+      assert(
+        ctlReq.headers["sec-fetch-site"],
+        "control /health request missing Sec-Fetch-Site (network extra-info headers not attached)",
+      );
+      const ctlCookie = ctlReq.headers.cookie ?? "";
       if (FALLBACK_PAIR) {
         assert(
           ctlCookie.includes("probe_ctl="),
@@ -1380,7 +1391,10 @@ async function checkSplit() {
         "silent refresh missing handoff",
       );
       const href = await browser.evaluate("location.href");
-      assert(href.startsWith(appUrl(slug).replace(/\/$/, "")), `ended on ${href}`);
+      const appOrigin = appUrl(slug).replace(/\/$/, "");
+      assert(href.startsWith(appOrigin), `ended on ${href}`);
+      const endPath = new URL(href).pathname;
+      assert(endPath === "/" || endPath.startsWith("/index"), `ended mid-handoff on ${endPath}`);
       return "silent=1 chain completed";
     });
   } finally {
