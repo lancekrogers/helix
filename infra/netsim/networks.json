@@ -43,6 +43,7 @@
     "$appsSubnet": "10.0.2.0/23",
     "$postgresSubnet": "10.0.6.0/24",
     "$privateEndpointSubnet": "10.0.7.0/24",
+    "$kvPlatformIp": "10.0.7.4",
     "$kvConnectionsIp": "10.0.7.5",
     "$kvDelegatedIp": "10.0.7.6"
   },

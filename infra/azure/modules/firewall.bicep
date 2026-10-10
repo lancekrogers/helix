@@ -99,6 +99,9 @@ param egressPlatformFqdns array = [
   '*.livediagnostics.monitor.azure.com'
   #disable-next-line no-hardcoded-env-urls
   'login.microsoftonline.com'
+  // Container Apps Key Vault references behind Azure Firewall need login.microsoft.com (manage-secrets doc).
+  #disable-next-line no-hardcoded-env-urls
+  'login.microsoft.com'
   'packages.microsoft.com'
 ]
 

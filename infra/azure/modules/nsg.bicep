@@ -20,8 +20,10 @@
 // Rows marked hypothesis in that file — platform flows (100, 140–143), the
 // 100.64.0.0/10 deny, ILB source addresses, service-tag membership — are
 // unverified in Azure until an operator runs net-verify. Prefix denies on
-// 168.63.129.16 and 169.254.169.254 do not filter Azure's documented host-node
-// paths; ssrf.ts is the control there (see ADR-0005 amendment).
+// 169.254.169.254 do not filter IMDS on Azure's documented host-node paths;
+// ssrf.ts is the only control on 168.63.129.16 (Microsoft says not to deny that
+// address explicitly on a Container Apps subnet) and on IMDS for proxied traffic
+// (see ADR-0005 amendment).
 
 @description('Azure region.')
 param location string
@@ -39,9 +41,10 @@ param appsSubnetPrefix string
 param postgresSubnetPrefix string
 param privateEndpointSubnetPrefix string
 
-@description('When true, rule 120 targets pinned kv-connections and kv-delegated IPs; when false, a single allow targets the whole private-endpoint subnet (weaker).')
+@description('When true, rule 120 targets pinned kv-platform, kv-connections and kv-delegated IPs; when false, a single allow targets the whole private-endpoint subnet (weaker).')
 param pinPrivateEndpointAddresses bool
 
+param kvPlatformIp string
 param kvConnectionsIp string
 param kvDelegatedIp string
 
@@ -54,6 +57,7 @@ var refs = {
   '$appsSubnet': appsSubnetPrefix
   '$postgresSubnet': postgresSubnetPrefix
   '$privateEndpointSubnet': privateEndpointSubnetPrefix
+  '$kvPlatformIp': kvPlatformIp
   '$kvConnectionsIp': kvConnectionsIp
   '$kvDelegatedIp': kvDelegatedIp
 }

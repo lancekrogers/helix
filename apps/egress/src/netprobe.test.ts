@@ -238,6 +238,7 @@ describe("buildChecks", () => {
       case "apps-env-443":
         return "informational";
       case "kv-platform-443":
+        return "reachable";
       case "blob-pe-443":
         return denyOnly ? "blocked" : "informational";
       case "kv-connections-443":

@@ -57,8 +57,16 @@ param appsDomain string = 'azx.helix.azxlabs.io'
 @description('Address space of the VNet. The subnet prefixes below are fixed inside the 10.0.0.0/16 default; changing this to a range that does not contain them fails the deployment.')
 param vnetAddressPrefix string = '10.0.0.0/16'
 
+@sealed()
+type PrivateEndpointAddresses = {
+  kvPlatform: string?
+  kvConnections: string?
+  kvDelegated: string?
+  blob: string?
+}
+
 @description('When pinPrivateEndpointAddresses is true, override the fixed addresses of the four private endpoints in snet-pe. Keys: kvPlatform, kvConnections, kvDelegated, blob. Omitted keys use the defaults (.4–.7 of the endpoint subnet). On an existing install that already has dynamic addresses, leave pinPrivateEndpointAddresses false unless you have listed current endpoint IPs (az network private-endpoint list), chosen non-clashing values, and accept that Azure may require recreating the endpoints to change an address (unverified). Static ipConfigurations on private endpoints are unverified in Azure for API version 2024-05-01.')
-param privateEndpointAddresses object = {}
+param privateEndpointAddresses PrivateEndpointAddresses = {}
 
 @description('Emit static ipConfigurations on the four snet-pe private endpoints. Default false keeps Azure-assigned dynamic addresses (safe for existing installs). New installs should set true so an egress NSG can name the Key Vault and Blob destinations; existing installs should enable only after reading live addresses and picking non-clashing pins.')
 param pinPrivateEndpointAddresses bool = false
@@ -544,6 +552,7 @@ module egressNsg 'modules/nsg.bicep' = if (egressNsgEnforce != 'off') {
     postgresSubnetPrefix: postgresSubnetPrefix
     privateEndpointSubnetPrefix: privateEndpointSubnetPrefix
     pinPrivateEndpointAddresses: pinPrivateEndpointAddresses
+    kvPlatformIp: peKvPlatformIp
     kvConnectionsIp: peKvConnectionsIp
     kvDelegatedIp: peKvDelegatedIp
     allowedPorts: egressAllowedPorts
@@ -1129,6 +1138,7 @@ module firewallDiagnostics 'modules/firewall-diagnostics.bicep' = if (deployFire
     firewallName: '${namePrefix}-fw'
     workspaceId: appsEnv.outputs.logAnalyticsWorkspaceId
     egressSubnetPrefix: egressSubnetPrefix
+    netprobeCanaryHost: netprobeCanaryHost
     actionGroupId: actionGroupId
     includeDenialAlert: deployInfraAlerts
   }

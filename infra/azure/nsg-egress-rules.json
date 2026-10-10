@@ -33,12 +33,12 @@
       "access": "Allow",
       "protocol": "Tcp",
       "sourcePrefixes": ["*"],
-      "destinationPrefixes": ["$kvConnectionsIp", "$kvDelegatedIp"],
+      "destinationPrefixes": ["$kvPlatformIp", "$kvConnectionsIp", "$kvDelegatedIp"],
       "destinationPorts": ["443"],
       "modes": ["deny-list-only", "enforce"],
       "pePinning": "pinned",
       "status": "known",
-      "note": "AZURE_KEY_VAULT_URL and AZURE_DELEGATED_KEY_VAULT_URL; fixed endpoint addresses when pinPrivateEndpointAddresses is true"
+      "note": "Egress Key Vault references (kv-platform) plus AZURE_KEY_VAULT_URL and AZURE_DELEGATED_KEY_VAULT_URL; fixed endpoint addresses when pinPrivateEndpointAddresses is true"
     },
     {
       "name": "allow-private-endpoints-subnet",
@@ -65,7 +65,7 @@
       "destinationPorts": ["53"],
       "modes": ["deny-list-only", "enforce"],
       "status": "hypothesis",
-      "note": "egress resolves every target itself; must sit above deny-wire-server"
+      "note": "egress resolves every target itself; Microsoft documents this outbound allow for workload-profile Container Apps environments"
     },
     {
       "name": "allow-tag-mcr",
@@ -120,19 +120,6 @@
       "note": "ACA platform and telemetry"
     },
     {
-      "name": "deny-wire-server",
-      "priority": 200,
-      "direction": "Outbound",
-      "access": "Deny",
-      "protocol": "*",
-      "sourcePrefixes": ["*"],
-      "destinationPrefixes": ["168.63.129.16"],
-      "destinationPorts": ["*"],
-      "modes": ["deny-list-only", "enforce"],
-      "status": "hypothesis",
-      "note": "documented belt-and-braces row; Azure exempts 168.63.129.16 on ports 80 and 32526 and DNS to it from prefix-based NSG rules — the application block list in ssrf.ts is the control on those paths"
-    },
-    {
       "name": "deny-link-local",
       "priority": 210,
       "direction": "Outbound",
@@ -180,9 +167,9 @@
       "sourcePrefixes": ["*"],
       "destinationPrefixes": ["100.64.0.0/10"],
       "destinationPorts": ["*"],
-      "modes": ["deny-list-only", "enforce"],
+      "modes": ["enforce"],
       "status": "hypothesis",
-      "note": "ACA draws ingress pod addresses from here; may break platform traffic. If it does, exclude 100.100.0.0/17"
+      "note": "ssrf.ts already blocks 100.64.0.0/10 for proxied traffic; kept out of deny-list-only until net-verify shows it does not break platform traffic on a real install"
     },
     {
       "name": "allow-internet-web",
@@ -218,10 +205,10 @@
       "protocol": "Tcp",
       "sourcePrefixes": ["$appsSubnet"],
       "destinationPrefixes": ["*"],
-      "destinationPorts": ["80", "443"],
+      "destinationPorts": ["80", "443", "31080", "31443"],
       "modes": ["deny-list-only", "enforce"],
       "status": "hypothesis",
-      "note": "edge and portal call egress through the internal load balancer; the source address the NSG sees is unverified"
+      "note": "edge and portal reach egress through the internal load balancer; Microsoft documents backend ports 31080 and 31443 for the environment edge proxy behind the ILB (Container Apps NSG integration); the source address the NSG sees is unverified"
     },
     {
       "name": "allow-load-balancer",
@@ -258,9 +245,9 @@
       "sourcePrefixes": ["$vnet"],
       "destinationPrefixes": ["*"],
       "destinationPorts": ["*"],
-      "modes": ["deny-list-only", "enforce"],
+      "modes": ["enforce"],
       "status": "known",
-      "note": "the rest of the VNet may not initiate to egress"
+      "note": "the rest of the VNet may not initiate to egress; omit from deny-list-only so Azure default AllowVnetInBound covers ILB backend traffic until enforce"
     }
   ]
 }

@@ -180,7 +180,7 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
   // block list (ssrf.ts) is the control for both, so these checks only record
   // what the replica sees.
   const hostNodeExpect: Expectation = "informational";
-  const peExpect: Expectation = denyOnly ? "blocked" : "informational";
+  const blobPeExpect: Expectation = denyOnly ? "blocked" : "informational";
   const portExpect: Expectation = enforce ? "blocked" : "informational";
   const canaryExpect: Expectation = cfg.fqdnAllowlist ? "blocked" : "reachable";
   const fqdnKind: "tcp" | "tls" = cfg.fqdnProtocol === "tls" ? "tls" : "tcp";
@@ -199,9 +199,16 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
   ];
 
   if (cfg.peAddresses === "pinned") {
+    // kv-platform is allowed when pinning is on (egress Key Vault references); blob stays denied.
     checks.push(
-      { id: "kv-platform-443", kind: "tcp", host: cfg.kvPlatformIp, port: 443, expect: peExpect },
-      { id: "blob-pe-443", kind: "tcp", host: cfg.blobIp, port: 443, expect: peExpect },
+      {
+        id: "kv-platform-443",
+        kind: "tcp",
+        host: cfg.kvPlatformIp,
+        port: 443,
+        expect: "reachable",
+      },
+      { id: "blob-pe-443", kind: "tcp", host: cfg.blobIp, port: 443, expect: blobPeExpect },
       {
         id: "kv-connections-443",
         kind: "tcp",

@@ -98,8 +98,24 @@ test("every non-literal destination prefix is a known tag or ref", () => {
   }
 });
 
-test("allow-azure-dns priority is below deny-wire-server", () => {
-  assert.ok(ruleByName("allow-azure-dns").priority < ruleByName("deny-wire-server").priority);
+test("no deny-wire-server row (Microsoft warns against denying 168.63.129.16 on ACA subnets)", () => {
+  assert.ok(!rules.some((r) => r.name === "deny-wire-server"));
+});
+
+test("allow-apps-subnet includes ILB backend ports 31080 and 31443", () => {
+  const ports = ruleByName("allow-apps-subnet").destinationPorts;
+  assert.ok(ports.includes("31080"));
+  assert.ok(ports.includes("31443"));
+});
+
+test("deny-vnet-in and deny-cgnat are enforce-only", () => {
+  assert.deepEqual(ruleByName("deny-vnet-in").modes, ["enforce"]);
+  assert.deepEqual(ruleByName("deny-cgnat").modes, ["enforce"]);
+});
+
+test("allow-key-vault-endpoints resolves pinned vault IPs", () => {
+  const resolved = resolveRule(ruleByName("allow-key-vault-endpoints"), ctx);
+  assert.deepEqual(resolved.dst, ["10.0.7.4", "10.0.7.5", "10.0.7.6"]);
 });
 
 test("deny-vnet is after postgres, vault, dns and own-subnet allows", () => {
