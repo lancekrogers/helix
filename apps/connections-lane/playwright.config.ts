@@ -1,5 +1,10 @@
 import { defineConfig } from "@playwright/test";
 
+const APPS = process.env.HELIX_APPS_DOMAIN?.trim().toLowerCase() || "";
+const hostResolverRules =
+  "MAP *.local.helix.azxlabs.io 127.0.0.1" +
+  (APPS ? `, MAP *.${APPS} 127.0.0.1, MAP ${APPS} 127.0.0.1` : "");
+
 /**
  * The connections browser lane — real-Chromium
  * acceptance for the OAuth-connections popup journeys, separate from the jsdom
@@ -44,7 +49,7 @@ export default defineConfig({
       args: [
         // The dev base domain maps to loopback — no /etc/hosts edit, so the
         // lane is self-sufficient on a CI runner.
-        "--host-resolver-rules=MAP *.local.helix.azxlabs.io 127.0.0.1",
+        `--host-resolver-rules=${hostResolverRules}`,
       ],
     },
     trace: "retain-on-failure",

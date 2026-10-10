@@ -92,8 +92,7 @@ services:
       # `.devcontainer/.env`; `.env.local` is only an env_file and does not feed
       # substitution) moves hosted apps to a second loopback domain while the
       # control plane stays on `local.helix.azxlabs.io`. Unset means single-domain
-      # dev unchanged. Split mode is not a working login stack until the edge and
-      # portal read EDGE_CONTROL_DOMAIN and CONTROL_PUBLIC_BASE.
+      # dev unchanged.
       HELIX_APPS_DOMAIN: ${HELIX_APPS_DOMAIN:-}
       EDGE_BASE_DOMAIN: ${HELIX_APPS_DOMAIN:-local.helix.azxlabs.io}
       EDGE_CONTROL_DOMAIN: ${HELIX_APPS_DOMAIN:+local.helix.azxlabs.io}

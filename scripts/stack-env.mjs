@@ -143,6 +143,11 @@ export function resolveStack(opts = {}) {
       `http://localhost:${ports.portal}/auth/callback`,
     ].join(","),
 
+    // The dev IdP binds IDP_PORT; edge and portal must discover JWKS on the
+    // same issuer the smoke stack actually runs, not the container default :3002.
+    EDGE_OIDC_ISSUER: `http://localhost:${ports.idp}`,
+    PORTAL_OIDC_ISSUER: `http://localhost:${ports.idp}`,
+
     // Storage isolation: own blob container, own database. Blob keys are
     // uuid-namespaced already, but the container keeps the two stacks' bundles
     // separable by eye.

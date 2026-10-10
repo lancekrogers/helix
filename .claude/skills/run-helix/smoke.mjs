@@ -10,8 +10,8 @@
  *
  * See ./SKILL.md for prerequisites and the flag reference.
  *
- * Split-domain dev (`HELIX_APPS_DOMAIN`): use `--only split-tls` until the edge and
- * portal read the control domain; full login is not expected to work before that.
+ * Split-domain dev (`HELIX_APPS_DOMAIN`): adds the `split` group (login, Sec-Fetch-Site,
+ * cookie scope, silent refresh). Use `--only split` to run just that group.
  */
 import { spawn, spawnSync } from "node:child_process";
 import dns from "node:dns";
@@ -76,10 +76,14 @@ try {
   process.exit(2);
 }
 /** Env every service in THIS stack boots with. */
-const SVC_ENV = { ...process.env, ...STACK.env };
+const SVC_ENV = {
+  ...process.env,
+  ...STACK.env,
+  ...(STACK.split ? { EDGE_SESSION_REFRESH_MS: "3000" } : {}),
+};
 const PORTS = Object.values(STACK.ports);
 
-const GROUPS = ["idp", "portal", "edge", "egress", "spa", "browser", "cli", "split-tls"];
+const GROUPS = ["idp", "portal", "edge", "egress", "spa", "browser", "cli", "split-tls", "split"];
 
 const SPLIT_CERT = join(ROOT, ".devcontainer/certs/local-helix-split.pem");
 const SPLIT_KEY = join(ROOT, ".devcontainer/certs/local-helix-split-key.pem");
@@ -164,7 +168,7 @@ const SERVICES = [
     name: "edge",
     script: "dev:edge",
     port: STACK.ports.edge,
-    health: `https://${BASE_DOMAIN}:${STACK.ports.edge}/health`,
+    health: `https://${CONTROL_DOMAIN}:${STACK.ports.edge}/health`,
   },
 ];
 const procs = [];
@@ -274,6 +278,65 @@ function rawGet(url, headers = {}) {
     req.on("error", reject);
     req.end();
   });
+}
+
+/** @param {Map<string, Map<string, string>>} jar hostname → cookie name → value */
+function storeSetCookies(hostname, headers, jar) {
+  const raw = headers["set-cookie"];
+  if (!raw) return;
+  for (const c of [].concat(raw)) {
+    const [kv] = c.split(";");
+    const i = kv.indexOf("=");
+    if (i < 1) continue;
+    const name = kv.slice(0, i).trim();
+    const value = kv.slice(i + 1).trim();
+    if (!jar.has(hostname)) jar.set(hostname, new Map());
+    jar.get(hostname).set(name, value);
+  }
+}
+
+function cookieHeaderFor(hostname, jar) {
+  const cookies = [...(jar.get(hostname) ?? [])].map(([k, v]) => `${k}=${v}`).join("; ");
+  return cookies || undefined;
+}
+
+/** Navigate GET with per-host cookie jar (exact Sec-Fetch-* headers). */
+async function navGet(url, jar) {
+  const u = new URL(url);
+  const cookie = cookieHeaderFor(u.hostname, jar);
+  const r = await rawGet(url, {
+    Accept: "text/html",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+    ...(cookie ? { Cookie: cookie } : {}),
+  });
+  storeSetCookies(u.hostname, r.headers, jar);
+  return r;
+}
+
+/**
+ * Walk the dev IdP from an authorize URL until the edge auth callback is next
+ * (caller follows that hop with the flow cookie on the auth host).
+ */
+async function idpWalkToEdgeCallback(authorizeUrl, jar) {
+  let cur = authorizeUrl;
+  for (let i = 0; i < 12; i++) {
+    const r = await navGet(cur, jar);
+    const loc = r.headers.location;
+    if (loc) {
+      cur = new URL(loc, cur).toString();
+      if (cur.startsWith(`https://auth.${CONTROL_DOMAIN}`)) return cur;
+      continue;
+    }
+    if (/pick a user/i.test(r.body)) {
+      const m = r.body.match(/\?user=([^"]+)"/);
+      assert(m, "no fixture user link on the interaction page");
+      cur = `${cur.split("?")[0]}?user=${m[1]}`;
+      continue;
+    }
+    throw new Error(`IdP walk stalled at ${cur}`);
+  }
+  throw new Error("IdP walk: too many hops");
 }
 
 async function jget(url, init) {
@@ -488,7 +551,7 @@ async function checkEdge() {
   const internal = live.find((a) => a.visibility.mode === "internal");
 
   await check("health reports registry-projection freshness", async () => {
-    const { status, body } = await jget(`https://${BASE_DOMAIN}:${STACK.ports.edge}/health`);
+    const { status, body } = await jget(`https://${CONTROL_DOMAIN}:${STACK.ports.edge}/health`);
     eq(status, 200, "status");
     const proj = body.checks?.find((c) => c.name === "registry-projection");
     assert(proj, "registry-projection check missing");
@@ -546,7 +609,10 @@ async function checkEdge() {
       });
       eq(r.status, 302, "status");
       const loc = r.headers.location ?? "";
-      assert(loc.startsWith(`https://auth.${BASE_DOMAIN}`), `unexpected redirect target: ${loc}`);
+      assert(
+        loc.startsWith(`https://auth.${CONTROL_DOMAIN}`),
+        `unexpected redirect target: ${loc}`,
+      );
       return new URL(loc).pathname;
     });
   }
@@ -713,7 +779,7 @@ async function checkIdp() {
       const loc = r.headers.get("location");
       if (!loc) return { final: cur, res: r, text: await r.text() };
       cur = new URL(loc, cur).toString();
-      if (cur.startsWith(`https://auth.${BASE_DOMAIN}`)) return { final: cur, res: r, text: "" };
+      if (cur.startsWith(`https://auth.${CONTROL_DOMAIN}`)) return { final: cur, res: r, text: "" };
     }
     throw new Error("too many redirects");
   }
@@ -731,7 +797,7 @@ async function checkIdp() {
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   // Must equal what dev-idp registered for the edge client — the stack sets
   // IDP_EDGE_REDIRECT_URIS, and this is its first (https) entry.
-  const redirectUri = `https://auth.${BASE_DOMAIN}:${STACK.ports.edge}/callback`;
+  const redirectUri = `https://auth.${CONTROL_DOMAIN}:${STACK.ports.edge}/callback`;
   let code = null;
 
   await check("authorize → interaction → code", async () => {
@@ -1008,6 +1074,310 @@ async function checkBrowser() {
   }
 }
 
+async function checkSplit() {
+  group("split");
+  console.log(
+    "\n\x1b[1msplit\x1b[0m — cross-domain login, Sec-Fetch-Site, cookies, silent refresh",
+  );
+
+  if (!STACK.split) {
+    skip("split-domain checks", "HELIX_APPS_DOMAIN is unset");
+    return;
+  }
+
+  const APPS = APPS_DOMAIN;
+  const CONTROL = CONTROL_DOMAIN;
+  const FALLBACK_PAIR = APPS.endsWith(`.${CONTROL}`);
+  const authOrigin = `https://auth.${CONTROL}:${STACK.ports.edge}`;
+  const appUrl = (slug, path = "/") => `https://${slug}.${APPS}:${STACK.ports.edge}${path}`;
+  const slug = "smoke-internal";
+  const sibling = "smoke-public";
+
+  await check("HTTP login across control and apps domains", async () => {
+    const jar = new Map();
+    let r = await navGet(appUrl(slug), jar);
+    eq(r.status, 302, "app gate");
+    let loc = new URL(r.headers.location, appUrl(slug)).toString();
+    assert(loc.startsWith(`${authOrigin}/start`), `expected auth /start, got ${loc}`);
+
+    r = await navGet(loc, jar);
+    assert(r.status >= 300 && r.status < 400, "start → IdP");
+    const idpStart = new URL(r.headers.location, loc).toString();
+    const callback = await idpWalkToEdgeCallback(idpStart, jar);
+    assert(callback.startsWith(`${authOrigin}/callback`), `callback origin: ${callback}`);
+
+    r = await navGet(callback, jar);
+    eq(r.status, 302, "callback → handoff");
+    loc = new URL(r.headers.location, callback).toString();
+    const completeOrigin = new URL(appUrl(slug)).origin;
+    assert(loc.startsWith(`${completeOrigin}/_auth/complete`), `handoff target: ${loc}`);
+
+    await navGet(loc, jar);
+    const appHost = new URL(appUrl(slug)).hostname;
+    const session = jar.get(appHost)?.get("__Host-session");
+    assert(session, "__Host-session not set on app host");
+    for (const [host, cookies] of jar) {
+      if (host !== appHost) assert(!cookies.has("__Host-session"), `session leaked to ${host}`);
+    }
+
+    r = await navGet(appUrl(slug), jar);
+    eq(r.status, 200, "authenticated app page");
+    return `${slug} on ${APPS}`;
+  });
+
+  let browser;
+  let chromeVersion = "unknown";
+  if (NO_BROWSER) {
+    skip("split browser login", "--no-browser");
+    skip("Sec-Fetch-Site on handoff and API", "--no-browser");
+    skip("cookie scope across sites", "--no-browser");
+    skip("silent refresh", "--no-browser");
+    return;
+  }
+  if (!findChrome()) {
+    const why = "no cached Chromium (set HELIX_SMOKE_CHROME)";
+    skip("split browser login", why);
+    skip("Sec-Fetch-Site on handoff and API", why);
+    skip("cookie scope across sites", why);
+    skip("silent refresh", why);
+    return;
+  }
+
+  try {
+    browser = await launchBrowser({
+      port: STACK.cdpPort + 3,
+      ignoreCertErrors: true,
+      hostRules: [APPS, CONTROL],
+    });
+    try {
+      const ver = await fetch(`http://127.0.0.1:${STACK.cdpPort + 3}/json/version`);
+      if (ver.ok) chromeVersion = (await ver.json()).Browser ?? chromeVersion;
+    } catch {
+      /* optional */
+    }
+  } catch (e) {
+    const why = e.message;
+    skip("split browser login", why);
+    skip("Sec-Fetch-Site on handoff and API", why);
+    skip("cookie scope across sites", why);
+    skip("silent refresh", why);
+    return;
+  }
+
+  let hypothesisRefuted = false;
+  /** @type {{ url: string, headers: Record<string, string> } | null} */
+  let handoffFromLogin = null;
+
+  try {
+    await check("browser login lands on the app host", async () => {
+      browser.reset();
+      let startCount = 0;
+      const deadline = Date.now() + 90_000;
+      await browser.navigate(appUrl(slug));
+      while (Date.now() < deadline) {
+        const href = await browser.evaluate("location.href");
+        if (href.startsWith(appUrl(slug).replace(/\/$/, ""))) {
+          handoffFromLogin =
+            browser.requestLog().find((e) => e.url.includes("/_auth/complete")) ?? null;
+          await sleep(500);
+          return href;
+        }
+        if (href.includes("/interaction/")) {
+          const withUser = href.includes("?user=")
+            ? href
+            : `${href}${href.includes("?") ? "&" : "?"}user=alice@azx.dev`;
+          await browser.navigate(withUser);
+          continue;
+        }
+        if (href.includes("/start")) {
+          startCount++;
+          if (startCount > 2) {
+            throw new Error(
+              `login looped through /start (${startCount} times)\n${browser
+                .requestLog()
+                .map((e) => e.url)
+                .join("\n")}`,
+            );
+          }
+        }
+        await sleep(500);
+        await browser.evaluate("void 0");
+      }
+      throw new Error(
+        `timed out waiting for app origin\n${browser
+          .requestLog()
+          .map((e) => e.url)
+          .join("\n")}`,
+      );
+    });
+
+    await check("Sec-Fetch-Site on handoff and credentialed fetches", async () => {
+      const handoff = handoffFromLogin;
+      assert(handoff, "no /_auth/complete captured during browser login");
+      const handoffSite = handoff.headers["sec-fetch-site"] ?? "(missing)";
+      console.log(`  Sec-Fetch-Site on the handoff: ${handoffSite}`);
+
+      browser.reset();
+      await browser.navigate(appUrl(slug));
+      await browser.evaluate(
+        `fetch("/_api/me", { credentials: "include" }).then(() => 1).catch(() => 0)`,
+      );
+      await sleep(800);
+      const meLog = browser.requestLog();
+      const me = meLog.find((e) => e.url.includes("/_api/me"));
+      const meSite = me?.headers["sec-fetch-site"] ?? "(missing)";
+
+      const onApp = async () => {
+        browser.reset();
+        await browser.navigate(appUrl(slug));
+      };
+      // Page-initiated navigations: Sec-Fetch-Site is computed from the app page's
+      // origin. Page.navigate (browser.navigate) is browser-initiated and always
+      // reports `none`, which says nothing about site classification. A fetch()
+      // probe would be blocked by the app CSP (connect-src 'self') before it is
+      // sent; navigation is not governed by CSP.
+      const navigateFromPage = async (target) => {
+        await browser.evaluate(
+          `setTimeout(() => location.assign(${JSON.stringify(target)}), 0); 1`,
+        );
+        await sleep(2000);
+      };
+      await onApp();
+      await navigateFromPage(appUrl(sibling));
+      const sibHost = `${sibling}.${APPS}`;
+      const sib = browser.requestLog().find((e) => {
+        try {
+          const u = new URL(e.url);
+          return u.hostname === sibHost && u.pathname === "/";
+        } catch {
+          return false;
+        }
+      });
+      const sibSite = sib?.headers["sec-fetch-site"] ?? "(missing)";
+
+      await onApp();
+      await navigateFromPage(`${authOrigin}/health`);
+      const ctl = browser.requestLog().find((e) => {
+        try {
+          const u = new URL(e.url);
+          return u.hostname === `auth.${CONTROL}` && u.pathname === "/health";
+        } catch {
+          return false;
+        }
+      });
+      const ctlSite = ctl?.headers["sec-fetch-site"] ?? "(missing)";
+
+      const record = {
+        handoff: handoffSite,
+        apiMe: meSite,
+        siblingApp: sibSite,
+        appToControl: ctlSite,
+        appsDomain: APPS,
+        controlDomain: CONTROL,
+        fallbackPair: FALLBACK_PAIR,
+        chromeVersion,
+      };
+      writeFileSync(join(OUT, "sec-fetch-site.json"), JSON.stringify(record, null, 2));
+
+      // The handoff is recorded, not asserted: it arrives through a redirect chain
+      // that crosses the dev IdP (http://localhost:<port>), so it is cross-site in
+      // either pair, and a browser-initiated login reports `none`. The site
+      // classification is read from the page-initiated app → control navigation.
+      eq(meSite, "same-origin", "/_api/me Sec-Fetch-Site");
+      eq(sibSite, "same-site", "sibling app Sec-Fetch-Site (page-initiated)");
+      if (FALLBACK_PAIR) {
+        eq(ctlSite, "same-site", "app → control Sec-Fetch-Site in the same-site pair");
+      } else if (ctlSite === "same-site") {
+        hypothesisRefuted = true;
+        console.log("  HYPOTHESIS REFUTED: the two domains are same-site in this browser");
+        return `recorded control=${ctlSite} (expected cross-site)`;
+      } else {
+        eq(ctlSite, "cross-site", "app → control Sec-Fetch-Site (page-initiated)");
+      }
+      return `handoff=${handoffSite}, me=${meSite}, sibling=${sibSite}, control=${ctlSite}`;
+    });
+
+    if (hypothesisRefuted) {
+      skip("cross-site fetch metadata (handoff)", "hypothesis refuted — unverified");
+      skip("cross-site fetch metadata (sibling)", "hypothesis refuted — unverified");
+      skip("cross-site fetch metadata (app→control)", "hypothesis refuted — unverified");
+    }
+
+    await check("app-set cookies do not reach the control host", async () => {
+      await browser.navigate(appUrl(slug));
+      await browser.evaluate(
+        `document.cookie = "probe_apps=1; Domain=${APPS}; Path=/; Secure";` +
+          `document.cookie = "probe_localhost=1; Domain=localhost; Path=/; Secure";` +
+          `document.cookie = "probe_ctl=1; Domain=${CONTROL}; Path=/; Secure";`,
+      );
+      browser.reset();
+      await browser.navigate(appUrl(sibling));
+      const sibReq = browser.requestLog().find((e) => {
+        try {
+          return new URL(e.url).origin === new URL(appUrl(sibling)).origin;
+        } catch {
+          return false;
+        }
+      });
+      const sibCookie = sibReq?.headers.cookie ?? "";
+      assert(
+        sibCookie.includes("probe_apps="),
+        `positive control did not hold: the cookie was never set (${sibCookie})`,
+      );
+
+      browser.reset();
+      await browser.navigate(`${authOrigin}/health`);
+      const ctlReq = browser.requestLog().find((e) => e.url.includes("/health"));
+      const ctlCookie = ctlReq?.headers.cookie ?? "";
+      if (FALLBACK_PAIR) {
+        assert(
+          ctlCookie.includes("probe_ctl="),
+          `expected same-site control cookie on auth host (negative control): ${ctlCookie}`,
+        );
+        return "fallback pair: probe_ctl reached auth (expected without PSL)";
+      }
+      assert(!/probe_/.test(ctlCookie), `probe cookie on control: ${ctlCookie}`);
+      assert(!ctlCookie.includes("__Host-session"), `session cookie on control: ${ctlCookie}`);
+      return "no probe or session on control host";
+    });
+
+    await check("silent refresh through auth host", async () => {
+      await sleep(3500);
+      browser.reset();
+      await browser.navigate(appUrl(slug));
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const href = await browser.evaluate("location.href");
+        if (href.startsWith(appUrl(slug).replace(/\/$/, ""))) break;
+        if (href.includes("/interaction/")) {
+          const withUser = href.includes("?user=")
+            ? href
+            : `${href}${href.includes("?") ? "&" : "?"}user=alice@azx.dev`;
+          browser.reset();
+          await browser.navigate(withUser);
+        }
+        await sleep(400);
+      }
+      const log = browser.requestLog();
+      const silent = log.find((e) => e.url.includes("/start") && e.url.includes("silent=1"));
+      assert(silent, `no silent /start in log:\n${log.map((e) => e.url).join("\n")}`);
+      assert(
+        log.some((e) => e.url.includes("/callback")),
+        "silent refresh missing callback",
+      );
+      assert(
+        log.some((e) => e.url.includes("/_auth/complete")),
+        "silent refresh missing handoff",
+      );
+      const href = await browser.evaluate("location.href");
+      assert(href.startsWith(appUrl(slug).replace(/\/$/, "")), `ended on ${href}`);
+      return "silent=1 chain completed";
+    });
+  } finally {
+    browser.close();
+  }
+}
+
 async function checkCli() {
   group("cli");
   console.log("\n\x1b[1mhelix CLI\x1b[0m — esbuild bundle driven against the live portal");
@@ -1050,8 +1420,8 @@ async function main() {
     console.error(`--only must be one of: ${GROUPS.join(", ")}`);
     process.exit(2);
   }
-  if (only === "split-tls" && !STACK.split) {
-    console.error("split-tls requires HELIX_APPS_DOMAIN to be set.");
+  if ((only === "split-tls" || only === "split") && !STACK.split) {
+    console.error(`${only} requires HELIX_APPS_DOMAIN to be set.`);
     process.exit(2);
   }
   if (STACK.split && (!existsSync(SPLIT_CERT) || !existsSync(SPLIT_KEY))) {
@@ -1100,7 +1470,7 @@ async function main() {
     console.error("\n\x1b[31mservices did not come up — aborting\x1b[0m");
   } else {
     try {
-      if (wanted("edge") || wanted("cli")) await seedRegistry();
+      if (wanted("edge") || wanted("cli") || wanted("split")) await seedRegistry();
       if (wanted("idp")) await checkIdp();
       if (wanted("portal")) await checkPortal();
       if (wanted("edge")) await checkEdge();
@@ -1108,6 +1478,7 @@ async function main() {
       if (wanted("egress")) await checkEgress();
       if (wanted("spa")) await checkSpa();
       if (wanted("browser")) await checkBrowser();
+      if (STACK.split && (!only || only === "split")) await checkSplit();
       if (wanted("cli")) await checkCli();
     } finally {
       cleanupThrowaway();

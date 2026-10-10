@@ -128,13 +128,21 @@ export async function launchBrowser({
   const errors = [];
   const failedRequests = [];
   const cspReportPosts = [];
+  const sent = new Map();
+  const extra = new Map();
+  const reqHeaders = new Map();
+  const pushHop = (m, k, v) => m.set(k, [...(m.get(k) ?? []), v]);
   listeners.add((msg) => {
     if (msg.sessionId !== sessionId) return;
     if (msg.method === "Network.requestWillBeSent") {
       const url = msg.params?.request?.url ?? "";
+      pushHop(sent, msg.params.requestId, url);
+      pushHop(reqHeaders, msg.params.requestId, msg.params?.request?.headers ?? {});
       if (url.includes("/_csp-report") && msg.params.request.postData) {
         cspReportPosts.push(msg.params.request.postData);
       }
+    } else if (msg.method === "Network.requestWillBeSentExtraInfo") {
+      pushHop(extra, msg.params.requestId, msg.params.headers ?? {});
     } else if (msg.method === "Runtime.exceptionThrown") {
       const d = msg.params.exceptionDetails;
       errors.push(d.exception?.description ?? d.text);
@@ -172,6 +180,19 @@ export async function launchBrowser({
       errors.length = 0;
       failedRequests.length = 0;
       cspReportPosts.length = 0;
+      sent.clear();
+      extra.clear();
+      reqHeaders.clear();
+    },
+    requestLog() {
+      const lower = (h = {}) =>
+        Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]));
+      return [...sent].flatMap(([id, urls]) =>
+        urls.map((url, i) => ({
+          url,
+          headers: lower(extra.get(id)?.[i] ?? reqHeaders.get(id)?.[i]),
+        })),
+      );
     },
     async navigate(url, settleMs = 2000) {
       const loaded = waitForLoad();

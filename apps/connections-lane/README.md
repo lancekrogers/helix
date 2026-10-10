@@ -15,6 +15,18 @@ on ephemeral ports against its own scratch database, fronts every
 browser-facing hop with a TLS terminator (the edge's dev hosts and the vendor's
 authorize screen), and drives a real browser.
 
+## Split-domain mode
+
+Set `HELIX_APPS_DOMAIN` (for example `helix-apps.localhost`) to serve hosted apps on a
+second loopback domain while auth and the connections callback stay on
+`auth.local.helix.azxlabs.io`. The opener page is then cross-origin with the
+popup and callback; where the browser classifies the pair as cross-site, the
+consent popup journey exercises that layout.
+
+```sh
+HELIX_APPS_DOMAIN=helix-apps.localhost pnpm lane:connections
+```
+
 ## Run it (dev container)
 
 ```sh
