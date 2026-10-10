@@ -3,7 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SHUTDOWN_GRACE_MS,
   installGracefulShutdown,
+  processShutdownSignal,
+  resetProcessShutdownSignalForTests,
   resolveShutdownGraceMs,
+  SHUTDOWN_ABORT_MARGIN_MS,
   type ShutdownLogger,
 } from "./lifecycle.js";
 
@@ -48,6 +51,7 @@ async function untilDrained(exit: ExitMock): Promise<void> {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  resetProcessShutdownSignalForTests();
 });
 
 describe("resolveShutdownGraceMs", () => {
@@ -85,6 +89,7 @@ describe("installGracefulShutdown", () => {
 
     handlers.get("SIGTERM")!("SIGTERM");
 
+    expect(processShutdownSignal().aborted).toBe(false);
     expect(close).toHaveBeenCalledTimes(1);
     // Not before the drain finishes.
     expect(exit.mock.calls.length).toBe(0);
@@ -110,6 +115,39 @@ describe("installGracefulShutdown", () => {
       expect.objectContaining({ event: "shutdown.error" }),
       "close failed during shutdown",
     );
+  });
+
+  it("does not abort in-flight work until graceMs minus the shutdown margin", async () => {
+    vi.useFakeTimers();
+    const handlers = captureRegistration();
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const graceMs = 10_000;
+    const close = vi.fn(() => new Promise<void>(() => {}));
+    installGracefulShutdown({ close }, silentLog, { graceMs });
+
+    handlers.get("SIGTERM")!("SIGTERM");
+    expect(processShutdownSignal().aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(graceMs - SHUTDOWN_ABORT_MARGIN_MS - 1);
+    expect(processShutdownSignal().aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(processShutdownSignal().aborted).toBe(true);
+
+    vi.useRealTimers();
+    expect(exit.mock.calls.length).toBe(0);
+  });
+
+  it("aborts in-flight work immediately when grace is at or below the margin", async () => {
+    const handlers = captureRegistration();
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    installGracefulShutdown({ close: async () => {} }, silentLog, {
+      graceMs: SHUTDOWN_ABORT_MARGIN_MS,
+    });
+
+    handlers.get("SIGTERM")!("SIGTERM");
+    expect(processShutdownSignal().aborted).toBe(true);
+    await untilDrained(exit);
   });
 
   it("exits at the hard deadline when close hangs", () => {

@@ -722,13 +722,24 @@ function parseTrustProxy(raw: string | undefined): boolean | string {
  * succeeding. Note `??` only catches `undefined`/`null`, so an empty-string env
  * var (`Number("") === 0`) needs the same guard.
  */
-function requirePositiveMs(raw: string | undefined, fallback: number, name: string): number {
+/** Largest timer value Node accepts without clamping to 1 ms (`setTimeout` / `AbortSignal.timeout`). */
+export const MAX_POSITIVE_MS = 2_147_483_647;
+
+function requirePositiveMs(
+  raw: string | undefined,
+  fallback: number,
+  name: string,
+  maxMs?: number,
+): number {
   if (raw === undefined || raw.trim() === "") return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(
       `${name} must be a positive number of milliseconds (got ${JSON.stringify(raw)})`,
     );
+  }
+  if (maxMs !== undefined && value > maxMs) {
+    throw new Error(`${name} must be at most ${maxMs} milliseconds (got ${JSON.stringify(raw)})`);
   }
   return value;
 }
@@ -841,7 +852,12 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
         "EDGE_LLM_MAX_USER_IN_FLIGHT",
       ),
       maxInFlight: requireNonNegativeInt(env.EDGE_LLM_MAX_IN_FLIGHT, 200, "EDGE_LLM_MAX_IN_FLIGHT"),
-      maxCallMs: requirePositiveMs(env.EDGE_LLM_MAX_CALL_MS, 600_000, "EDGE_LLM_MAX_CALL_MS"),
+      maxCallMs: requirePositiveMs(
+        env.EDGE_LLM_MAX_CALL_MS,
+        600_000,
+        "EDGE_LLM_MAX_CALL_MS",
+        MAX_POSITIVE_MS,
+      ),
     },
     fetch: {
       egressUrl: env.EDGE_EGRESS_URL || null,

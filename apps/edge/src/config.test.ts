@@ -207,6 +207,12 @@ describe("loadConfig", () => {
         /EDGE_LLM_MAX_CALL_MS must be a positive number/,
       );
     }
+    expect(() => loadConfig({ ...ENV, EDGE_LLM_MAX_CALL_MS: String(2_147_483_648) })).toThrow(
+      /EDGE_LLM_MAX_CALL_MS must be at most 2147483647/,
+    );
+    expect(loadConfig({ ...ENV, EDGE_LLM_MAX_CALL_MS: "2147483647" }).llm.maxCallMs).toBe(
+      2_147_483_647,
+    );
     expect(() =>
       loadDevGatewayConfig({
         ...ENV,

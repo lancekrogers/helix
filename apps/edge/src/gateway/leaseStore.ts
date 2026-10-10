@@ -20,6 +20,42 @@ export interface LeaseStore {
   close(): Promise<void>;
 }
 
+export const INFLIGHT_LEASES_PRIVILEGE_SQL = `
+SELECT
+  to_regclass('public.inflight_leases') IS NOT NULL AS table_exists,
+  has_table_privilege(current_user, 'public.inflight_leases', 'SELECT') AS can_select,
+  has_table_privilege(current_user, 'public.inflight_leases', 'INSERT') AS can_insert,
+  has_table_privilege(current_user, 'public.inflight_leases', 'DELETE') AS can_delete
+`;
+
+export type InflightLeasesCheck =
+  | { status: "ok" }
+  | { status: "misconfigured"; problem: string }
+  | { status: "unreachable"; error: unknown };
+
+type InflightLeasesPrivilegeRow = {
+  table_exists: boolean;
+  can_select: boolean;
+  can_insert: boolean;
+  can_delete: boolean;
+};
+
+export function classifyInflightLeasesPrivilege(
+  rows: InflightLeasesPrivilegeRow[],
+): Exclude<InflightLeasesCheck, { status: "unreachable" }> {
+  const row = rows[0];
+  if (!row?.table_exists) {
+    return { status: "misconfigured", problem: "inflight_leases table is missing" };
+  }
+  if (!row.can_select || !row.can_insert || !row.can_delete) {
+    return {
+      status: "misconfigured",
+      problem: "helix_edge cannot SELECT, INSERT, and DELETE on inflight_leases",
+    };
+  }
+  return { status: "ok" };
+}
+
 function cappedRequests(requests: readonly LeaseRequest[]): LeaseRequest[] {
   const byScope = new Map<string, number>();
   for (const { scope, cap } of requests) {
@@ -97,6 +133,34 @@ export class PgLeaseStore implements LeaseStore {
 
   async sweep(): Promise<void> {
     await this.#pool.query(`DELETE FROM inflight_leases WHERE "expiresAt" < now()`);
+  }
+
+  async checkInflightLeasesAccess(): Promise<InflightLeasesCheck> {
+    try {
+      const res = await this.#pool.query(INFLIGHT_LEASES_PRIVILEGE_SQL);
+      const classified = classifyInflightLeasesPrivilege(res.rows as InflightLeasesPrivilegeRow[]);
+      if (classified.status === "misconfigured") return classified;
+      await withPooledClient(this.#pool, async (client) => {
+        const probeId = randomUUID();
+        const probeScope = `boot:probe:${probeId}`;
+        await client.query("BEGIN");
+        try {
+          await client.query(
+            `INSERT INTO inflight_leases (id, scope, "expiresAt")
+             VALUES ($1::uuid, $2, now() + interval '1 second')`,
+            [probeId, probeScope],
+          );
+          await client.query(`DELETE FROM inflight_leases WHERE id = $1::uuid`, [probeId]);
+          await client.query("ROLLBACK");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {});
+          throw err;
+        }
+      });
+      return { status: "ok" };
+    } catch (err) {
+      return { status: "unreachable", error: err };
+    }
   }
 
   async close(): Promise<void> {

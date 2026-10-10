@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Pool } from "pg";
-import { PLATFORM_LLM_SPEND_DEFINER_CATALOG_SQL } from "./platformSpendDefinerCheck.js";
+import { PLATFORM_SPEND_CHECK_SQL } from "./usage.js";
 import { PgUsageStore } from "./usage.js";
 import { TEST_DATABASE_URL } from "../test/seed.js";
 
@@ -261,7 +261,7 @@ describe("platform_llm_spend_micro_usd (SECURITY DEFINER aggregate)", () => {
   it("owner policy and definer function are aligned in the catalog", async () => {
     const pool = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
     try {
-      const r = await pool.query(PLATFORM_LLM_SPEND_DEFINER_CATALOG_SQL);
+      const r = await pool.query(PLATFORM_SPEND_CHECK_SQL);
       expect(r.rows).toHaveLength(1);
       const row = r.rows[0] as Record<string, boolean | string>;
       expect(row.fn_name_ok).toBe(true);

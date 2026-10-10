@@ -83,7 +83,15 @@ the cached aggregate read caught up. These are **bounds**, not exact gates.
 
 - **Reasoning tokens billed upstream but never streamed** are not estimated; a cut call may undercharge
   relative to the vendor invoice.
-- **An edge crash mid-stream writes no row** and may leave a lease until TTL expires.
+- **A rolling deploy, scale-in, or crash mid-stream** may strand a lease until TTL if the process
+  exits before the handler's `finally` runs. Shutdown aborts in-flight LLM calls shortly before the
+  hard drain deadline (`SHUTDOWN_ABORT_MARGIN_MS` before `SHUTDOWN_GRACE_MS`) so the cut path can
+  write a ledger row and release the lease while shorter streams may still finish; SIGKILL or an
+  overrun past the deadline can still strand rows for up to the lease TTL.
+- **The dev gateway (`deployDevGateway`) is outside the platform ceiling.** Its LLM calls use
+  `env=dev`, which `platform_llm_spend_micro_usd` does not sum. Enabling the dev gateway is a
+  precondition that operators accept unbounded platform-wide dev spend unless they add separate
+  controls.
 - **Byte estimates can be tens of percent off**; every starting cap and TTL is a guess until real
   traffic exists (defaults: $50/day install baseline, platform ceiling derived from monthly cap,
   200 per-replica sockets, 10-minute deadline, fetch lease TTL ten minutes when enabled).

@@ -321,6 +321,25 @@ installGracefulShutdown(app, app.log);
 
 const pgUsage = usage instanceof PgUsageStore ? usage : null;
 let observePlatformSpendRatio: ((result: ObservableResult) => void) | null = null;
+const leaseCapsEnabled =
+  config.llm.maxAppInFlight > 0 ||
+  config.llm.maxUserInFlight > 0 ||
+  config.fetch.maxAppInFlight > 0;
+if (leaseCapsEnabled) {
+  const leaseCheck = await leases.checkInflightLeasesAccess();
+  if (leaseCheck.status === "misconfigured") {
+    throw new Error(
+      `in-flight lease caps are enabled but the database is misconfigured: ${leaseCheck.problem}`,
+    );
+  }
+  if (leaseCheck.status === "unreachable") {
+    app.log.warn(
+      { err: leaseCheck.error, event: "inflight_leases.selftest_unreachable" },
+      "inflight_leases self-test could not reach the database; per-call acquires fail closed",
+    );
+  }
+}
+
 if (config.llm.platformDollarsPerDay > 0 && pgUsage) {
   const check = await pgUsage.checkPlatformSpendFunction();
   if (check.status === "misconfigured") {

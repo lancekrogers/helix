@@ -8,6 +8,7 @@ import {
   type ApiErrorCode,
   type LlmUsage,
 } from "@azx-pbc/shared";
+import { processShutdownSignal } from "@azx-pbc/shared/lifecycle";
 import type { GatewayConfig } from "../config.js";
 import type { RegistryReader } from "../registry/projection.js";
 import { meterIdentity, type CallerResolver } from "../auth/gate.js";
@@ -482,7 +483,7 @@ export function makeLlmHandler(
         includeUsage: parsed.includeUsage,
       };
       const deadline = AbortSignal.timeout(rt.maxCallMs);
-      const callSignal = AbortSignal.any([abort.signal, deadline]);
+      const callSignal = AbortSignal.any([abort.signal, deadline, processShutdownSignal()]);
       const events = rt.provider.stream(chat, {
         signal: callSignal,
         appId: entry.appId,
@@ -536,20 +537,28 @@ export function makeLlmHandler(
             await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
             return;
           }
+          const shutdownHit = processShutdownSignal().aborted;
           const deadlineHit = deadline.aborted;
           await recordOnce("error", {
-            errorDetail: deadlineHit ? "deadline_exceeded" : errorDetailOf(err),
-            cut: deadlineHit || eventsSeen > 0,
+            errorDetail: shutdownHit
+              ? "process_shutdown"
+              : deadlineHit
+                ? "deadline_exceeded"
+                : errorDetailOf(err),
+            cut: shutdownHit || deadlineHit || eventsSeen > 0,
           });
-          const { status, code, message, param, retryAfter } = deadlineHit
-            ? {
-                status: 502,
-                code: "internal" as const,
-                message: "LLM call exceeded its time limit",
-                param: undefined,
-                retryAfter: undefined,
-              }
-            : describeError(err, { structured });
+          const { status, code, message, param, retryAfter } =
+            shutdownHit || deadlineHit
+              ? {
+                  status: 502,
+                  code: "internal" as const,
+                  message: shutdownHit
+                    ? "LLM call ended during platform shutdown"
+                    : "LLM call exceeded its time limit",
+                  param: undefined,
+                  retryAfter: undefined,
+                }
+              : describeError(err, { structured });
           if (!started) {
             // `start()` is lazy, so a failure before the first delta has written
             // nothing — a real status is still possible, and matches how every other
@@ -594,20 +603,28 @@ export function makeLlmHandler(
           await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
           return;
         }
+        const shutdownHit = processShutdownSignal().aborted;
         const deadlineHit = deadline.aborted;
         await recordOnce("error", {
-          errorDetail: deadlineHit ? "deadline_exceeded" : errorDetailOf(err),
-          cut: deadlineHit || eventsSeen > 0,
+          errorDetail: shutdownHit
+            ? "process_shutdown"
+            : deadlineHit
+              ? "deadline_exceeded"
+              : errorDetailOf(err),
+          cut: shutdownHit || deadlineHit || eventsSeen > 0,
         });
-        const { status, code, message, param, retryAfter } = deadlineHit
-          ? {
-              status: 502,
-              code: "internal" as const,
-              message: "LLM call exceeded its time limit",
-              param: undefined,
-              retryAfter: undefined,
-            }
-          : describeError(err, { structured });
+        const { status, code, message, param, retryAfter } =
+          shutdownHit || deadlineHit
+            ? {
+                status: 502,
+                code: "internal" as const,
+                message: shutdownHit
+                  ? "LLM call ended during platform shutdown"
+                  : "LLM call exceeded its time limit",
+                param: undefined,
+                retryAfter: undefined,
+              }
+            : describeError(err, { structured });
         // 502 for upstream failures, 400 when the vendor rejected the app's request,
         // 429 (with retry-after) when it throttled one; the code stays within the
         // shared set.

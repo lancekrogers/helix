@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { request as undiciRequest } from "undici";
-import { describe, expect, it, vi } from "vitest";
+import {
+  abortInFlightWorkForShutdown,
+  resetProcessShutdownSignalForTests,
+} from "@azx-pbc/shared/lifecycle";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { ATTR_REASON, INSTR_GATEWAY_ADMISSION_DENIED, SPAN_LLM } from "@azx-pbc/shared/telemetry";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
@@ -1207,6 +1211,10 @@ describe("platform ceiling", () => {
 });
 
 describe("concurrency caps and the call deadline", () => {
+  afterEach(() => {
+    resetProcessShutdownSignalForTests();
+  });
+
   async function holdFirstDelta(edge: LlmEdge): Promise<() => void> {
     let resume!: () => void;
     const gate = new Promise<void>((r) => {
@@ -1289,6 +1297,35 @@ describe("concurrency caps and the call deadline", () => {
     expect(blocked.json().error.message).toContain("replica");
     resume();
     await first;
+  });
+
+  it("cuts and releases the lease when process shutdown aborts an in-flight stream", async () => {
+    const leases = new InMemoryLeaseStore();
+    const releaseRows: number[] = [];
+    const ctx: { edge: LlmEdge | undefined } = { edge: undefined };
+    const baseRelease = leases.release.bind(leases);
+    vi.spyOn(leases, "release").mockImplementation(async (id) => {
+      releaseRows.push(ctx.edge!.usage.records.length);
+      await baseRelease(id);
+    });
+    ctx.edge = buildLlmEdge({
+      maxAppInFlight: 5,
+      leases,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const token = await seedSession(ctx.edge.sessions);
+    const resume = await holdFirstDelta(ctx.edge);
+    const pending = chat(ctx.edge, token, { ...ASK, stream: true });
+    await until(() => ctx.edge!.provider.calls.length === 1, "upstream started");
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(1);
+    abortInFlightWorkForShutdown();
+    resume();
+    await pending;
+    await until(() => ctx.edge!.usage.records.length === 1, "shutdown cut row");
+    expect(ctx.edge!.usage.records[0]?.outcome).toBe("error");
+    expect(ctx.edge!.usage.records[0]?.errorDetail).toContain("process_shutdown");
+    expect(releaseRows[0]).toBe(1);
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(0);
   });
 
   it("releases the lease only after the ledger row on streaming, non-streaming, upstream-error and hang-up paths", async () => {

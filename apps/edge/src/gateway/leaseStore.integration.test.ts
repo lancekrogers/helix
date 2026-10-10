@@ -48,6 +48,11 @@ afterAll(async () => {
 });
 
 describe("PgLeaseStore (helix_edge)", () => {
+  it("checkInflightLeasesAccess returns ok on a migrated database", async () => {
+    if (!ok) return;
+    expect(await store.checkInflightLeasesAccess()).toEqual({ status: "ok" });
+  });
+
   it("acquires, refuses at cap, and release frees a slot", async () => {
     if (!ok) return;
     const s = scope();

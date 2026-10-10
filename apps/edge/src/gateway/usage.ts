@@ -12,36 +12,62 @@ export interface PgUsageStoreOpts extends EdgePoolOpts {
   platformCacheMs?: number;
 }
 
+/** Boot self-test and integration tests share this catalog query (ADR-0002). */
 export const PLATFORM_SPEND_CHECK_SQL = `
-  SELECT p.prosecdef AS definer,
-         EXISTS (SELECT 1 FROM pg_policies pol
-                 WHERE pol.schemaname = 'public' AND pol.tablename = 'gateway_calls'
-                   AND pol.policyname = 'gateway_calls_owner_read'
-                   AND pg_get_userbyid(p.proowner) = ANY (pol.roles)) AS owner_policy
-  FROM pg_proc p
-  WHERE p.proname = 'platform_llm_spend_micro_usd' AND p.pronamespace = 'public'::regnamespace`;
+SELECT
+  p.proname = 'platform_llm_spend_micro_usd' AS fn_name_ok,
+  p.prosecdef AS security_definer,
+  EXISTS (
+    SELECT 1 FROM unnest(COALESCE(p.proconfig, ARRAY[]::text[])) AS cfg
+    WHERE cfg LIKE 'search_path=%'
+  ) AS search_path_pinned,
+  pg_get_userbyid(p.proowner) AS function_owner,
+  pol.policyname = 'gateway_calls_owner_read' AS policy_name_ok,
+  pol.cmd = 'SELECT' AS policy_cmd_ok,
+  pol.roles @> ARRAY[pg_get_userbyid(p.proowner)]::name[] AS policy_admits_owner
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+LEFT JOIN pg_policies pol
+  ON pol.tablename = 'gateway_calls'
+ AND pol.policyname = 'gateway_calls_owner_read'
+WHERE p.proname = 'platform_llm_spend_micro_usd'
+  AND pg_get_function_identity_arguments(p.oid) = 'p_env text'
+`;
 
 export type PlatformSpendCheck =
   | { status: "ok" }
   | { status: "misconfigured"; problem: string }
   | { status: "unreachable"; error: unknown };
 
-type PlatformSpendCheckRow = { definer: boolean; owner_policy: boolean };
+export type PlatformSpendCheckRow = {
+  fn_name_ok: boolean;
+  security_definer: boolean;
+  search_path_pinned: boolean;
+  policy_name_ok: boolean;
+  policy_cmd_ok: boolean;
+  policy_admits_owner: boolean;
+};
 
 export function classifyPlatformSpendCheck(
   rows: PlatformSpendCheckRow[],
 ): Exclude<PlatformSpendCheck, { status: "unreachable" }> {
   const row = rows[0];
-  if (!row) {
+  if (!row?.fn_name_ok) {
     return { status: "misconfigured", problem: "platform_llm_spend_micro_usd is missing" };
   }
-  if (!row.definer) {
+  if (!row.security_definer) {
     return {
       status: "misconfigured",
       problem: "platform_llm_spend_micro_usd is not SECURITY DEFINER",
     };
   }
-  if (!row.owner_policy) {
+  if (!row.search_path_pinned) {
+    return {
+      status: "misconfigured",
+      problem: "platform_llm_spend_micro_usd does not pin search_path",
+    };
+  }
+  if (!row.policy_name_ok || !row.policy_cmd_ok || !row.policy_admits_owner) {
     return {
       status: "misconfigured",
       problem: "gateway_calls_owner_read does not admit the function owner",

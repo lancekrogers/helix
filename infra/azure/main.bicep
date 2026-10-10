@@ -79,6 +79,7 @@ param llmMaxInFlight int = 200
 
 @description('Wall-clock deadline for one upstream LLM call in milliseconds (EDGE_LLM_MAX_CALL_MS). Also bounds lease TTL on the edge.')
 @minValue(1000)
+@maxValue(2147483647)
 param llmMaxCallMs int = 600000
 
 @description('Max uncompressed size in MB of any single file in a deployed bundle.')
