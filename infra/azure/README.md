@@ -1037,7 +1037,11 @@ A monthly consumption budget on this resource group, notifying at 80% actual,
 **not** gated on `deployApps`: the expensive resources exist after phase 1, so it
 is worth having before any app is deployed. It **notifies and does not enforce** —
 Azure will not stop a resource when a budget is crossed. The real limits are the
-per-app daily token budgets.
+per-app daily LLM budgets and the **enforced platform daily ceiling** on the edge
+(`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`, Bicep `llmPlatformDollarsPerDay`, default one tenth of
+`platformMonthlyUsdCap` per day). That ceiling is not this Azure budget — it is spend refused at
+the gateway when the day's ledger sum crosses the install setting. Operator rollout:
+`apps/docs/src/deploy/updates.md` ("Upgrading to the LLM spend controls").
 
 **LLM spend is a separate axis and is never in this budget.** With vendor-direct
 keys it is not in Azure at all; with `deployFoundry` it bills into the Foundry

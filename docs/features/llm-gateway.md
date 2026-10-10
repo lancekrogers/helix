@@ -1,12 +1,19 @@
 # LLM gateway
 
-> **Related ADRs:** [ADR-0008](../adr/0008-llm-key-via-egress.md) (LLM key via egress) · [ADR-0021](../adr/0021-metering-ledger.md) (metering ledger) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0033](../adr/0033-openai-compatible-gateway-surface.md) (OpenAI-compatible surface + multi-provider routing) · [ADR-0034](../adr/0034-structured-output-on-the-llm-gateway.md) (structured output).
+> **Related ADRs:** [ADR-0008](../adr/0008-llm-key-via-egress.md) (LLM key via egress) · [ADR-0021](../adr/0021-metering-ledger.md) (metering ledger) · [ADR-0051](../adr/0051-llm-admission-control.md) (admission: default budget, platform ceiling, in-flight caps) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0033](../adr/0033-openai-compatible-gateway-surface.md) (OpenAI-compatible surface + multi-provider routing) · [ADR-0034](../adr/0034-structured-output-on-the-llm-gateway.md) (structured output).
 
 `POST /_api/llm/chat` sends a language-model request through the platform.
 The edge resolves the caller, checks the request origin and app's model allowlist,
-enforces its daily budget, and records usage. Egress supplies the vendor
-credential and makes the outbound call. The vendor-neutral request and response
-schemas are in `packages/shared/src/llm.ts` (architecture §6.1, project plan §4 M4).
+enforces admission controls (daily budget, optional platform ceiling, in-flight caps,
+call deadline), and records usage. Egress supplies the vendor credential and makes the
+outbound call. The vendor-neutral request and response schemas are in
+`packages/shared/src/llm.ts` (architecture §6.1, project plan §4 M4).
+
+**Spend leak scope (corrected).** A client hang-up after the upstream response headers arrive
+already tore the vendor connection down; the gaps were the **pre-header** window (egress now
+aborts upstream on edge hang-up), cut streams that wrote **$0** before charging was fixed, and
+approved apps with no manifest `dollarsPerDay` being unlimited at the gateway. ADR-0051 records
+the full decision set.
 
 Handler: `apps/edge/src/gateway/llm.ts` (`makeLlmHandler`). Route wiring:
 `apps/edge/src/app.ts` (`POST /_api/llm/chat`). App hosts only — `sendNotFound` elsewhere.
@@ -373,6 +380,11 @@ holds an API key. See [examples.md](./examples.md).
 
 ## Planned / not yet built
 
+- **Admission residuals (ADR-0051).** Reasoning tokens billed upstream but never streamed are not
+  estimated; an edge crash mid-stream writes no ledger row; byte estimates can be tens of percent
+  off; platform `retry-after` assumes the edge and database share a time zone; abort propagation
+  through Container Apps ingress is **unverified in Azure**; pre-charge with a settling second row
+  remains the option if edge-crash orphan spend becomes material.
 - **Tool calling** on both surfaces — `tools`/`tool_calls` translation needs the neutral-seam
   changes structured output did *not* (a tool call is a non-text content block, so it needs new
   `LlmStreamEvent` variants and new codec framing); deferred (ADR-0033/0034). Other modalities

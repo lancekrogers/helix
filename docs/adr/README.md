@@ -65,3 +65,4 @@ This directory records the significant architecture decisions for Helix (the AZX
 | [0048](0048-canonical-principal-oid.md) | Canonical principal identifier: the Entra `oid` claim, captured at source in both planes | Accepted |
 | [0049](0049-warden-optional-inference-backend.md) | Warden as an optional inference backend (phase 1 light upstream proposed; phase 2 deep integration deferred) | Proposed |
 | [0050](0050-hosted-app-visitor-analytics.md) | Visitor analytics for hosted apps (visits, unique visitors, approximate location) | Accepted |
+| [0051](0051-llm-admission-control.md) | LLM admission control: install default budget, platform ceiling, in-flight caps | Accepted |

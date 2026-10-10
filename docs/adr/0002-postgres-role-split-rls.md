@@ -86,13 +86,12 @@ The function returns only a platform-wide aggregate to the same role; grant abse
 owner policy is removed) and `role-split.integration.test.ts`.
 
 Migration `20261009230444_inflight_leases` adds `inflight_leases` for in-flight concurrency caps
-(wired to handlers in a follow-on task). The edge inserts one row per
+on the LLM and fetch-proxy paths. The edge inserts one row per
 scope per admitted call and deletes on completion; `expiresAt` bounds leak time when a replica dies
 without releasing. `helix_edge` has `SELECT`, `INSERT`, and `DELETE` only (no `UPDATE`); `REVOKE
 ALL` on `helix_portal` undoes the blanket owner default grant; `helix_egress` and `helix_dev` have
 no grant. No RLS: the `scope` string embeds the app id the way `rate_counters.bucketKey` does, and
 the table holds no app payload. An edge compromise could already exhaust its own rate-counter keys;
 inserting lease rows to fill caps is the same blast radius. Pinned in `role-split.integration.test.ts`
-and `leaseStore.integration.test.ts`.
-
-ADR-0011's spend-containment pointer and ADR-0051 remain for the docs task in the same sequence.
+and `leaseStore.integration.test.ts`. ADR [0051](0051-llm-admission-control.md) records the
+admission semantics that use these objects.

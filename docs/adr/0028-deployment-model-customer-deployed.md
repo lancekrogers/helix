@@ -41,6 +41,15 @@ Concretely, each prior decision that was implicitly single-install is **paramete
 - **Version skew across the fleet is now a first-class cost.** Customers run different versions; docs/ADRs describe *a* deployment, and cross-version compatibility (migration ordering, manifest schema, instruction/handoff token formats) must be explicitly versioned. This is the classic self-managed-software tax (GitLab/Retool self-hosted).
 - **Edits this ADR obligates — done 2026-07-22:** architecture decision 11 (now "no per-app vanity domains; base domain is a per-deployment parameter") and the §11 resolved-note both qualified in `platform-architecture.md`; ADR-0019 carries a 2026-07-22 amendment reframing the #16 split as a per-deployment topology + PSL recommendation, not a domain we own.
 
+## Amendment (2026-10-09): admission controls are per-install settings
+
+The platform LLM daily ceiling, LLM and fetch in-flight concurrency caps, the install default LLM
+budget when a manifest omits `dollarsPerDay`, and the wall-clock LLM call deadline are **per-install
+settings**, each with a strict default and an off value where the knob allows it (the call deadline
+excepted — it has no off value). A one-organization install on this model may relax or disable
+individual controls without forking code. Later network-egress and domain-split work extends this same
+amendment rather than adding a second one. Detail: ADR [0051](0051-llm-admission-control.md).
+
 ## Considered and rejected
 
 **Hosted multi-tenant SaaS on our cloud.** Rejected: it would place customer apps, secrets, and data in *our* tenancy (custody + residency burden), create a cross-customer blast radius, and require exactly the multi-tenant machinery this model avoids — per-tenant base-domain resolution, SNI multi-cert at a shared ingress, cross-tenant unknown-host rejection, and an `orgId` scoping layer. Not a permanent bar: recorded so that any future hosted offering is a **conscious re-decision**, not drift — and note that reversing to it later is a large re-architecture, precisely because the machinery above is deliberately absent.

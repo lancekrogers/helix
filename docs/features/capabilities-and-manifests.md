@@ -151,7 +151,8 @@ Two invariants keep it safe without being annoying (`docs/design/approvals.md` �
   boundary*: `group → internal` widens access and is still baseline, because `internal` is the
   baseline trust level and the default. **LLM spend cap:** at the edge, an unset
   `dollarsPerDay` is enforced at the install default (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`, $50/day
-  unless changed). The classifier cannot read that knob, so a *requested* unset cap is treated as
+  unless changed); **data and fetch** daily caps, when unset in the manifest, stay unlimited at the
+  gateway (only a defined cap is enforced on those paths). The classifier cannot read that knob, so a *requested* unset cap is treated as
   possibly unlimited and *removing* an explicit LLM cap gates; *adding* a cap (including unset →
   any number) is a reduction and commits when the new cap is at or under the $50 baseline. **Unset
   data and fetch budgets** remain unlimited (those paths only enforce a defined cap), so removing

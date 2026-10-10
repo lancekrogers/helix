@@ -168,6 +168,60 @@ The active revision's image must be the tag you just deployed, and its running
 state must be `Running`. Two active revisions means the new one has not become
 ready and the old one is still serving.
 
+## Upgrading to the LLM spend controls
+
+These notes are for an operator adopting the admission and metering work in a live install. Nothing
+here runs automatically — you choose the order and the parameter values.
+
+1. **Egress and edge images.** Build and deploy the new egress and edge images. There is no data
+   migration for the upstream abort or the charging change. New `error` rows carry `;usage=` markers;
+   historical rows keep their $0.
+
+2. **List approved apps with no budget.** Before the install default takes effect, find apps that are
+   unlimited today:
+
+```sql
+SELECT slug FROM apps
+ WHERE capabilities->'llm' IS NOT NULL
+   AND capabilities->'llm'->>'dollarsPerDay' IS NULL
+   AND jsonb_array_length(COALESCE(capabilities->'llm'->'models', '[]'::jsonb)) > 0;
+```
+
+   These become $50 per day when the default deploys unless you change
+   `llmDefaultDollarsPerDay`. Set an explicit number for each through the portal, or deploy with
+   `llmDefaultDollarsPerDay` raised for a transition and lower it afterwards. Skipping this step
+   means refusals on the first busy day. Column and JSON paths match `apps/portal/prisma/schema.prisma`
+   (`App.capabilities`) and `packages/shared/src/approval.ts`; validate the query on your database
+   before you rely on it in production.
+
+3. **Apply the migrations before the edge image.** An edge that starts without
+   `platform_llm_spend_micro_usd` or `inflight_leases` fails closed on its first ceiling or lease
+   call. Confirm the migration identity's role name (`helixadmin` by default, the `postgresAdminLogin`
+   parameter) is the role the owner policy on `gateway_calls` was created for.
+
+4. **Choose the platform ceiling.** The Bicep default is one tenth of `platformMonthlyUsdCap` per
+   day. Set it from the install's own ledger history; an untuned value either blocks real use or
+   never trips. A one-organization install may set `llmPlatformDollarsPerDay` to `0` to switch the
+   ceiling off and should record that choice in its own runbook.
+
+5. **Apply the new template.** A Bicep default does not reach an install until you apply the template
+   with your parameters. Set the four concurrency parameters (`llmMaxAppInFlight`,
+   `llmMaxUserInFlight`, `llmMaxInFlight`, `fetchMaxAppInFlight`), the call deadline
+   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. See
+   [Configuration](/deploy/configuration).
+
+6. **Mixed replicas.** An edge revision without `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` disables the
+   platform ceiling on that replica, so a rolling deploy with old and new replicas does not refuse
+   calls for the ceiling until every replica carries the setting.
+
+**Rollback.** Roll images back with `az containerapp update` as in step 2 above. Each Part 3 control
+has an off value (`0`) except the call deadline. Migrations are additive and can stay.
+
+**What was not verified in Azure.** Bicep parameters and edge/dev-gateway environment wiring
+(compile-checked only); the platform-spend alert rule's query and whether it fires; the production
+owner role under `FORCE` RLS; abort propagation through the Container Apps ingress between edge and
+egress; lease behavior across real replicas.
+
 ## What a rollout actually does
 
 These behaviours were measured on a live install, polling an app every ~2 s
