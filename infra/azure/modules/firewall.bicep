@@ -34,8 +34,13 @@ param appsRouteTableName string
 @description('Name of the egress route table (default route is added to it).')
 param egressRouteTableName string
 
-@description('FQDNs the ACA managed environments need outbound to function (MCR + ACA system images, control plane, monitoring) plus GHCR for the app image pulls. Both subnets are allowed to reach these. Review against current ACA networking docs before deploying.')
-param acaPlatformFqdns array = [
+@description('''
+  Threat intelligence mode for the firewall policy. Default Deny drops traffic to known-bad destinations (stricter than Alert). A false positive on a vendor IP is possible — use firewall application-rule denial logs to diagnose; set Alert to log only without blocking. Whether Azure Firewall Basic tier supports Deny is unverified in Azure (this module uses Standard tier). Existing installs that relied on Alert can set threatIntelMode = 'Alert' to preserve prior behavior on template update.''')
+@allowed(['Alert', 'Deny', 'Off'])
+param threatIntelMode string = 'Deny'
+
+@description('FQDNs the apps-subnet workloads need: ACA platform plumbing (MCR, GHCR, monitoring, App Insights), Entra for tokens and OIDC, Microsoft Graph (portal directory client), Azure Resource Manager (certbot) and the ACME directory host. Review against current ACA networking docs before deploying.')
+param appsPlatformFqdns array = [
   'mcr.microsoft.com'
   '*.data.mcr.microsoft.com'
   '*.cdn.mscr.io'
@@ -57,6 +62,33 @@ param acaPlatformFqdns array = [
   // Live Metrics. The azuremonitor exporter reaches for it; without the rule it
   // retries and logs rather than failing, but the noise is not worth saving one
   // allowlist line.
+  '*.livediagnostics.monitor.azure.com'
+  #disable-next-line no-hardcoded-env-urls
+  'login.microsoftonline.com' // portal OIDC discovery + JWKS; edge OIDC against Entra issuer
+  'packages.microsoft.com'
+  'graph.microsoft.com' // packages/directory/src/entra.ts: group and user lookups
+  #disable-next-line no-hardcoded-env-urls
+  'management.azure.com' // certbot: az login, certificate upload, hostname bind, DNS TXT writes
+  #disable-next-line no-hardcoded-env-urls
+  'login.microsoft.com' // managed-identity token issuance for Key Vault references
+]
+
+@description('ACME directory host (from the acmeServer parameter). Added to the apps list: certbot runs in the apps environment.')
+param acmeServerHost string
+
+@description('FQDNs the egress subnet needs for the platform itself: MCR, GHCR (egress image pulls), monitoring and App Insights, Entra. NOT Graph, ACME or Resource Manager, which only the apps subnet uses.')
+param egressPlatformFqdns array = [
+  'mcr.microsoft.com'
+  '*.data.mcr.microsoft.com'
+  '*.cdn.mscr.io'
+  // Egress image is ghcr.io/azx-pbc-oss/helix-egress; ACA infrastructure may pull
+  // layers through the subnet route — keep GHCR until net-verify confirms otherwise.
+  'ghcr.io'
+  'pkg-containers.githubusercontent.com'
+  #disable-next-line no-hardcoded-env-urls
+  '*.blob.core.windows.net'
+  '*.monitoring.azure.com'
+  '*.in.applicationinsights.azure.com'
   '*.livediagnostics.monitor.azure.com'
   #disable-next-line no-hardcoded-env-urls
   'login.microsoftonline.com'
@@ -81,7 +113,7 @@ resource firewallPolicy 'Microsoft.Network/firewallPolicies@2024-05-01' = {
     sku: {
       tier: 'Standard'
     }
-    threatIntelMode: 'Alert'
+    threatIntelMode: threatIntelMode
   }
 }
 
@@ -125,13 +157,42 @@ resource ruleCollectionGroup 'Microsoft.Network/firewallPolicies/ruleCollectionG
         rules: [
           {
             ruleType: 'ApplicationRule'
-            name: 'aca-required-fqdns'
-            sourceAddresses: [appsSubnetPrefix, egressSubnetPrefix]
-            targetFqdns: acaPlatformFqdns
+            name: 'aca-required-fqdns-apps'
+            sourceAddresses: [appsSubnetPrefix]
+            targetFqdns: concat(appsPlatformFqdns, [acmeServerHost])
             protocols: [
               { protocolType: 'Https', port: 443 }
               { protocolType: 'Http', port: 80 }
             ]
+          }
+          {
+            ruleType: 'ApplicationRule'
+            name: 'aca-required-fqdns-egress'
+            sourceAddresses: [egressSubnetPrefix]
+            targetFqdns: egressPlatformFqdns
+            protocols: [
+              { protocolType: 'Https', port: 443 }
+              { protocolType: 'Http', port: 80 }
+            ]
+          }
+        ]
+      }
+      {
+        // Key Vault reference resolution is not an FQDN rule: it needs the AzureKeyVault service tag.
+        ruleCollectionType: 'FirewallPolicyFilterRuleCollection'
+        name: 'aca-platform-network'
+        priority: 300
+        action: {
+          type: 'Allow'
+        }
+        rules: [
+          {
+            ruleType: 'NetworkRule'
+            name: 'key-vault-reference-resolution'
+            ipProtocols: ['TCP']
+            sourceAddresses: [appsSubnetPrefix, egressSubnetPrefix]
+            destinationAddresses: ['AzureKeyVault']
+            destinationPorts: ['443']
           }
         ]
       }

@@ -66,15 +66,23 @@ works with the firewall off, which is the posture of the live installs.
 
 ## Optional: the egress firewall (`deployFirewall`)
 
-The Azure Firewall (Standard tier) is the enforcement point for the egress-only
-network zone: it forces both app subnets' `0.0.0.0/0` through itself, **allows
-only `snet-egress` out** (to any FQDN) plus a narrow platform allow-list, and
-**denies the apps subnet** (edge/portal) by default. Per
-[ADR-0005](../../docs/adr/0005-ssrf-egress-controls.md) this network-zone
-allow-list is the **primary** SSRF/egress control; the egress app's own
-`ssrf.ts` IP validation + header filtering is explicitly _defense-in-depth_
-behind it (ADR [0001](../../docs/adr/0001-three-runtime-split.md),
+The Azure Firewall (Standard tier) is the stronger optional tier for the
+egress-only network zone when `deployFirewall=true`: it forces both app subnets'
+`0.0.0.0/0` through itself, **allows only `snet-egress` out** (to any FQDN) plus
+a narrow platform allow-list, and **denies the apps subnet** (edge/portal) by
+default. The baseline for every install is the egress application's
+`ssrf.ts` IP validation + header filtering and the `snet-egress` NSG
+(`egressNsgEnforce`); the firewall FQDN filter adds a network layer on top when
+enabled. See [ADR-0005](../../docs/adr/0005-ssrf-egress-controls.md) (ADR
+[0001](../../docs/adr/0001-three-runtime-split.md),
 [0013](../../docs/adr/0013-egress-trust-model.md)).
+
+Threat intelligence on the firewall policy now defaults to `Deny`
+(`threatIntelMode`); earlier templates used `Alert`. An install that already
+runs the firewall becomes stricter on its next template apply: traffic to
+destinations Microsoft's feed marks as malicious is dropped instead of logged.
+If a legitimate vendor is blocked, confirm it in the firewall logs and set
+`threatIntelMode = 'Alert'` to return to log-only.
 
 The Standard firewall deployment charge is approximately $900/month before data
 processing, as estimated for this deployment. It applies even when idle.
@@ -85,9 +93,9 @@ trade-offs below.
 
 - The firewall and its forced-tunnel routes are not created; both app subnets get
   **default internet egress**. A compromised **edge can now reach the internet**
-  directly, and the primary egress control is gone — only the egress app-level
-  denylist (defense-in-depth, a validation surface that must be kept current)
-  remains, and it only governs traffic that actually goes _through_ egress.
+  directly. The `snet-egress` NSG and `ssrf.ts` remain the baseline outbound
+  controls; they govern egress-plane traffic and do not stop a compromised edge
+  on the apps subnet from dialing the internet.
 - The isolation guarantee in the diagram above no longer holds; the
   isolation-verification checks below invert (edge outbound **succeeds**).
 
@@ -272,11 +280,17 @@ Two scope notes:
   [microsoft/azure-container-apps#1804](https://github.com/microsoft/azure-container-apps/issues/1804)),
   so the migrate job keeps its runtime read of `postgres-admin-password` with its
   own managed identity. Do not move it to references until that bug closes.
-- On an environment whose egress is UDR'd through the firewall
-  (`deployFirewall=true`), reference resolution needs the `AzureKeyVault`
-  service tag and `login.microsoft.com` on the allow list (managed-identity
-  token issuance needs the Entra endpoint generally). Neither install runs the
-  firewall today; add these before it comes back.
+- On an environment whose traffic is UDR'd through the firewall
+  (`deployFirewall=true`), the template now carries per-subnet platform FQDN
+  rules plus a network rule for the `AzureKeyVault` service tag (Key Vault
+  reference resolution) and `login.microsoft.com` (managed-identity token
+  issuance). The apps subnet list also includes `graph.microsoft.com` (portal
+  directory client, `packages/directory/src/entra.ts`), `management.azure.com`
+  and the ACME directory host from `acmeServer` (certbot,
+  `apps/certbot/issue-and-bind.sh`), and `login.microsoftonline.com` for Entra
+  OIDC. **Unverified in Azure:** whether service tags work in firewall network
+  rules, and whether every host is sufficient at runtime. Neither live install
+  runs the firewall today; validate on a scratch deploy before turning it on.
 
 `kv-platform` is written at deploy (ARM management-plane, bypasses the firewall)
 and is the canonical store. **Connection** secrets are different: they stay in

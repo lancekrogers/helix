@@ -52,13 +52,14 @@ param imageTag = readEnvironmentVariable('HELIX_IMAGE_TAG', 'latest')
 // helix_dev role (README step 4) and the pre-deploy riders in the feature doc.
 param deployDevGateway = false
 
-// Egress firewall (ADR-0001/0005). true = deploy the Azure Firewall that enforces
-// the egress-only network zone (the PRIMARY SSRF/egress control). Secure default.
-// false skips it to save ~$900/mo but drops that control (a compromised edge can
-// then reach the internet; only the egress app-level denylist remains). Data
-// services stay private either way. Disable ONLY for dev/smoketest/trusted
-// installs — see README "Optional: the egress firewall".
+// Egress firewall (ADR-0001/0005). true = deploy the Azure Firewall FQDN-filtering
+// tier (stronger optional control). Baseline for every install: ssrf.ts + snet-egress
+// NSG. false skips it to save ~$900/mo (both subnets get default internet egress;
+// egress traffic still governed by ssrf.ts and the NSG). Data services stay private
+// either way. Disable ONLY for dev/smoketest/trusted installs — see README
+// "Optional: the egress firewall".
 param deployFirewall = true
+// param threatIntelMode = 'Alert'  // 'Deny' drops known-bad destinations; use 'Alert' to log only
 
 // Egress subnet NSG (layer 2). enforce = deny list + closing deny-all; deny-list-only =
 // safe first step on an existing install (no row 4000); off = no NSG. Unverified in

@@ -406,8 +406,13 @@ param llmMonthlyBudgetUsd int = 1000
 @description('Budget start date. Must be the first of a month and, for a monthly budget, no earlier than the current one — so it defaults to the first of the current month at deploy time rather than a date that would age out of validity. Pin it in the .bicepparam if you want deploys to stop touching it.')
 param budgetStartDate string = utcNow('yyyy-MM-01')
 
-@description('Deploy the Azure Firewall that enforces the egress-only network zone (ADR-0001) — the PRIMARY SSRF/egress control per ADR-0005. Default true (secure by default). Setting false SKIPS the firewall + its forced-tunnel routes to save ~$900/mo: the apps subnet then gets default internet egress, so a compromised edge can reach the internet and the only remaining outbound control is the egress app-level denylist (defense-in-depth). Data services stay private (private endpoints) either way. Only disable for dev / smoketest / trusted single-tenant installs — NOT production or untrusted-app hosting. See README "Optional: the egress firewall".')
+@description('Deploy the Azure Firewall FQDN-filtering tier for the egress-only network zone (ADR-0001). Default true. The baseline for every install is the egress application filter (apps/egress/src/ssrf.ts) plus the snet-egress NSG (egressNsgEnforce); the firewall is the stronger optional tier when enabled. Setting false SKIPS the firewall + its forced-tunnel routes to save ~$900/mo: both app subnets get default internet egress, so a compromised edge can reach the internet directly while egress traffic remains governed by ssrf.ts and the NSG. Data services stay private (private endpoints) either way. Only disable for dev / smoketest / trusted single-tenant installs — NOT production or untrusted-app hosting. See README "Optional: the egress firewall".')
 param deployFirewall bool = true
+
+@description('''
+  Firewall threat intelligence mode (only when deployFirewall is true). Default Deny blocks known-bad destinations; Alert logs without blocking; Off disables intel. Deny can false-positive on a vendor IP — use firewall logs to diagnose and set Alert to revert to log-only. Whether Basic firewall SKU supports Deny is unverified in Azure (this template uses Standard). Existing installs that used Alert before this parameter can set threatIntelMode = 'Alert' to avoid a stricter default on upgrade.''')
+@allowed(['Alert', 'Deny', 'Off'])
+param threatIntelMode string = 'Deny'
 
 @allowed(['off', 'deny-list-only', 'enforce'])
 @description('''
@@ -621,6 +626,9 @@ var effectiveEdgeTrustProxy = trustProxyRaw == 'auto'
 // doc + README for the security trade-off). The route tables themselves stay
 // (created empty in routing.bicep) — an empty UDR is a no-op, so both subnets
 // fall back to system routing.
+// The ACME directory's host, for the apps-subnet firewall list. acmeServer is a full URL.
+var acmeServerHost = split(replace(replace(acmeServer, 'https://', ''), 'http://', ''), '/')[0]
+
 module firewall 'modules/firewall.bicep' = if (deployFirewall) {
   name: 'firewall'
   params: {
@@ -631,6 +639,8 @@ module firewall 'modules/firewall.bicep' = if (deployFirewall) {
     egressSubnetPrefix: network.outputs.egressSubnetPrefix
     appsRouteTableName: routing.outputs.appsRouteTableName
     egressRouteTableName: routing.outputs.egressRouteTableName
+    threatIntelMode: threatIntelMode
+    acmeServerHost: acmeServerHost
   }
 }
 
