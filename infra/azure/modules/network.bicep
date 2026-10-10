@@ -7,9 +7,11 @@
 // subnet per managed environment, which is *why* there are two app subnets and
 // two environments rather than one.
 //
-// Route tables are attached here (passed in by id) so the subnet definition and
-// its UDR stay in one place — Azure rejects late association if a subnet already
-// holds ACA infrastructure.
+// Route tables and the egress NSG are attached here (passed in by id) so the
+// subnet definition and its UDR stay in one place — Azure rejects late
+// association if a subnet already holds ACA infrastructure. The same
+// restriction may apply to attaching an NSG to a populated ACA subnet;
+// unverified in Azure.
 
 @description('Azure region for all network resources.')
 param location string
@@ -22,6 +24,9 @@ param appsRouteTableId string
 
 @description('Resource id of the route table for snet-egress (allow-egress).')
 param egressRouteTableId string
+
+@description('Resource id of the NSG for snet-egress, or empty for none.')
+param egressNsgId string = ''
 
 @description('Address space for the VNet.')
 param vnetAddressPrefix string
@@ -79,6 +84,9 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           addressPrefix: egressSubnetPrefix
           routeTable: {
             id: egressRouteTableId
+          }
+          networkSecurityGroup: empty(egressNsgId) ? null : {
+            id: egressNsgId
           }
           delegations: [
             {

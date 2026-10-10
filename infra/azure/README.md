@@ -21,6 +21,12 @@ Container Apps. This is the `infra/` referenced in the project plan (§2) and th
 | Compute  | 2 ACA environments (`apps`, `egress`) + edge / portal / egress container apps, plus the opt-in dev-gateway (`deployDevGateway`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | DNS      | public zone for the apps domain (`*`, `auth`, `portal`; `dev-api` when `deployDevGateway`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
+Every install gets a network security group on `snet-egress` (`egressNsgEnforce`, default
+`deny-list-only`; set `enforce` on a new install, or on an existing one after `just infra net-verify`
+passes) loaded from `nsg-egress-rules.json`. The Azure Firewall remains the optional,
+costly tier (`deployFirewall`) for FQDN allow-listing on internet-bound traffic; the NSG
+works with the firewall off, which is the posture of the live installs.
+
 ### The security shape, in one diagram
 
 ```
@@ -498,8 +504,10 @@ the param rather than by hand on a container app. The default of 25 matches the
 ```
 main.bicep            orchestrator (resourceGroup scope)
 main.bicepparam       parameters (resource names + secrets via env vars)
+nsg-egress-rules.json shared NSG rule table (Bicep + local net simulation)
 modules/
   network.bicep       VNet + subnets + delegations
+  nsg.bicep           egress subnet NSG (rules from nsg-egress-rules.json)
   routing.bicep       2 empty route tables (routes added by firewall.bicep)
   firewall.bicep      Azure Firewall + policy + default routes
   privatedns.bicep    private DNS zones + VNet links

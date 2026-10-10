@@ -60,6 +60,12 @@ param deployDevGateway = false
 // installs — see README "Optional: the egress firewall".
 param deployFirewall = true
 
+// Egress subnet NSG (layer 2). enforce = deny list + closing deny-all; deny-list-only =
+// safe first step on an existing install (no row 4000); off = no NSG. Unverified in
+// Azure whether a populated ACA subnet accepts NSG attachment as an update.
+// param egressNsgEnforce = 'enforce'  // new installs; existing installs keep the deny-list-only default until net-verify passes
+// param egressAllowedPorts = ['80', '443']  // non-standard approved-origin ports need values here
+
 // Wildcard TLS automation (apps/certbot, ADR-0029). true = deploy the certbot
 // scheduled job that issues/renews *.appsDomain via ACME DNS-01 and binds the
 // edge wildcard custom domain. Needs acmeEmail (skipped when empty). acmeServer

@@ -83,6 +83,8 @@ catches a wrongly-off flag before it does damage.
 | --- | --- | --- |
 | `deployApps` | `false` | The two-phase switch: `false` deploys infrastructure only, `true` adds the container apps |
 | `deployFirewall` | `true` | The Azure Firewall that enforces the egress-only network zone. **Keep on for production** — it is the primary outbound control. `false` saves ~$920/month and is for dev/test installs only |
+| `egressNsgEnforce` | `deny-list-only` | NSG on `snet-egress`: `deny-list-only` (deny list only; the default, safe on an existing install), `enforce` (deny list plus a closing deny-all on outbound internet; choose it for a new install, or on an existing one after `just infra net-verify` passes), or `off` (no NSG). Attaching an NSG to a populated Container Apps subnet is **unverified in Azure**; test on a scratch copy, run net-verify, then move to `enforce`. Edge→egress inbound is not covered by the net probe — use post-deploy checks in the infra README |
+| `egressAllowedPorts` | `80`, `443` | TCP ports the egress NSG opens to the Internet (row 300). Approved fetch origins on other ports need explicit values here and stop working once the closing deny is enforced |
 | `pinPrivateEndpointAddresses` | `false` | When `true`, the four `snet-pe` private endpoints get static `ipConfigurations` (defaults `.4`–`.7` of that subnet, overridable via `privateEndpointAddresses`). **New installs should set `true`** so egress NSG rules can name Key Vault and Blob by IP. **Existing installs should leave `false`** unless you list current endpoint addresses (`az network private-endpoint list`), pick non-clashing values, set `privateEndpointAddresses` if needed, and accept that Azure may require recreating endpoints to change an address (**unverified**). When `false`, endpoints keep dynamic addresses as before |
 | `privateEndpointAddresses` | *(defaults when pinning)* | Only used when `pinPrivateEndpointAddresses` is `true`. Overrides per-endpoint IPv4 (`kvPlatform`, `kvConnections`, `kvDelegated`, `blob`). Static `ipConfigurations` are **unverified in Azure** until an operator applies the template |
 | `deployDevGateway` | `false` | The opt-in cross-origin dev surface (`dev-api.<appsDomain>`) for building apps locally against a deployed platform |
@@ -223,7 +225,7 @@ parameter:
 | `EDGE_FETCH_MAX_BODY_BYTES` | edge, dev-gateway | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
 | `EDGE_FETCH_MAX_APP_IN_FLIGHT` | edge, dev-gateway | `fetchMaxAppInFlight` | `0` (off). Lease TTL is ten minutes; a call that outlives it stops counting |
 | `EGRESS_MAX_BODY_BYTES` | egress | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
-| `EGRESS_EXTRA_BLOCKED_CIDRS` | egress | unset until the template wires it | built-in SSRF ranges only |
+| `EGRESS_EXTRA_BLOCKED_CIDRS` | egress | `vnetAddressPrefix` and `100.100.0.0/17` (ACA platform-reserved ingress range) from the template | built-in SSRF ranges only (`100.64.0.0/10` is already in the built-in list; the VNet entry matters when the install uses a prefix outside RFC 1918) |
 
 LLM concurrency and the call deadline:
 

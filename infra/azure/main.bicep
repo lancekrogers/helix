@@ -409,6 +409,17 @@ param budgetStartDate string = utcNow('yyyy-MM-01')
 @description('Deploy the Azure Firewall that enforces the egress-only network zone (ADR-0001) — the PRIMARY SSRF/egress control per ADR-0005. Default true (secure by default). Setting false SKIPS the firewall + its forced-tunnel routes to save ~$900/mo: the apps subnet then gets default internet egress, so a compromised edge can reach the internet and the only remaining outbound control is the egress app-level denylist (defense-in-depth). Data services stay private (private endpoints) either way. Only disable for dev / smoketest / trusted single-tenant installs — NOT production or untrusted-app hosting. See README "Optional: the egress firewall".')
 param deployFirewall bool = true
 
+@allowed(['off', 'deny-list-only', 'enforce'])
+@description('''
+  Subnet NSG on snet-egress (layer 2 egress control). Default deny-list-only: the explicit deny rules (private ranges, platform addresses, other subnets) without the closing deny-all, so default AllowInternetOutBound remains for ports outside egressAllowedPorts. It is the default because the platform-flow rules are unverified in Azure and a closing deny-all that misses one would cut egress on an existing install's next deploy. enforce adds the closing deny-all on outbound internet (row 4000): choose it for a new install, and on an existing install after net-verify passes. off creates no NSG and removes the association (rollback). off creates no NSG and removes association (rollback). Whether a populated Container Apps subnet accepts an NSG as an update is unverified in Azure; test on a scratch copy first. Platform flows in the rule table (own-subnet, MCR, Front Door, Entra, Monitor, DNS via 168.63.129.16, inbound ILB source) are unverified in Azure until net-verify. A wrongly tight inbound rule blocks edge→egress (EDGE_EGRESS_URL); the net probe cannot test inbound — use README "Verifying the isolation (post-deploy)" after apply. Approved fetch origins on ports other than egressAllowedPorts stop working once rules 300 and 4000 are active.''')
+param egressNsgEnforce string = 'deny-list-only'
+
+@description('TCP ports the egress NSG internet allow (row 300) opens. Default 80 and 443. Non-standard ports need explicit values here and in any firewall allow-list when deployFirewall is true.')
+param egressAllowedPorts array = [
+  '80'
+  '443'
+]
+
 @description('Log verbosity for all four services (pino levels: fatal|error|warn|info|debug|trace|silent). Sets LOG_LEVEL, which every service reads unless its own <PREFIX>_LOG_LEVEL overrides it — so this one line raises the whole platform, and a per-service override raises just the noisy one. Applied per revision: changing it rolls a new ACA revision rather than taking effect on the running one. NOTE debug/trace on the edge is a data-exposure decision as much as a volume one — this stdout is retained in Log Analytics for 30 days.')
 @allowed(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
 param logLevel string = 'info'
@@ -497,6 +508,24 @@ module routing 'modules/routing.bicep' = {
   }
 }
 
+module egressNsg 'modules/nsg.bicep' = if (egressNsgEnforce != 'off') {
+  name: 'nsg-egress'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    mode: egressNsgEnforce == 'enforce' ? 'enforce' : 'deny-list-only'
+    vnetAddressPrefix: vnetAddressPrefix
+    egressSubnetPrefix: egressSubnetPrefix
+    appsSubnetPrefix: appsSubnetPrefix
+    postgresSubnetPrefix: postgresSubnetPrefix
+    privateEndpointSubnetPrefix: privateEndpointSubnetPrefix
+    pinPrivateEndpointAddresses: pinPrivateEndpointAddresses
+    kvConnectionsIp: peKvConnectionsIp
+    kvDelegatedIp: peKvDelegatedIp
+    allowedPorts: egressAllowedPorts
+  }
+}
+
 module network 'modules/network.bicep' = {
   name: 'network'
   params: {
@@ -504,6 +533,7 @@ module network 'modules/network.bicep' = {
     namePrefix: namePrefix
     appsRouteTableId: routing.outputs.appsRouteTableId
     egressRouteTableId: routing.outputs.egressRouteTableId
+    egressNsgId: egressNsg.?outputs.nsgId ?? ''
     vnetAddressPrefix: vnetAddressPrefix
     firewallSubnetPrefix: firewallSubnetPrefix
     appsSubnetPrefix: appsSubnetPrefix
@@ -1194,6 +1224,11 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
       // foundry module) for these connection names instead of opening a sealed
       // key, pinned to the account's host. Empty = DB-only resolution.
       { name: 'EGRESS_MANAGED_IDENTITY_CONNECTIONS', value: foundryMiConnections }
+      // SSRF filter ranges beyond the built-in list (apps/egress/src/ssrf.ts): the VNet, so an
+      // install on a non-RFC 1918 range is covered, and the ACA platform-reserved range.
+      // 100.64.0.0/10 is already in the built-in list; 100.100.0.0/17 documents the ACA slice.
+      // 10.0.0.0/8 in the built-in list already covers the default VNet prefix.
+      { name: 'EGRESS_EXTRA_BLOCKED_CIDRS', value: '${vnetAddressPrefix},100.100.0.0/17' }
       { name: 'EGRESS_DATABASE_URL', secretRef: 'egress-database-url' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_EXCHANGE_SECRET', secretRef: 'helix-exchange-secret' }
