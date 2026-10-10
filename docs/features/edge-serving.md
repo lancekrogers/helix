@@ -135,14 +135,21 @@ XML can execute script). The split:
   tailwind, Google Fonts).
 - **Image / plugin containment:** enforced `img-src 'self' data: blob:` plus approved origins and
   operator `EDGE_IMG_SRC_EXTRA`; `object-src 'none'`. Top-level navigation, popups/`window.open`,
-  approved origins, WebRTC, and DNS prefetch/preconnect hints remain open (WebRTC and DNS-hint behavior
-  under this policy is untested). The platform does not claim confidentiality against a hostile app
-  author.
+  approved origins, request URLs to permitted CDN hosts (Hypothesis), WebRTC, and DNS
+  prefetch/preconnect hints remain open (WebRTC and DNS-hint behavior under this policy is
+  untested). The platform does not claim confidentiality against a hostile app author.
 
 An app's approved `externalOrigins` (from its manifest, gated through the approvals
-write-gate) extend both `connect-src` and `img-src`. Origins are reduced to bare CSP sources
-(`new URL().origin` — scheme+host+port, path stripped) and invalid entries are dropped
-fail-closed. A same-origin `report-uri /_csp-report` funnels violations to the edge sink.
+write-gate) extend `connect-src` (`https:` and `wss:`) and `img-src` (`https:` only). Origins are
+reduced to bare CSP sources (`new URL().origin` — scheme+host+port, path stripped); wildcard hosts,
+non-`https`/`wss` schemes for `connect-src`, and hostnames outside `[a-z0-9.-]` (aside from IPv6) are
+dropped fail-closed. A same-origin `report-uri /_csp-report` funnels violations to the edge sink.
+The sink caps stored reports at 100 INSERTs per app per 10-minute window (`CSP_REPORT_INSERT_MAX` /
+`CSP_REPORT_INSERT_WINDOW_MS` in `apps/edge/src/serving/cspReportThrottle.ts`); additional reports
+are counted on `helix.edge.csp_reports` with `helix.outcome=dropped` but not persisted. The portal
+**Violations** screen (`GET /api/v1/csp/violations`) aggregates the last 30 days
+(`CSP_VIOLATIONS_LOOKBACK_DAYS`). A report's `blockedUri` can carry the data a page tried to send
+out; admins see it when reviewing violations.
 
 Per-install settings: `EDGE_IMG_SRC_EXTRA` (operator-trusted image hosts, never an image proxy),
 `EDGE_IMG_SRC_ALLOW_ALL` (restores `img-src https: data: blob:` on the enforced header while keeping

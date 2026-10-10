@@ -56,17 +56,19 @@ report-uri /_csp-report
 ```
 
 `<CDNs>` is `cdnjs.cloudflare.com`, `cdn.jsdelivr.net`, `unpkg.com`, `esm.sh`,
-`cdn.tailwindcss.com` — those load without a grant. Approved origins are appended
-to `img-src` and `connect-src`.
+`cdn.tailwindcss.com` — those load without a grant. Approved origins are appended to
+`connect-src` (`https:` and `wss:`) and to `img-src` (`https:` only).
 
 Inline images as `data:` URIs or ship them in the bundle. A remote image needs
 its origin in `externalOrigins`, approved by an admin (an approved origin also
 widens `connect-src` for direct browser calls).
 
-**Other serving rules.** Do not ship a service worker — one you register is
-refused (`403` on a `Service-Worker: script` request). Plain web workers are
-fine. If the app needs to work with no network, ask for the **offline**
-capability instead (below); the platform supplies the worker. A request that
+**Other serving rules.** Do not ship a service worker — registration from your bundle is refused
+(`403` on a `Service-Worker` request or worker `Sec-Fetch-Dest`), and `/_api/fetch/*` refuses
+worker and service-worker loads too. Proxied responses carry
+`content-security-policy: default-src 'none'`, so a proxied body cannot be used as a script,
+worker, or document. Plain web workers are fine. If the app needs to work with no network, ask for
+the **offline** capability instead (below); the platform supplies the worker. A request that
 accepts HTML and matches no asset falls back to `index.html`, so client-side
 routing works. HTML is served `no-cache`; other assets get a short private cache
 with ETags. The path prefixes `/_api/*`, `/_auth/*`, and `/_helix/*` are reserved

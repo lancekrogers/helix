@@ -94,10 +94,15 @@ These are where the security model lives (see `docs/platform-architecture.md` §
 - **Relaxed CSP directives** — inline scripts/styles, event handlers, `eval`, and the curated
   CDN allowlist are deliberate (ADR-0009); containment lives in the data-flow directives
   (`connect-src`, `form-action`, `frame-ancestors`, tightened `img-src`, `object-src 'none'`).
-  Navigation, popups, approved origins, WebRTC, and DNS hints remain exfil channels (architecture
-  §10; WebRTC and DNS-hint behavior under CSP is untested). App code can still send out what its
+  Navigation, popups, approved origins, request URLs to permitted CDN hosts (Hypothesis), WebRTC,
+  and DNS hints remain exfil channels (architecture §10; WebRTC and DNS-hint behavior under CSP is
+  untested). App code can still send out what its
   viewer can read — the platform does not claim confidentiality against a hostile app author. Misuse
   of a capability _within_ its granted scope is also a residual risk.
+- **Fetch-proxy response posture** — `/_api/fetch/*` refuses worker and service-worker destination
+  loads, sets `content-security-policy: default-src 'none'` on every proxied response, and strips
+  `Service-Worker-Allowed` from upstream headers so only the platform offline worker route may emit
+  it.
 - **Dev-only stand-ins** — `apps/dev-idp` (the local OIDC issuer) and the dev AES-GCM secret
   envelope are never deployed. Only report these if the same flaw applies to the production
   path (Entra ID, Key Vault).

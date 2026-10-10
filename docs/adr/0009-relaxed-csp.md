@@ -40,6 +40,11 @@ operator `EDGE_IMG_SRC_EXTRA`. `object-src 'none'` is added on the enforced head
 relaxations: `EDGE_IMG_SRC_ALLOW_ALL` restores `img-src https: data: blob:` (with `object-src 'none'`
 unchanged); `EDGE_IMG_SRC_REPORT_ONLY` keeps the measurement window (the previous open policy enforced, the tightened one as Report-Only) until
 the operator removes it. The CDN `script-src` allowlist is unchanged — narrowing it is a separate
-decision. Residual channels: top-level navigation, popups/`window.open`, approved origins, WebRTC,
-and DNS prefetch/preconnect hints (WebRTC and DNS-hint behavior under this policy is untested). The
+decision. Residual channels: top-level navigation, popups/`window.open`, approved origins, request
+URLs to permitted CDN hosts (Hypothesis), WebRTC, and DNS prefetch/preconnect hints (WebRTC and
+DNS-hint behavior under this policy is untested). The
 warning never to add a hash or nonce to `script-src` still holds.
+
+Proxied `/_api/fetch/*` responses carry `content-security-policy: default-src 'none'` on the edge,
+refuse worker and service-worker loads, and strip `Service-Worker-Allowed` from upstream headers so
+only the platform offline worker route may emit that header.

@@ -210,7 +210,7 @@ looked up:
 | `helix.session.gate_denied` | counter | `reason` |
 | `helix.edge.trust_proxy.unresolved` | observable gauge | — |
 | `helix.app.visits` | counter | `appId`, `outcome` (`recorded` / `failed` / `dropped` / `deduplicated`; the fire-and-forget `app_visits` write, ADR-0050. Alert on a sustained `failed` or `dropped` rate. The owner's numbers come from the table, never this counter) |
-| `helix.edge.csp_reports` | counter | `appId`, `directive` (`img-src` / `connect-src` / `script-src` / `style-src` / `font-src` / `object-src` / `other`), `disposition` (`enforce` / `report` / `unknown`; `report` only during `EDGE_IMG_SRC_REPORT_ONLY`, `enforce` after the tightened policy is on the enforced header). Blocked and document URIs are never recorded. Owner-facing counts come from `csp_reports`, not this counter |
+| `helix.edge.csp_reports` | counter | `appId`, `directive` (`img-src` / `connect-src` / `script-src` / `style-src` / `font-src` / `object-src` / `other`), `disposition` (`enforce` / `report` / `unknown`; `report` only during `EDGE_IMG_SRC_REPORT_ONLY`, `enforce` after the tightened policy is on the enforced header), `helix.outcome` (`recorded` / `dropped` / `failed` — whether the report row was inserted, dropped past the per-app cap, or the insert failed). Blocked and document URIs are never recorded on this counter. Owner-facing counts come from `csp_reports`, not this counter |
 | `helix.consent.operations` | counter | `operation`, `outcome` (ADR-0031 as amended; the portal's first instrument — see the `helix.outcome` vocabularies in `@azx-pbc/shared/telemetry`) |
 
 `appId` is a dimension; **`userOid` never is** — unbounded and personal data, it

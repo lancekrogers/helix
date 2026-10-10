@@ -139,6 +139,8 @@ Two things that look like reasons to skip it, and are not:
 
 ### 2. Roll the apps
 
+If this release tightens `img-src`, read [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy) step 0 first — set `imgSrcReportOnly = true` in your parameter file before rolling the edge image.
+
 ```bash
 for app in edge portal egress; do
   az containerapp update -g <rg> -n "<namePrefix>-$app" \
@@ -184,7 +186,8 @@ here runs automatically — you choose the order and the parameter values.
    migration identity's role name (`helixadmin` by default, the `postgresAdminLogin` parameter) is
    the role the owner policy on `gateway_calls` was created for.
 
-3. **Egress and edge images.** Build and deploy the new egress and edge images. There is no extra data
+3. **Egress and edge images.** Build and deploy the new egress and edge images. If the edge image
+   ships tightened `img-src`, follow [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy) step 0 in your parameter file before rolling the edge. There is no extra data
    migration for the upstream abort or the charging change. New `error` rows carry `;usage=` markers;
    historical rows keep their $0. The new edge image enforces in-flight lease caps from **code
    defaults** (10 concurrent LLM calls per app, 3 per authenticated user) before you apply the Bicep
@@ -219,7 +222,8 @@ SELECT slug FROM apps
    [Configuration](/deploy/configuration). If this template also ships network controls, read
    [Upgrading to the network controls](#upgrading-to-the-network-controls) step 0 first — set
    `egressNsgEnforce = 'off'` until the scratch-copy test passes before any full apply, including
-   this step.
+   this step. If the template also ships tightened `img-src`, set `imgSrcReportOnly = true` in the
+   parameter file first ([image policy step 0](#upgrading-to-the-tightened-image-policy)).
 
 7. **Mixed replicas.** An edge revision without `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` disables the
    platform ceiling on that replica, so a rolling deploy with old and new replicas does not refuse
@@ -292,15 +296,42 @@ requires maintaining `egressAllowedFqdns` (use `just infra egress-hosts`).
 
 ## Upgrading to the tightened image policy
 
-Before rolling the edge image on an **existing** install, set `imgSrcReportOnly = true` in the
-parameter file (or `EDGE_IMG_SRC_REPORT_ONLY=true` on the edge Container App). That restores the
-measurement window: open enforced `img-src` plus a Report-Only tightened policy. Read the Violations
-screen and the `helix.edge.csp_reports` counter for the window (`disposition=report` while the flag
-is on). Pre-grant legitimate image hosts per app, or list operator-trusted hosts in
-`EDGE_IMG_SRC_EXTRA` — never an image proxy. Tell app owners to inline images or ship them in the
-bundle. Then remove the flag and roll the image to enforce `img-src 'self' data: blob:` and
-`object-src 'none'`. One-org installs that accept the open image channel set
-`EDGE_IMG_SRC_ALLOW_ALL=true` instead of enforcing the tight default.
+0. **Hold enforcement until you have read the Violations screen.** Until you have reviewed CSP
+   reports there, set `imgSrcReportOnly = true` in your parameter file before rolling the edge
+   image or running **any** full template apply. That restores the measurement window: open
+   enforced `img-src` plus a Report-Only tightened policy. A hand-set
+   `EDGE_IMG_SRC_REPORT_ONLY=true` on the edge Container App works only until the next full apply —
+   the template re-declares the variable from the params file, so once any apply follows, the flag
+   must live in the parameter file, not only on the Container App.
+
+1. **Audit approved origins that will drop out of CSP.** Before you turn enforcement on, run this
+   read-only query against the install's database and fix or pre-grant anything you still need.
+   It lists `externalOrigins` entries that are not `https:` or `wss:`, or that use a wildcard host
+   (both are omitted from `connect-src` / `img-src`). Origins whose hostname contains characters
+   outside `[a-z0-9.-]` (aside from IPv6 literals) are dropped too — inspect those manually in
+   `capabilities.externalOrigins` if any app relied on them.
+
+```sql
+SELECT slug, o FROM apps, jsonb_array_elements_text(COALESCE(capabilities->'externalOrigins','[]'::jsonb)) o
+ WHERE o !~* '^(https|wss)://' OR o LIKE '%*%';
+```
+
+   Column and JSON paths match `apps/portal/prisma/schema.prisma` (`App.capabilities`); validate
+   on your database before you rely on it in production.
+
+2. **Measurement window.** With `imgSrcReportOnly = true` applied (parameter file or scoped
+   `az containerapp update --set-env-vars`), roll the edge image. Read the Violations screen and the
+   `helix.edge.csp_reports` counter for the window (`disposition=report` while the flag is on).
+   Pre-grant legitimate image hosts per app, or list operator-trusted hosts in `EDGE_IMG_SRC_EXTRA`
+   — never an image proxy. Tell app owners to inline images or ship them in the bundle.
+
+3. **Enforce.** Remove `imgSrcReportOnly` from the parameter file (or set it false) and apply the
+   template, or set `EDGE_IMG_SRC_REPORT_ONLY=false` with a scoped
+   `az containerapp update --set-env-vars`. That switches the enforced header to
+   `img-src 'self' data: blob:` (plus approved origins and extras) and `object-src 'none'`. No
+   further image roll is required unless you are also shipping new edge code. One-org installs that
+   accept the open image channel set `EDGE_IMG_SRC_ALLOW_ALL=true` instead of enforcing the tight
+   default.
 
 Passing these parameters through Container Apps on a live install is **unverified in Azure**.
 

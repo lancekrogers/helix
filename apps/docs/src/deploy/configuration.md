@@ -212,7 +212,7 @@ build-time configuration at all):
 | `EDGE_LLM_MAX_USER_IN_FLIGHT` | `llmMaxUserInFlight` | Cross-replica concurrent LLM calls per authenticated user per app; `0` disables |
 | `EDGE_LLM_MAX_IN_FLIGHT` | `llmMaxInFlight` | Per-replica concurrent LLM cap; `0` disables |
 | `EDGE_LLM_MAX_CALL_MS` | `llmMaxCallMs` | Wall-clock LLM call deadline in ms |
-| `EDGE_IMG_SRC_EXTRA` | `imgSrcExtra` (default empty) | Comma-separated `https` origins appended to every app's enforced `img-src` (not `connect-src`). Never list an image proxy that fetches attacker-chosen URLs |
+| `EDGE_IMG_SRC_EXTRA` | `imgSrcExtra` (default empty) | Comma-separated `https` origins appended to every app's enforced `img-src` in the default and allow-all modes, and only to the Report-Only header in measurement mode (`EDGE_IMG_SRC_REPORT_ONLY`). Not `connect-src`. Never list an image proxy that fetches attacker-chosen URLs |
 | `EDGE_IMG_SRC_REPORT_ONLY` | `imgSrcReportOnly` (default false) | Measurement window: enforces the previous open `img-src` and sends the tightened policy as `Content-Security-Policy-Report-Only`. Set on existing installs before enforcing; remove after reading the Violations screen |
 | `EDGE_IMG_SRC_ALLOW_ALL` | `imgSrcAllowAll` (default false) | Restores `img-src https: data: blob:` on the enforced header (plus approved origins and `EDGE_IMG_SRC_EXTRA`). Gives up the default tight image channel; `object-src 'none'` stays |
 

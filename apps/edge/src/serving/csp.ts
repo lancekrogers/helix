@@ -10,8 +10,9 @@
  * curated CDNs are allowed for generated-app compatibility. By default `img-src`
  * is `'self' data: blob:` plus approved origins and operator `EDGE_IMG_SRC_EXTRA`,
  * with `object-src 'none'`. Top-level navigation, popups/`window.open`, approved
- * origins, WebRTC, and DNS prefetch/preconnect hints remain open channels; the
- * platform does not deliver confidentiality against a hostile app author.
+ * origins, request URLs to permitted CDN hosts (Hypothesis), WebRTC, and DNS
+ * prefetch/preconnect hints remain open channels; the platform does not deliver
+ * confidentiality against a hostile app author.
  *
  * Keep unsafe-inline: the fetch shim and offline registration are inlined so
  * they work on offline startup, and apps may have their own inline scripts.

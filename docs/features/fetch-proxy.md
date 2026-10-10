@@ -33,15 +33,19 @@ decides *whether* the call may happen and to *where*; egress actually makes it.
    (`capabilities.fetch.origins`, projected as `proxyConnections`). Not present ⇒
    `403`, before anything leaves the edge. Direct-CSP origins
    (`externalOrigins`) are a separate list and are *not* proxied.
-4. **Quota.** A per-app `requestsPerDay` budget (block-new/finish-in-flight),
+4. **Worker loads refused.** `Sec-Fetch-Dest` values `worker`, `sharedworker`, and
+   `serviceworker`, and any request carrying a `Service-Worker` header, get `403` before egress
+   (same posture as the asset handler). Navigations that would treat the response as a document are
+   refused too.
+5. **Quota.** A per-app `requestsPerDay` budget (block-new/finish-in-flight),
    counted from `gateway_calls`.
-5. **Concurrency cap (optional).** When `EDGE_FETCH_MAX_APP_IN_FLIGHT` is
+6. **Concurrency cap (optional).** When `EDGE_FETCH_MAX_APP_IN_FLIGHT` is
    positive, the edge holds a Postgres lease on `fetch:app:<appId>` for the
    whole response (including a streamed body) and refuses over-cap calls with
    `429 rate_limited` before minting an instruction. `0` disables — no extra
    database round trip. Lease TTL is ten minutes; a call that outlives it stops
    counting (at most one residual slot per such call).
-6. **Attest + forward.** The edge mints a short-lived signed instruction
+7. **Attest + forward.** The edge mints a short-lived signed instruction
    `(app, user, capability, origin, connection?, request-id)` and forwards the
    request + instruction to egress over the `EgressProvider` HTTP seam. The edge
    has **no grant on `app_secrets`** (it cannot read an app's connection secret)
@@ -53,6 +57,12 @@ decides *whether* the call may happen and to *where*; egress actually makes it.
    secretless, though: it holds its own operational keys (auth/instruction/OIDC)
    and today an over-broad Blob access key (tightening that to a read-only managed
    identity is tracked). (ADR-0001.)
+
+On the way back, the edge sets `content-security-policy: default-src 'none'` on every proxied
+response (a backstop if a worker-destination check is ever bypassed) and strips upstream policy
+headers. `service-worker-allowed` and `alt-svc` are on the shared response blocklist with the other
+relay headers — only the platform offline worker route (`/_helix/sw.js`) emits
+`Service-Worker-Allowed`.
 
 ### `helix-egress` (mechanism plane)
 
@@ -89,7 +99,8 @@ plaintext secrets or the public internet:
    hop-by-hop names, and similar), policy and reporting headers that would apply
    to the app origin if copied through (`clear-site-data`,
    `content-security-policy`, `content-security-policy-report-only`, `refresh`,
-   `report-to`, `reporting-endpoints`, `nel`), while keeping headers apps rely
+   `report-to`, `reporting-endpoints`, `nel`, `service-worker-allowed`, `alt-svc`), while keeping
+   headers apps rely
    on (`link`, `www-authenticate`, `etag`, rate-limit headers, and
    `content-location` with any injected query credential redacted). The body caps
    read only `content-length` (#8), and the injection path still accepts

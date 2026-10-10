@@ -104,7 +104,7 @@ param portalExternal = false
 param allowPublicApps = false
 param allowPasswordApps = false
 // param imgSrcExtra = 'https://images.example.com'  // EDGE_IMG_SRC_EXTRA — operator-trusted image origins; never an image proxy
-// param imgSrcReportOnly = true  // existing installs: measurement window before enforcing; remove after reading the Violations screen
+// param imgSrcReportOnly = true  // existing installs: until you have read the Violations screen, set this before rolling the edge image or any full apply (see apps/docs deploy updates — tightened image policy step 0)
 // param imgSrcAllowAll = true  // one-org installs that accept the open https: image channel
 
 // Azure AI Foundry (ADR-0046) — LLM inference in this subscription instead of

@@ -199,8 +199,9 @@ patterns for compatibility. This policy does not try to establish trust in app c
 
 - `img-src 'self' data: blob:` plus approved origins (and operator `EDGE_IMG_SRC_EXTRA`);
   `object-src 'none'`. Inline/`data:`/blob images and granted hosts load; other remote images do
-  not. Navigation, popups, WebRTC, and DNS hints can still transmit data (untested for WebRTC/DNS
-  under CSP), so the platform does not deliver confidentiality against a hostile app author.
+  not. Navigation, popups, request URLs to permitted CDN hosts (Hypothesis), WebRTC, and DNS hints
+  can still transmit data (untested for WebRTC/DNS under CSP), so the platform does not deliver
+  confidentiality against a hostile app author.
 - `wasm-unsafe-eval` and `worker-src 'self' blob:` allow WebAssembly and ordinary
   workers. Service workers cannot register from blob URLs. The edge rejects
   app-supplied service-worker registration requests because a root-scoped worker
