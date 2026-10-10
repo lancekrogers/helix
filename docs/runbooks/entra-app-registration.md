@@ -250,9 +250,9 @@ Set these in the M5 ACA app configuration / Key Vault. **The dev
 | `EDGE_AUTH_SECRET` | fresh base64 ≥32 bytes (internal HKDF key, **not** an Entra secret) |
 | `EDGE_OIDC_ALLOW_INSECURE` | unset |
 
-Confirm the base-domain/port config produces the portless callback
-`https://auth.azx.helix.azxlabs.io/callback` to match Reg 1 (`apps/edge/src/server.ts`,
-`publicOrigin`).
+Confirm the control-domain/port config produces the portless callback
+`https://auth.<control domain>/callback` to match Reg 1 (`apps/edge/src/server.ts`,
+`controlOrigin`).
 
 ### Portal (`apps/portal/src/plugins/auth.ts`)
 

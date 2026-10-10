@@ -1,6 +1,6 @@
 # Edge serving
 
-> **Related ADRs:** [ADR-0017](../adr/0017-registry-listen-notify-projection.md) (registry projection) · [ADR-0025](../adr/0025-registry-projection-hardening.md) (projection hardening) · [ADR-0009](../adr/0009-relaxed-csp.md) (relaxed CSP) · [ADR-0019](../adr/0019-subdomain-per-app-isolation.md) (subdomain isolation) · [ADR-0020](../adr/0020-static-only-apps-v1.md) (static-only apps) · [ADR-0003](../adr/0003-dependency-minimal-edge.md) (dependency-minimal edge) · [ADR-0002](../adr/0002-postgres-role-split-rls.md) (Postgres role split) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split).
+> **Related ADRs:** [ADR-0017](../adr/0017-registry-listen-notify-projection.md) (registry projection) · [ADR-0025](../adr/0025-registry-projection-hardening.md) (projection hardening) · [ADR-0009](../adr/0009-relaxed-csp.md) (relaxed CSP) · [ADR-0019](../adr/0019-subdomain-per-app-isolation.md) (subdomain isolation) · [ADR-0020](../adr/0020-static-only-apps-v1.md) (static-only apps) · [ADR-0003](../adr/0003-dependency-minimal-edge.md) (dependency-minimal edge) · [ADR-0002](../adr/0002-postgres-role-split-rls.md) (Postgres role split) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split) · [ADR-0028](../adr/0028-deployment-model-customer-deployed.md) (per-install domain split).
 
 The edge (`apps/edge`) routes requests by hostname, authenticates app users,
 streams assets from Blob, and applies the platform CSP. Missing and archived
@@ -14,11 +14,24 @@ See [`apps/edge/README.md`](../../apps/edge/README.md) for the full request flow
 
 ### Host classification (the two-router discipline)
 
-Every request is classified **once** at an `onRequest` hook into `app` / `auth` / `platform`,
-and the two worlds never mix — platform handlers are unreachable on app hosts and vice versa
-(architecture §3, decision 12). `apps/edge/src/app.ts:156` decorates `req.hostClass`;
-`apps/edge/src/routing/hosts.ts` does the parsing. Reserved subdomains (`auth`, `portal`,
-`api`, `www`) are protected; an unmatched slug falls through to `platform`.
+Every request is classified **once** at an `onRequest` hook into `app` / `legacy-app` / `auth` /
+`platform`, and the two worlds never mix — platform handlers are unreachable on app hosts and vice
+versa (architecture §3, decision 12). `apps/edge/src/app.ts` decorates `req.hostClass`;
+`apps/edge/src/routing/hosts.ts` does the parsing via `classifyHost(host, baseDomain,
+controlDomain, legacyAppRedirect)`. Reserved subdomains (`auth`, `portal`, `api`, `www`) are
+protected under the apps suffix; in split layout `auth.<appsDomain>` is platform, not auth. An
+unmatched slug falls through to `platform`.
+
+When `EDGE_LEGACY_APP_REDIRECT` is on in a split install, `legacy-app` hosts run a GET/HEAD-only
+307 to the same path on the apps domain (`routing/legacyRedirect.ts`), with `Cache-Control:
+no-store` and the `helix.edge.legacy_app_redirects` counter (`outcome` dimension). Paths starting
+with `_` are never redirected. `publicOrigin` refuses reserved labels so app URL builders cannot
+silently emit control-host origins.
+
+| Setting | Default | Failure direction |
+| --- | --- | --- |
+| `EDGE_CONTROL_DOMAIN` | unset → `EDGE_BASE_DOMAIN` | Unset or blank: single-domain layout. Control domain under the apps domain or invalid hostname: edge refuses to boot |
+| `EDGE_LEGACY_APP_REDIRECT` | off | Off: old app hosts on the control domain 404. On (split only): 307 for live apps. Ignored without a split |
 
 A consequence worth knowing: `/health` returns the platform health JSON on platform/auth hosts,
 but on an app host it serves the app's own `/health` file (or the SPA fallback) — see

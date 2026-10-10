@@ -122,10 +122,11 @@ All three containers run on Azure Container Apps for v1 (AKS if/when needed), ke
 
 ### 4.1 Routing and TLS
 
-- Serve apps on a dedicated domain, such as `azx.helix.azxlabs.io`, separate from
-  corporate sites. This separates branding, cookies, and browser policies.
-  Entra credentials are entered only on the identity provider's domain;
-  shared app passwords use the platform's distinct login form.
+- Serve apps on a dedicated domain per deployment (the `EDGE_BASE_DOMAIN` / `appsDomain`
+  parameter), optionally on a **second** site from the control hosts (`auth.`, `portal.`,
+  `dev-api.`) when the operator configures `hostedAppsDomain` / `EDGE_CONTROL_DOMAIN`. This
+  separates branding, cookies, and browser policies. Entra credentials are entered only on the
+  identity provider's domain; shared app passwords use the platform's distinct login form.
 - Wildcard DNS routes `*.<base>` to the edge. A wildcard certificate covers app
   hosts; the deployed setup uses ACME DNS-01 renewal.
 - Give each app its own subdomain and browser origin to separate DOM, storage,
@@ -144,11 +145,11 @@ The edge authenticates visitors. Apps do not implement login.
 
 The name `private` is reserved for future owner-plus-admin access; see TODO.md.
 
-For OIDC, use one callback on `auth.<base>` because Entra requires exact registered
-redirect URLs. After login, a short-lived, signed, single-use, audience-bound
-handoff token transfers the result to the app host. Validate app and return-path
-parameters to prevent open redirects. Appendix A describes the flow and required
-adversarial tests.
+For OIDC, use one callback on `auth.<control domain>` because Entra requires exact registered
+redirect URLs. After login, a short-lived, signed, single-use, audience-bound handoff token
+transfers the result to the app host on the apps domain (the same hostname when not split).
+Validate app and return-path parameters to prevent open redirects. Appendix A describes the flow
+and required adversarial tests.
 
 Sessions use host-only `__Host-` cookies. Sibling subdomains are still same-site,
 so additional controls are required:
@@ -357,7 +358,7 @@ Portability rule: **Azure services may appear only behind internal interfaces** 
 | 8 | One org, but app-id partitioning everywhere | Multi-tenant now | Every row/blob/audit record keyed by app ID from day one; adding an org ID above it later is additive, not a migration. |
 | 9 | Dedicated apps domain (`azx.helix.azxlabs.io`) | Subdomain of corporate domain (`apps.azx.io`) | Reputation and security isolation from the main brand (§4.1): an ugly or compromised app can't taint `azx.io`, and app-domain cookies/policies are fully separated from corporate properties. Cost: one more domain to own and explain. |
 | 10 | Upload-only deploys in v1 | Git-connect + hosted builds | Hosted builds = operating a CI system + sandboxing arbitrary code execution; high effort, blocks nothing. `helix deploy` from the user's own CI gives a Git workflow without platform build infra. Revisit at v2. |
-| 11 | No per-app vanity domains; the *base* domain is a per-deployment parameter | Per-app domains (`tool.example.com`) | **Per-app vanity domains stay rejected** — one app reachable at two origins reintroduces origin ambiguity and breaks wildcard-cert simplicity. But the base domain is **not** hardwired: it is a deploy-time parameter (`EDGE_BASE_DOMAIN`), so each deployment serves apps at `<app>.<base>` — our reference deployment at `<app>.azx.helix.azxlabs.io`, a customer-cloud install at `<app>.helix.<customer-domain>`. One canonical origin per app whatever the base. This is the parameterization ADR-0028 makes explicit: "custom domains" as a *feature* still doesn't exist; there is only *this deployment's* domain. |
+| 11 | No per-app vanity domains; the *base* domain is a per-deployment parameter | Per-app domains (`tool.example.com`) | **Per-app vanity domains stay rejected** — one app reachable at two origins reintroduces origin ambiguity and breaks wildcard-cert simplicity. But the apps domain is **not** hardwired: it is a deploy-time parameter (`EDGE_BASE_DOMAIN`), with an optional **control** domain (`EDGE_CONTROL_DOMAIN` / `hostedAppsDomain`) when apps move to a separate site. Each deployment serves apps at `<app>.<apps-domain>` — the reference install at `<app>.azx.helix.azxlabs.io` until split, a customer install at `<app>.helix.<customer-domain>`. One canonical origin per app. ADR-0028 makes this explicit: per-app vanity domains as a *feature* still do not exist; there is only *this deployment's* topology. |
 | 12 | Three containers: `helix-edge` + `helix-portal` + `helix-egress` | One monolith, or 4+ services | Split follows the trust boundary: untrusted-facing data plane runs unprivileged and rarely restarts; privileged control plane iterates fast without killing in-flight LLM streams; the egress mechanism plane isolates the two things dangerous to co-locate with a public-facing process — plaintext secrets and outbound network — in its own network zone. One process = shared fate and blast radius; a *generic* gateway split would be internal hops for nothing, but egress earns its split with a genuinely different posture (§3). Edge/portal may still ship as one binary in v0; egress is its own container from day one. |
 
 ---

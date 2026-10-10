@@ -121,6 +121,10 @@ default. See the [configuration reference](/deploy/configuration#cost).
   gets its own origin — deliberate isolation, since every hosted app is
   untrusted code: the browser's same-origin policy is what keeps one app's
   code away from another app's data, and the platform manages it all.
+  Optionally you may add a **second** domain so hosted apps sit on their own site
+  while control hosts stay on the first — see `hostedAppsDomain` in
+  [Configuration](/deploy/configuration) and [Upgrading to hosted-app
+  containment](/deploy/updates#upgrading-to-hosted-app-containment).
 - `openssl` and `python3` on the machine you deploy from (the database
   bootstrap script uses both). Everything else runs inside Azure.
 
@@ -158,7 +162,8 @@ Copy `main.bootstrap.bicepparam` and set, at minimum:
 - Names: `namePrefix`, `storageAccountName`, `platformVaultName`,
   `connectionsVaultName`, `postgresServerName` (vault and storage names are
   globally unique).
-- `appsDomain` — your apps domain.
+- `appsDomain` — your control domain (or your only domain in the single-domain layout).
+- `hostedAppsDomain` — optional; when set, apps live here and `appsDomain` is control-only.
 - The Entra ids from step 1: `edgeOidcClientId`, `portalOidcAudience` (the
   bare client-id GUID), `portalAdminGroupId` (`platform-admin`),
   `azxCliClientId`, `azxWebClientId`. (The edge OIDC **certificate pair** is a
@@ -326,9 +331,10 @@ that routine is in [Deploying updates](/deploy/updates).
 
 ## Step 7: DNS and TLS
 
-1. **Delegate the domain.** In the parent zone, add NS records for
+1. **Delegate the domain(s).** In the parent zone, add NS records for
    `<appsDomain>` pointing at the nameservers in the deployment output
-   `dnsNameServers`.
+   `dnsNameServers`. With `hostedAppsDomain`, delegate that zone too before running
+   either certbot job.
 2. **Bootstrap the wildcard certificate.** A scheduled job (`certbot`) issues
    and renews `*.<appsDomain>` via Let's Encrypt DNS-01 and binds it. It needs
    the domain verified first: take the `customDomainVerificationId` from the

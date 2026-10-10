@@ -223,7 +223,9 @@ SELECT slug FROM apps
    [Upgrading to the network controls](#upgrading-to-the-network-controls) step 0 first — set
    `egressNsgEnforce = 'off'` until the scratch-copy test passes before any full apply, including
    this step. If the template also ships tightened `img-src`, set `imgSrcReportOnly = true` in the
-   parameter file first ([image policy step 0](#upgrading-to-the-tightened-image-policy)).
+   parameter file first ([image policy step 0](#upgrading-to-the-tightened-image-policy)). If it also
+   ships the apps/control domain split, read [Upgrading to hosted-app
+   containment](#upgrading-to-hosted-app-containment) before changing `hostedAppsDomain`.
 
 7. **Mixed replicas.** An edge revision without `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` disables the
    platform ceiling on that replica, so a rolling deploy with old and new replicas does not refuse
@@ -251,7 +253,9 @@ repository. Nothing here runs automatically.
    non-production copy of the install and run `just infra net-verify` there, set
    `egressNsgEnforce = 'off'` in your parameter file before **any** full template apply — including
    step 6 of [Upgrading to the LLM spend controls](#upgrading-to-the-llm-spend-controls) if that
-   apply ships this template. Also decide `deployNetprobe`: the probe job and its two log alerts
+   apply ships this template, and before the second certbot run in [Upgrading to hosted-app
+   containment](#upgrading-to-hosted-app-containment) when that template ships the firewall-tier
+   platform lists. Also decide `deployNetprobe`: the probe job and its two log alerts
    deploy by default (`deployNetprobe` true, requires `deployApps`), and the no-recent-success alert
    fires until the first scheduled or on-demand run.
 
@@ -334,6 +338,87 @@ SELECT slug, o FROM apps, jsonb_array_elements_text(COALESCE(capabilities->'exte
    default.
 
 Passing these parameters through Container Apps on a live install is **unverified in Azure**.
+
+## Upgrading to hosted-app containment
+
+These notes cover the three containment parts shipped together: response-header stripping,
+tightened CSP, and the optional apps/control domain split. Nothing runs automatically — you choose
+the order and parameter values.
+
+### Part 3 — proxied response headers
+
+Deploy the new egress and edge images. No install setting is involved.
+
+The edge strips a fixed blocklist of response headers on every `/_api/fetch/*` response (the list lives
+in `packages/shared/src/fetch.ts`). Browsers do not act on a `Link` header in a `fetch()` response,
+so `link` is deliberately **not** stripped — pagination that relies on `rel="next"` keeps working. If
+an upstream vendor expected one of the other stripped headers to reach app JavaScript (unlikely), the
+blocklist is the single source of truth.
+
+### Part 2 — CSP (`img-src` / `object-src`)
+
+Follow [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy): step 0
+(`imgSrcReportOnly = true`) before any edge roll or full apply that ships the measurement build; then
+the Violations screen and `helix.edge.csp_reports` (`disposition=report` during measurement); then
+enforce (remove the flag or set `EDGE_IMG_SRC_REPORT_ONLY=false`). Pre-grant per app or list
+operator-trusted image hosts in `EDGE_IMG_SRC_EXTRA` — never an image proxy that fetches
+attacker-chosen URLs. One-organization installs that accept the open channel set
+`EDGE_IMG_SRC_ALLOW_ALL=true`. Parameter names in Bicep: `imgSrcExtra`, `imgSrcReportOnly`,
+`imgSrcAllowAll`.
+
+### Part 1 — domain split
+
+**New install**
+
+1. Choose two domains, or one domain plus a delegated subdomain you will list on the Public Suffix
+   List (**operator-run**; without that entry the two remain the same site and host-only cookies do
+   not stop a `Domain=` cookie from reaching the control hosts). Create and delegate both zones.
+2. Set `appsDomain` (the **control** domain: `auth.`, `portal.`, `dev-api.`) and `hostedAppsDomain`
+   (the apps domain) in the parameter file. Deploy with `wildcardTlsBound` and `hostedAppsTlsBound`
+   `false`.
+3. On a firewall install, apply the release that carries the per-subnet platform FQDN lists (ACME,
+   Resource Manager, Entra) **before** the second certbot run, or issuance can fail silently
+   (**operator-run**; prerequisite from the network-controls work).
+4. Run the first certbot job (`<namePrefix>-certbot`), then the second (`<namePrefix>-ap-certbot`);
+   flip both bound flags and redeploy. The TLS what-if canary must never show
+   `Delete properties.configuration.ingress.customDomains` for either binding (**unverified in Azure**
+   with two bindings on one Container App).
+5. Register Entra redirect URIs for the control domain as in [Entra setup](/deploy/entra-setup).
+6. Submit the apps zone to the Public Suffix List when it is a delegated subdomain (**operator-run**).
+
+**Existing install — keep the current domain as control** (sign-in, portal, dev-api, Entra and vendor
+callbacks stay put; only app URLs move)
+
+0. If this release also ships CSP or network controls, read [Upgrading to the tightened image
+   policy](#upgrading-to-the-tightened-image-policy) step 0 and [Upgrading to the network
+   controls](#upgrading-to-the-network-controls) step 0 before any full apply that carries those
+   templates.
+1. Deploy new edge and portal images with all split settings absent; confirm a no-op before changing
+   parameters.
+2. Choose and delegate the apps domain; add the apps zone and its `asuid` record.
+3. Add the second certbot instance, run it, flip `hostedAppsTlsBound`.
+4. **Operator-run, on a staging app:** verify cross-site sign-in in Chrome, Firefox, and Safari.
+   Tracking-protection heuristics may treat an auth host that redirects without a click as a bounce
+   tracker — symptom: login loop at `/start`, visible in the `helix.session.gate_denied` counter and the
+   `helix.auth.handoff.complete` span (**unverified in Safari, Firefox and Chrome on real domains**).
+5. In one release, set `legacyAppRedirect`, `hostedAppsDomain`, portal `CONTROL_PUBLIC_BASE`, and
+   `APP_PUBLIC_BASE` (Bicep sets both from the parameter pair). Edge and portal must flip together.
+6. Tell app owners URLs changed; update `availabilityExtraTargets` (it holds app URLs) and any
+   external registration by old host.
+7. Watch `helix.edge.legacy_app_redirects`. When `redirected` has been near zero for your chosen
+   period: set `legacyAppRedirect` to `false` and re-apply; delete the control zone's `*` A record
+   by hand (a re-apply does not delete DNS records); **keep** the edge's `*.<control domain>` binding
+   — `auth.<control domain>` terminates TLS through it and certbot re-binds it on every run; keep the
+   `auth`, `portal`, and `dev-api` records.
+
+**Data migration:** none — apps are keyed by slug and id.
+
+**Compatibility:** sessions on old hosts are lost; handoff tokens in flight at cutover fail; browser
+state on the old origin does not carry over; `/_api` clients that hard-coded the old host break
+(relative URLs are correct); the grace redirect softens GET navigations only.
+
+Split topology on Azure (**unverified in Azure** until exercised on your install): two wildcard
+certificates, two certbot jobs, two declarative bindings when both TLS gates are on.
 
 ## What a rollout actually does
 
@@ -576,8 +661,9 @@ What the preview genuinely cannot answer:
 
 ### The TLS canary
 
-On an install with `wildcardTlsBound: true`, the what-if must **not** show a
-delete of `properties.configuration.ingress.customDomains`.
+On an install with `wildcardTlsBound: true` (and `hostedAppsTlsBound: true` when
+`hostedAppsDomain` is set), the what-if must **not** show a delete of
+`properties.configuration.ingress.customDomains` for **either** wildcard binding.
 
 **If it does, the gate is off — stop, do not apply.** With the gate on, the
 template declares the bindings and an apply preserves them (verified by an

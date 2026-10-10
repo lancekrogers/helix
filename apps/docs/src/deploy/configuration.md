@@ -55,7 +55,10 @@ updates](/deploy/updates#when-you-do-need-a-full-apply).
 
 | Parameter | Default | What it is |
 | --- | --- | --- |
-| `appsDomain` | — | Your apps domain. Apps live on `<slug>.<appsDomain>`, sign-in on `auth.<appsDomain>`, the portal on `portal.<appsDomain>` |
+| `appsDomain` | — | Your control domain when split: sign-in on `auth.<appsDomain>`, portal on `portal.<appsDomain>`. When `hostedAppsDomain` is empty, apps also live on `<slug>.<appsDomain>` (single-domain layout) |
+| `hostedAppsDomain` | `''` | Optional apps-only domain. Empty: apps stay on `appsDomain`. Set: apps live on `<slug>.<hostedAppsDomain>` and `appsDomain` is the control domain |
+| `hostedAppsTlsBound` | `false` | Second ADR-0044 gate for `*.<hostedAppsDomain>` on the edge. `true` only after the second certbot run; `true` without a certificate fails the edge PUT loudly. Meaningful only with `hostedAppsDomain` (**unverified in Azure**) |
+| `legacyAppRedirect` | `false` | `307` from old `<slug>.<appsDomain>` to the apps domain (`EDGE_LEGACY_APP_REDIRECT`). Split only; off leaves legacy hosts on 404 |
 | `deployCertbot` | `true` | The scheduled job that issues and renews the `*.<appsDomain>` Let's Encrypt certificate via DNS-01 |
 | `acmeEmail` | *(empty)* | Required for the certificate — the job is skipped without it |
 | `acmeServer` | Let's Encrypt **staging** | Switch to `https://acme-v02.api.letsencrypt.org/directory` once the flow is validated |
@@ -70,6 +73,10 @@ two-phase flag. While it is `false` (a fresh install), the certbot job makes
 the bindings at runtime — but a full template re-apply **strips** them. After
 the first successful certbot run, set it to `true` and re-apply; from then on
 the template declares the bindings itself and re-applies preserve them.
+
+With `hostedAppsDomain`, repeat the same pattern for `hostedAppsTlsBound` and the
+`<namePrefix>-ap-certbot` job on the apps zone. The TLS what-if canary applies to **both**
+bindings when both gates are on.
 
 Set it literally in `main.bicepparam`, never from an environment variable — a
 set-but-blank variable reads as `false`, and that is the direction that wipes
@@ -203,7 +210,9 @@ build-time configuration at all):
 
 | Variable | Set from | If absent |
 | --- | --- | --- |
-| `APP_PUBLIC_BASE` | `https://<appsDomain>` | The portal refuses to boot |
+| `APP_PUBLIC_BASE` | `https://<hostedAppsDomain>` when set, else `https://<appsDomain>` | The portal refuses to boot |
+| `CONTROL_PUBLIC_BASE` | `https://<appsDomain>` when `hostedAppsDomain` is set | Single-domain: defaults to `APP_PUBLIC_BASE`. Split: invalid URL, scheme/port mismatch, or control host under the apps host → boot failure; one-sided with the edge → vendor rejects the callback |
+| `EDGE_CONTROL_DOMAIN` | `appsDomain` when split (edge env) | Unset on the edge → same as `EDGE_BASE_DOMAIN`. Invalid or control under apps → edge refuses to boot |
 | `DEV_API_PUBLIC_BASE` | set when `deployDevGateway` | The SPA reports dev mode as disabled |
 | `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` | No spend line on the Activity page |
 | `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` | `llmDefaultDollarsPerDay` | Apps with no manifest `dollarsPerDay` use the install default ($50/day unless raised); `0` on the parameter means unset is unlimited |

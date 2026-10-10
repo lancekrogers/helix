@@ -68,9 +68,9 @@ must not fall through to a blob key named `_api/me`.
 Read the primitives before the orchestration, then the enforcement, then the tests:
 
 1. **`apps/edge/src/config.ts`** — what's configured, the fail-closed stances (auth block
-   all-or-nothing; HTTPS-only / TLS-required-in-dev), and `publicOrigin` (URLs are built
-   from config, **never** from request headers — this matters for redirect/audience/Origin
-   integrity).
+   all-or-nothing; HTTPS-only / TLS-required-in-dev), and `publicOrigin` / `controlOrigin`
+   (app URLs vs auth-host URLs are built from config, **never** from request headers — this
+   matters for redirect/audience/Origin integrity).
 2. **`apps/edge/src/auth/secrets.ts`** — one `EDGE_AUTH_SECRET` → HKDF → purpose-bound
    keys (`flowKey`, `handoffKey`). Domain separation is why a flow token can't be replayed
    as a handoff token. (The egress instruction key is derived the same way from a
@@ -327,7 +327,8 @@ checks — verify each is present on **every** capability (`llm`, `data`, `fetch
   capability handler must never trust an app-supplied identity, only the `Caller`.
 - **Origin/CSRF.** `/_api/*` is same-origin by design, so a mutation must carry an `Origin`
   that equals the app's **own** origin — and that origin is built from config
-  (`publicOrigin` + the registry's slug), **never** from request headers. `SameSite=Lax`
+  (`publicOrigin` + the registry's slug for app hosts; auth-host URLs use `controlOrigin`),
+  **never** from request headers. `SameSite=Lax`
   does not stop a *sibling* subdomain's form/fetch riding the session, so this check (plus
   `form-action 'self'` in CSP) is what does. Confirm it's enforced before any state change
   and can't be satisfied by a missing/empty Origin.

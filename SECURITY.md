@@ -68,7 +68,9 @@ These are where the security model lives (see `docs/platform-architecture.md` §
   security-sensitive code in the platform.
 - **Cross-app isolation** — subdomain-per-app origins, host-only cookies (cookie
   tossing/shadowing), Origin validation + `form-action` at the gateway, and the block on
-  app-supplied service-worker registration.
+  app-supplied service-worker registration. An install may optionally serve apps from a separate
+  domain from the control hosts; that closes cookie-bomb and reputation blast radius only when the
+  apps domain is a separate registrable domain or a Public Suffix List entry.
 - **The serving path** — the auth gate before any asset is served, CSP injection on every app
   response, and host-routing confusion (app content reachable on the auth/portal hosts, gated
   content served without a session, version/pointer mixups).
@@ -108,8 +110,9 @@ These are where the security model lives (see `docs/platform-architecture.md` §
   path (Entra ID, Key Vault).
 - **Known, tracked gaps** — before reporting a _missing_ control, check [`TODO.md`](TODO.md);
   known items include per-app RBAC (reads are still authenticated-only, ADR-0007 residual),
-  confirming `deployFirewall` is on in the live deployments, and Public Suffix List
-  submission. (Admin per-user session revocation shipped — the portal Sessions screen —
+  confirming `deployFirewall` is on in the live deployments, and **operator-run** Public Suffix
+  List submission when the apps zone is a delegated subdomain (required for same-site separation).
+  (Admin per-user session revocation shipped — the portal Sessions screen —
   and is no longer a gap.) A bypass of a control that _is_ built
   remains a valid report.
 - **The usual exclusions** — volumetric DoS, unverified scanner output, social engineering,

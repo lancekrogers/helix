@@ -451,7 +451,28 @@ silent-wipe one).
 **The canary for the gate's state:** a what-if on a gated install must never show
 `Delete properties.configuration.ingress.customDomains`. If it does, **the gate is
 off — stop, do not apply.** (On a gated install the declarative set matches the
-live bindings, so that Delete line is impossible unless the flag is wrong.)
+live bindings, so that Delete line is impossible unless the flag is wrong.) With
+`hostedAppsDomain` set, the edge carries **two** wildcard bindings — run the same
+check for both; **unverified in Azure** that two wildcard custom domains on
+different certificates bind on one Container App.
+
+### Two domains (`hostedAppsDomain`)
+
+When `hostedAppsDomain` is non-empty, `appsDomain` is the **control** domain (`auth.`,
+`portal.`, `dev-api.`) and apps live at `<slug>.<hostedAppsDomain>`. The template instantiates
+`dns.bicep` and `certbot.bicep` twice:
+
+- **Control zone** — wildcard `*` (while `legacyAppRedirect` is on), `auth`, `portal`, `dev-api`,
+  `asuid`. Cert name `wildcard-<control with dashes>`. Job `<namePrefix>-certbot`. Gate
+  `wildcardTlsBound`.
+- **Apps zone** — wildcard `*` and `asuid` only. Cert name `wildcard-<hostedAppsDomain with
+dashes>`. Job `<namePrefix>-ap-certbot` (half-hour cron offset from the control job). Gate
+  `hostedAppsTlsBound`. Portal and dev-gateway bindings stay on the control cert.
+
+Order: deploy with both gates false → run control certbot → flip `wildcardTlsBound` → run apps
+certbot → flip `hostedAppsTlsBound`. Each cert name is computed once in `main.bicep` and passed to
+its job and its declarative edge binding (ADR-0044 per cert). **Unverified in Azure** for the full
+two-binding path.
 
 ## Container shutdown (graceful drain)
 
@@ -510,11 +531,12 @@ know this install's domain at build time — there are deliberately no `VITE_*`
 build args. It reads the topology at runtime from the public
 `GET /api/v1/config`, which the template feeds via three portal env vars:
 
-| Env var                    | Set from                                                                 | Absent means                                           |
-| -------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------ |
-| `APP_PUBLIC_BASE`          | `https://<appsDomain>`                                                   | **Boot failure** — the portal refuses to start in prod |
-| `DEV_API_PUBLIC_BASE`      | `https://dev-api.<appsDomain>`, or `''` when `deployDevGateway` is false | The SPA says dev mode isn't enabled on this deployment |
-| `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` (default `1000`)                                 | No spend watch line on the admin Activity page         |
+| Env var                    | Set from                                                                 | Absent means                                                                                                                               |
+| -------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `APP_PUBLIC_BASE`          | `https://<hostedAppsDomain>` when set, else `https://<appsDomain>`       | **Boot failure** — the portal refuses to start in prod                                                                                     |
+| `CONTROL_PUBLIC_BASE`      | `https://<appsDomain>` when `hostedAppsDomain` is set                    | Absent in single-domain layout. When split: **boot failure** if invalid; vendor OAuth callback fails at the vendor if only one side is set |
+| `DEV_API_PUBLIC_BASE`      | `https://dev-api.<appsDomain>`, or `''` when `deployDevGateway` is false | The SPA says dev mode isn't enabled on this deployment                                                                                     |
+| `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` (default `1000`)                                 | No spend watch line on the admin Activity page                                                                                             |
 
 `APP_PUBLIC_BASE` also drives the `url` field on every app the API returns, so a
 redeployment onto a different `appsDomain` needs no client or image change.
@@ -932,19 +954,19 @@ existed pick it up on their own; nothing needs restarting.
 
 ### 7. DNS + TLS
 
-- Delegate `azx.helix.azxlabs.io` (a subdomain of `azxlabs.io`) by adding NS
-  records for `azx.helix` in the parent `azxlabs.io` Cloudflare zone, pointing at
-  the deployment output `dnsNameServers` — not at the registrar.
-- Bind the wildcard cert (`*.azx.helix.azxlabs.io`) and ACA custom domains — the
-  `deployCertbot` job does this (see "Wildcard TLS"). Supply
-  `domainVerificationId` to write the `asuid` TXT record ACA needs.
-  A custom-domain binding is **per container app**, so the job binds each plane
-  that has its own external ingress: the edge wildcard always, plus
-  `portal.<appsDomain>` when `portalExternal` and `dev-api.<appsDomain>` when
-  `deployDevGateway`. Nothing to bind by hand.
-- **Delegation must exist before the first certbot run** — Let's Encrypt has to
-  resolve the DNS-01 TXT in the Azure zone publicly, so a cert issued before the
-  NS records propagate will fail validation.
+- Delegate the control zone (`appsDomain` in the params file — your control domain when
+  `hostedAppsDomain` is set). With a split, also delegate `hostedAppsDomain` as a second zone;
+  both need NS records at the parent before any certbot run (**unverified in Azure** for the
+  two-zone path).
+- Bind the wildcard cert (`*.<zone>`) and ACA custom domains — the `deployCertbot` job(s) do this
+  (see "Wildcard TLS"). Supply `domainVerificationId` to write the `asuid` TXT record ACA needs.
+  A custom-domain binding is **per container app**, so the job binds each plane that has its own
+  external ingress: the edge wildcard always, plus `portal.<controlDomain>` when `portalExternal`
+  and `dev-api.<controlDomain>` when `deployDevGateway`. A split adds a second edge wildcard on
+  `*.<hostedAppsDomain>`. Nothing to bind by hand.
+- **Delegation must exist before the first certbot run** — Let's Encrypt has to resolve the DNS-01
+  TXT in the Azure zone publicly, so a cert issued before the NS records propagate will fail
+  validation.
 
 ## Telemetry (ADR-0037)
 
@@ -1049,11 +1071,11 @@ per execution; five locations every five minutes is ~43k executions/month per
 URL, which is what `availabilityTestFrequencySeconds` and
 `availabilityTestLocations` control.
 
-| Probed                                    | When                                                                      |
-| ----------------------------------------- | ------------------------------------------------------------------------- |
-| `https://auth.<appsDomain>/health`        | always                                                                    |
-| `https://portal.<appsDomain>/health`      | `portalExternal=true`                                                     |
-| whatever `availabilityExtraTargets` lists | e.g. a real hosted app, which is the only way to cover Blob asset serving |
+| Probed                                    | When                                                                                                                                    |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `https://auth.<appsDomain>/health`        | always                                                                                                                                  |
+| `https://portal.<appsDomain>/health`      | `portalExternal=true`                                                                                                                   |
+| whatever `availabilityExtraTargets` lists | e.g. a real hosted app, which is the only way to cover Blob asset serving — update these URLs when app hosts move to `hostedAppsDomain` |
 
 Three things about that table are load-bearing:
 

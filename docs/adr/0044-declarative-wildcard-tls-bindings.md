@@ -95,3 +95,13 @@ those planes are external — exactly the set the job binds today.
 - No new telemetry: this moves control-plane declarativity, adds no runtime seam, and
   the existing TLS-expiry availability test already monitors the outcome rather than the
   mechanism.
+
+## Amendment (2026-10-10) — one certificate and binding pair per domain
+
+When `hostedAppsDomain` is set, the edge carries **two** wildcard custom domains on **two**
+environment-store certificates. `main.bicep` computes each cert name once (`wildcard-<domain with
+dashes>`) and passes it to that zone's certbot job and to its declarative edge binding.
+`hostedAppsTlsBound` is the second gate beside `wildcardTlsBound` — same bootstrap semantics, same
+what-if canary (`Delete properties.configuration.ingress.customDomains` must never appear for either
+binding on a gated install). **Unverified in Azure:** two wildcard domains on different certificates
+binding on one Container App.

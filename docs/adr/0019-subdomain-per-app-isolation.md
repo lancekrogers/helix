@@ -37,3 +37,12 @@ A review proposed rendering each untrusted bundle in a sandboxed `<iframe>` with
 - The sandboxed-iframe pattern (Google SafeContentFrame / double-key) is for a **trusted page embedding untrusted content**; Helix is the inverse — the untrusted app **is** the top-level navigable site (this ADR), and CSP already sets `frame-ancestors 'none'` (apps refuse framing).
 - The containment that actually applies is the **separate eTLD+1 move above** (#16) + strict CSP data-flow directives + ADR-0020 (no server-side untrusted execution). Browser-side XSS in a site the user navigated to directly is the user's risk by design, bounded by origin/site isolation, not by iframe sandboxing.
 - **Narrow future slice:** if the *portal* ever embeds an unpromoted app for preview inside the control plane, sandbox-without-`allow-same-origin` is the right control for *that* surface — a separate forward-compat item, not a precedent for the hosting model.
+
+## Amendment (2026-10-10) — the apps/control split is implemented
+
+The per-deployment site split described in the 2026-07-22 reframing is now shipped: optional
+`hostedAppsDomain` / `EDGE_CONTROL_DOMAIN`, host classification, `controlOrigin`, portal
+`CONTROL_PUBLIC_BASE`, optional legacy redirect, and operator rollout notes. Defaults preserve the
+single-domain layout. Setting names, boot rules, PSL requirement, and what was tested locally are
+recorded in the domain-split lines of [ADR-0028](0028-deployment-model-customer-deployed.md)
+(Amendment 2026-10-09).
