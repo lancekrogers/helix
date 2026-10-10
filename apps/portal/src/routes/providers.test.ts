@@ -306,6 +306,22 @@ describe("the fixed callback hint", () => {
     }
   });
 
+  it("serves the control-domain auth host when CONTROL_PUBLIC_BASE is set", async () => {
+    vi.stubEnv("APP_PUBLIC_BASE", "https://apps.example.com");
+    vi.stubEnv("CONTROL_PUBLIC_BASE", "https://control.example.com");
+    try {
+      const list = await t.app.inject({
+        method: "GET",
+        url: "/api/v1/providers",
+        headers: authHeader(),
+      });
+      expect(list.statusCode).toBe(200);
+      expect(list.json().callbackUrl).toBe("https://auth.control.example.com/connections/callback");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("carries a non-default port through the derivation", () => {
     expect(connectionsCallbackUrl({ APP_PUBLIC_BASE: "http://localhost:8081" })).toBe(
       "http://auth.localhost:8081/connections/callback",

@@ -522,6 +522,24 @@ describe("GET /api/v1/apps and /:slug", () => {
     }
   });
 
+  it("keeps app URLs on the apps host when CONTROL_PUBLIC_BASE is set", async () => {
+    const prevBase = process.env.APP_PUBLIC_BASE;
+    const prevControl = process.env.CONTROL_PUBLIC_BASE;
+    process.env.APP_PUBLIC_BASE = "https://apps.example.com";
+    process.env.CONTROL_PUBLIC_BASE = "https://control.example.com";
+    try {
+      const slug = uniqueSlug();
+      const created = await createApp({ slug, displayName: "Split" });
+      expect(created.json().url).toBe(`https://${slug}.apps.example.com`);
+      expect(created.json().url).not.toContain("control.example.com");
+    } finally {
+      if (prevBase === undefined) delete process.env.APP_PUBLIC_BASE;
+      else process.env.APP_PUBLIC_BASE = prevBase;
+      if (prevControl === undefined) delete process.env.CONTROL_PUBLIC_BASE;
+      else process.env.CONTROL_PUBLIC_BASE = prevControl;
+    }
+  });
+
   it("requires sign-in to read the registry (401)", async () => {
     const list = await t.app.inject({ method: "GET", url: "/api/v1/apps" });
     expect(list.statusCode).toBe(401);
