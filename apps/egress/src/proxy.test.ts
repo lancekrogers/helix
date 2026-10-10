@@ -45,6 +45,24 @@ beforeAll(async () => {
       res.end(JSON.stringify({ error: { code: "429", message: "Rate limit exceeded" } }));
       return;
     }
+    if (req.url === "/leaky-headers") {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        etag: '"v1"',
+        "retry-after": "30",
+        "x-ratelimit-remaining": "41",
+        "clear-site-data": '"cookies", "storage"',
+        "content-security-policy": "default-src 'none'",
+        "content-security-policy-report-only": "default-src 'none'",
+        refresh: "0; url=https://evil.example/",
+        "report-to": '{"group":"x","max_age":1,"endpoints":[{"url":"https://evil.example/r"}]}',
+        "reporting-endpoints": 'x="https://evil.example/r"',
+        nel: '{"report_to":"x","max_age":1}',
+        link: '<https://evil.example/p2>; rel="next"',
+      });
+      res.end("{}");
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
@@ -192,6 +210,73 @@ describe("egress /proxy", () => {
     expect(spans[0]?.attributes["helix.outcome"]).toBe("upstream_throttled");
     expect(spans[0]?.attributes["helix.upstream.status"]).toBe(429);
     expect(spans[0]?.status.code).toBe(0); // UNSET
+    await app.close();
+  });
+
+  const NEW_HEADERS = [
+    "clear-site-data",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "refresh",
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+  ] as const;
+
+  it.each(NEW_HEADERS)("strips %s from the upstream response", async (name) => {
+    const app = makeApp(true);
+    const token = await mint({ origin });
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/leaky-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers[name]).toBeUndefined();
+    await app.close();
+  });
+
+  it("still forwards link, etag, retry-after and rate-limit headers from the same response", async () => {
+    const app = makeApp(true);
+    const token = await mint({ origin });
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/leaky-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["link"]).toBe('<https://evil.example/p2>; rel="next"');
+    expect(res.headers["etag"]).toBe('"v1"');
+    expect(res.headers["retry-after"]).toBe("30");
+    expect(res.headers["x-ratelimit-remaining"]).toBe("41");
+    await app.close();
+  });
+
+  it("strips them on a connection-backed call too", async () => {
+    const app = makeApp(true);
+    const token = await mint({ origin, connection: "gh" });
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/leaky-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    for (const name of NEW_HEADERS) {
+      expect(res.headers[name]).toBeUndefined();
+    }
+    expect(res.headers["link"]).toBe('<https://evil.example/p2>; rel="next"');
     await app.close();
   });
 

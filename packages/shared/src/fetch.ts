@@ -106,6 +106,14 @@ export const REQUEST_HEADER_SAFELIST: readonly string[] = [
  * Strip Location so browsers cannot follow a redirect outside the proxy;
  * egress also does not follow redirects (ADR-0005). Keep Content-Location,
  * which does not navigate, but redact any injected query credential in it.
+ *
+ * Policy and reporting headers belong to the app origin, not a vendor. The
+ * gateway's response is same-origin with the app, so a copied clear-site-data
+ * or nel applies to the app's origin even on a fetch() response (clearing its
+ * cookies and storage, or registering a reporting policy), and the CSP, refresh
+ * and reporting headers apply if the response is opened as a document. Keep this
+ * a denylist; an allowlist would drop headers apps rely on (etag, retry-after,
+ * rate-limit headers).
  */
 export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
   "set-cookie",
@@ -119,6 +127,13 @@ export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
   "proxy-authorization",
   "trailer",
   "upgrade",
+  "clear-site-data",
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "refresh",
+  "report-to",
+  "reporting-endpoints",
+  "nel",
 ];
 
 // ── App-facing error shape ────────────────────────────────────────────────────

@@ -52,6 +52,8 @@ class FakeEgress implements EgressProvider {
   status = 200;
   /** When set, the response body egress "returns" — used to exercise the cap. */
   responseBody: Readable | null = null;
+  /** Extra headers the fake upstream response carries (merged over the default). */
+  responseHeaders: Record<string, string> = {};
   /** When set, the request body is fully drained so tests can measure its size. */
   drainRequest = false;
   drainedBytes = 0;
@@ -90,7 +92,7 @@ class FakeEgress implements EgressProvider {
     settled = true;
     return {
       status: this.status,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.responseHeaders },
       body: this.responseBody ?? Readable.from([Buffer.from(JSON.stringify({ ok: true }))]),
       outcome: this.outcome,
     };
@@ -656,6 +658,45 @@ describe("/_api/fetch", () => {
     expect(usage.records).toContainEqual(
       expect.objectContaining({ capability: "fetch", outcome: "error", statusCode: 429 }),
     );
+    await app.close();
+  });
+
+  const NEW_HEADERS = [
+    "clear-site-data",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "refresh",
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+  ] as const;
+
+  it.each(NEW_HEADERS)("does not copy %s from egress's response onto the app's", async (name) => {
+    const { app, egress } = buildFetchEdge();
+    egress.responseHeaders = {
+      "clear-site-data": '"cookies"',
+      "content-security-policy": "default-src 'none'",
+      "content-security-policy-report-only": "default-src 'none'",
+      refresh: "0; url=https://evil.example/",
+      "report-to": '{"group":"x","max_age":1,"endpoints":[{"url":"https://evil.example/r"}]}',
+      "reporting-endpoints": 'x="https://evil.example/r"',
+      nel: '{"report_to":"x","max_age":1}',
+      link: '<https://evil.example/p2>; rel="next"',
+      etag: '"v1"',
+      "retry-after": "30",
+      "x-ratelimit-remaining": "41",
+    };
+    const res = await app.inject({
+      method: "GET",
+      url: "/_api/fetch/https://api.github.com/x",
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers[name]).toBeUndefined();
+    expect(res.headers["link"]).toBe('<https://evil.example/p2>; rel="next"');
+    expect(res.headers["etag"]).toBe('"v1"');
+    expect(res.headers["retry-after"]).toBe("30");
+    expect(res.headers["x-ratelimit-remaining"]).toBe("41");
     await app.close();
   });
 

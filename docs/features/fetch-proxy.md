@@ -84,11 +84,16 @@ plaintext secrets or the public internet:
    `Location` is stripped so the browser can't chase it either; issue #10).
 4. **Header controls** — a **request-header safelist** (the app's
    `cookie`/`authorization` never go upstream: no session leak, no overriding the
-   injected credential) plus a **response-header blocklist** (`set-cookie` and
-   friends stripped off the response). The response blocklist has tracked gaps
-   today — it omits `authorization`/`www-authenticate` (#7), the body caps read
-   only `content-length` (#8), and the injection path still accepts cleartext
-   `http://` (#11). (ADR-0005.)
+   injected credential) plus a **response-header blocklist** that strips
+   credential and transport headers (`set-cookie`, `authorization`, `location`,
+   hop-by-hop names, and similar), policy and reporting headers that would apply
+   to the app origin if copied through (`clear-site-data`,
+   `content-security-policy`, `content-security-policy-report-only`, `refresh`,
+   `report-to`, `reporting-endpoints`, `nel`), while keeping headers apps rely
+   on (`link`, `www-authenticate`, `etag`, rate-limit headers, and
+   `content-location` with any injected query credential redacted). The body caps
+   read only `content-length` (#8), and the injection path still accepts
+   cleartext `http://` (#11). (ADR-0005.)
 5. **Stream** the upstream response straight back through the edge to the
    browser; never buffered.
 

@@ -410,7 +410,10 @@ Prefix the absolute target URL onto the path. The method, headers, and body pass
 through; the platform resolves and injects any `connection` credential — or, on
 a provider-bound origin, the signed-in user's own OAuth connection token
 (§3.5) — blocks private/loopback/metadata addresses, refuses redirects, and
-streams the response back.
+streams the response back. The proxy strips response headers that would change
+the app's own origin (`Content-Security-Policy`, `Clear-Site-Data`, `Refresh`,
+and the reporting headers). The `Link` header still passes through, so pagination
+by `rel="next"` keeps working.
 
 ```js
 const r = await fetch("/_api/fetch/https://api.github.com/repos/vercel/next.js");
