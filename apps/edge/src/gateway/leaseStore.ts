@@ -56,6 +56,14 @@ export function classifyInflightLeasesPrivilege(
   return { status: "ok" };
 }
 
+function postgresErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
 function cappedRequests(requests: readonly LeaseRequest[]): LeaseRequest[] {
   const byScope = new Map<string, number>();
   for (const { scope, cap } of requests) {
@@ -99,8 +107,17 @@ export class PgLeaseStore implements LeaseStore {
     return withPooledClient(this.#pool, async (client) => {
       await client.query("BEGIN");
       try {
+        await client.query("SET LOCAL lock_timeout = '250ms'");
         for (const { scope } of sorted) {
-          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scope]);
+          try {
+            await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scope]);
+          } catch (err) {
+            if (postgresErrorCode(err) === "55P03") {
+              await client.query("ROLLBACK");
+              return { ok: false as const, scope };
+            }
+            throw err;
+          }
         }
         for (const { scope, cap } of sorted) {
           const res = await client.query<{ n: number }>(

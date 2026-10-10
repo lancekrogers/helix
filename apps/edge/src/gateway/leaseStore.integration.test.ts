@@ -180,6 +180,23 @@ describe("PgLeaseStore (helix_edge)", () => {
     expect(after.rows[0]?.n).toBe(0);
   });
 
+  it("refuses quickly when an advisory lock is already held on the scope", async () => {
+    if (!ok) return;
+    const s = scope();
+    const holder = new Pool({ connectionString: edgeUrl(), max: 1 });
+    const client = await holder.connect();
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [s]);
+    const started = Date.now();
+    const result = await store.acquire([{ scope: s, cap: 10 }], 60_000);
+    const elapsed = Date.now() - started;
+    await client.query("ROLLBACK");
+    client.release();
+    await holder.end();
+    expect(result).toEqual({ ok: false, scope: s });
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
   it("a refused acquire leaves no row for any of its scopes", async () => {
     if (!ok) return;
     const prefix = scope();

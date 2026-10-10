@@ -283,8 +283,8 @@ describe("a recorded egress span", () => {
       .find((s) => s.attributes[ATTR_CLIENT_DISCONNECTED] === true);
     expect(recorded).toBeDefined();
     expect(recorded?.attributes[ATTR_CLIENT_DISCONNECTED]).toBe(true);
-    expect(recorded?.attributes["helix.outcome"]).toBe("ok");
-    expect(recorded?.attributes["helix.upstream.status"]).toBe(200);
+    expect(recorded?.attributes["helix.outcome"]).toBeUndefined();
+    expect(recorded?.attributes["helix.upstream.status"]).toBeUndefined();
     expect(recorded?.events.filter((e) => e.name === "exception")).toEqual([]);
     const serialized = JSON.stringify(recorded?.attributes ?? {});
     expect(serialized).not.toMatch(/authorization|x-api-key|Bearer/i);

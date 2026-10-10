@@ -103,10 +103,12 @@ looked up:
 - `helix.gateway.llm` spans carry `helix.usage.basis` ∈ {`measured`, `estimated`,
   `mixed`} when a call ends without a final usage block (a client hang-up or a
   post-200 stream failure charged from interim counts and byte estimates).
-- When the edge hangs up before egress finishes writing a response,
-  `helix.egress.proxy` still records `helix.outcome` = `ok` and
-  `helix.upstream.status` = 200, because no outcome header was committed on
-  that path. `helix.client_disconnected` = true is the distinguishing attribute.
+- When the edge hangs up before egress has sent response headers,
+  `helix.egress.proxy` records `helix.client_disconnected` = true and omits
+  `helix.outcome` and `helix.upstream.status`, because no upstream response was
+  committed; the `helix.egress.proxy.duration` sample for that call carries no
+  outcome dimension. A hang-up after the headers keeps the committed status and
+  outcome and adds `helix.client_disconnected` = true.
 - `helix.egress.exchange` spans carry `helix.outcome` ∈
   `EGRESS_EXCHANGE_OUTCOMES` (`exchanged`, `rejected`, `provider_unavailable`,
   `exchange_failed`, `unauthorized`, `malformed`, `unconfigured` — the seven

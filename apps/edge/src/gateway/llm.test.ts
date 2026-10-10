@@ -872,6 +872,46 @@ describe("cut and failed calls are charged", () => {
     expect(detail.endsWith(";usage=estimated")).toBe(true);
   });
 
+  it("does not call the provider when the client leaves during admission", async () => {
+    const edge = buildLlmEdge({ maxAppInFlight: 5 });
+    const token = await seedSession(edge.sessions);
+    let unblock: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    const baseAcquire = edge.leases.acquire.bind(edge.leases);
+    vi.spyOn(edge.leases, "acquire").mockImplementation(async (req, ttl) => {
+      await gate;
+      return baseAcquire(req, ttl);
+    });
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: true }),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(
+        () => (edge.leases.acquire as ReturnType<typeof vi.fn>).mock.calls.length === 1,
+        "lease acquire to start",
+      );
+      ac.abort();
+      await new Promise((r) => setTimeout(r, 100));
+      unblock();
+      await pending;
+      await until(() => edge.usage.records.length === 1, "cut row");
+    });
+    expect(edge.provider.calls).toHaveLength(0);
+    expect(String(edge.usage.records[0]?.errorDetail)).toMatch(/^client_disconnected;usage=/);
+  });
+
   it("charges the non-streaming path the same way on a hang-up", async () => {
     const edge = buildLlmEdge();
     const token = await seedSession(edge.sessions);

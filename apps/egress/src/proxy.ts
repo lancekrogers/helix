@@ -718,8 +718,6 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
         clientGone || (!requestCapTripped && abort.signal.aborted && !reply.raw.writableEnded);
       if (disconnected) {
         // Normal event, not a failure: nothing to write to a dead socket and nothing worth a warn.
-        // Outcome stays ok and helix.upstream.status stays 200 — no outcome header was written.
-        // helix.client_disconnected (set in proxyHandler's finally) is what separates this path.
         instruments().upstreamAborts.add(1, { [ATTR_CAPABILITY]: instruction.capability });
         return;
       }
@@ -811,7 +809,17 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
       // false. Read naively that records "a successful 200 the app hung up on"
       // — a plausible, complete fiction, on the one plane where "the client
       // gave up" and "we broke" send an operator down different paths.
-      const outcome = threw ? "error" : String(reply.getHeader(OUTCOME_HEADER) ?? "ok");
+      const clientDisconnected = !threw && !reply.raw.writableEnded;
+      const headersCommitted = reply.raw.headersSent;
+      let outcome: string | undefined = threw
+        ? "error"
+        : String(reply.getHeader(OUTCOME_HEADER) ?? "ok");
+      // Fastify's default statusCode is 200 and the default outcome is `ok` even when
+      // nothing was written — omit both when the client left before any upstream
+      // response was committed.
+      if (clientDisconnected && !headersCommitted) {
+        outcome = undefined;
+      }
 
       // A refusal returns normally through `fail()`, so the `catch` above never
       // sees it and the span would otherwise end UNSET — including on a 5xx.
@@ -826,13 +834,14 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
           [ATTR_OUTCOME]: outcome,
           // Omitted rather than guessed when we threw — the status the caller
           // will actually see is written by the error handler, later.
-          [ATTR_UPSTREAM_STATUS]: threw ? undefined : reply.statusCode,
-          [ATTR_CLIENT_DISCONNECTED]: !threw && !reply.raw.writableEnded ? true : undefined,
+          [ATTR_UPSTREAM_STATUS]:
+            threw || (clientDisconnected && !headersCommitted) ? undefined : reply.statusCode,
+          [ATTR_CLIENT_DISCONNECTED]: clientDisconnected ? true : undefined,
         }),
       );
-      instruments().proxyDuration.record(performance.now() - startedAt, {
-        [ATTR_OUTCOME]: outcome,
-      });
+      const durationAttrs: Record<string, string> = {};
+      if (outcome !== undefined) durationAttrs[ATTR_OUTCOME] = outcome;
+      instruments().proxyDuration.record(performance.now() - startedAt, durationAttrs);
       span.end();
     }
   }

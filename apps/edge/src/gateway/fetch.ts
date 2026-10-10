@@ -338,8 +338,7 @@ export function makeFetchHandler(rt: FetchGatewayRuntime) {
       // to free the slot. A finally block would free it at the headers, because the
       // streamed body outlives this function's return.
       reply.raw.once("close", releaseLease);
-      // If the socket is already gone when this attaches, 'close' will not fire again and the
-      // lease lives until its TTL; that TTL is the backstop.
+      if (reply.raw.destroyed && !reply.raw.writableEnded) releaseLease();
     }
 
     // Mint the attested instruction and forward to egress.

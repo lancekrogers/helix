@@ -381,7 +381,7 @@ export function makeLlmHandler(
       // under `app.inject()` every ordinary response would look like a hang-up.
       const abort = new AbortController();
       let clientGone = false;
-      reply.raw.on("close", () => {
+      const markClientGone = (): void => {
         if (reply.raw.writableEnded) return;
         clientGone = true;
         abort.abort();
@@ -390,7 +390,11 @@ export function makeLlmHandler(
         // the bottom of this factory, and this listener already closes over
         // enough.
         trace.getActiveSpan()?.setAttribute(ATTR_CLIENT_DISCONNECTED, true);
-      });
+      };
+      reply.raw.on("close", markClientGone);
+      // Admission can await budget, platform spend, and lease acquire before this
+      // listener is attached — same gap as egress (proxy.ts).
+      if (reply.raw.destroyed && !reply.raw.writableEnded) markClientGone();
 
       const startedAt = performance.now();
       let recorded = false;
@@ -490,6 +494,10 @@ export function makeLlmHandler(
       };
       const deadline = AbortSignal.timeout(rt.maxCallMs);
       const callSignal = AbortSignal.any([abort.signal, deadline, processShutdownSignal()]);
+      if (clientGone) {
+        await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
+        return;
+      }
       const events = rt.provider.stream(chat, {
         signal: callSignal,
         appId: entry.appId,

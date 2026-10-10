@@ -978,6 +978,33 @@ describe("fetch per-app concurrency cap", () => {
     await until(() => leases.held(`fetch:app:${APP_ID}`) === 0, "lease released");
   });
 
+  it("releases the lease when the socket is already gone after acquire", async () => {
+    const leases = new InMemoryLeaseStore();
+    const baseAcquire = leases.acquire.bind(leases);
+    let unblock: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    vi.spyOn(leases, "acquire").mockImplementation(async (req, ttl) => {
+      await gate;
+      return baseAcquire(req, ttl);
+    });
+    const { app } = buildFetchEdge({ maxAppInFlight: 2, leases });
+    await withServer(app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}${FETCH_PATH}`, {
+        method: "GET",
+        headers: { ...HOST, origin: ORIGIN },
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 40));
+      ac.abort();
+      unblock();
+      await pending;
+      await until(() => leases.held(`fetch:app:${APP_ID}`) === 0, "lease released");
+    });
+  });
+
   it("releases the lease when the client hangs up mid-upload", async () => {
     const { app, egress, leases } = buildFetchEdge({ maxAppInFlight: 2 });
     egress.drainRequest = true;

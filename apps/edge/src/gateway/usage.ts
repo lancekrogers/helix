@@ -1,8 +1,22 @@
 import { type Pool } from "pg";
 
-import { type Env, type GatewayOutcome } from "@azx-pbc/shared";
+import { type Env, type GatewayOutcome, type PrincipalKind } from "@azx-pbc/shared";
+import {
+  ATTR_APP_ID,
+  ATTR_CAPABILITY,
+  ATTR_OUTCOME,
+  ATTR_REASON,
+  ATTR_USAGE_BASIS,
+  capTargetPath,
+  TARGET_PATH_MAX,
+  type AdmissionDenialReason,
+  type CutChargeBasis,
+} from "@azx-pbc/shared/telemetry";
 
+import { USER_EMAIL_MAX, USER_NAME_MAX, truncate } from "../auth/identity.js";
 import { createEdgePool, type EdgePoolOpts } from "../db/pool.js";
+import { withPartition } from "../db/partition.js";
+import { instruments } from "../telemetry.js";
 
 /** Default TTL for cached platform LLM spend reads (per edge replica). */
 export const PLATFORM_SPEND_CACHE_MS = 5_000;
@@ -83,21 +97,6 @@ function postgresErrorCode(err: unknown): string | undefined {
   }
   return undefined;
 }
-import { withPartition } from "../db/partition.js";
-import type { PrincipalKind } from "@azx-pbc/shared";
-import { USER_EMAIL_MAX, USER_NAME_MAX, truncate } from "../auth/identity.js";
-import {
-  ATTR_APP_ID,
-  ATTR_CAPABILITY,
-  ATTR_OUTCOME,
-  ATTR_REASON,
-  ATTR_USAGE_BASIS,
-  capTargetPath,
-  TARGET_PATH_MAX,
-  type AdmissionDenialReason,
-  type CutChargeBasis,
-} from "@azx-pbc/shared/telemetry";
-import { instruments } from "../telemetry.js";
 
 /**
  * The gateway call ledger (architecture §6.1/§6.3, §8) — metering + audit and
@@ -545,6 +544,18 @@ export class PgUsageStore implements UsageStore {
   }
 }
 
+export function meterAdmissionDenied(call: {
+  appId: string;
+  capability: string;
+  reason: AdmissionDenialReason;
+}): void {
+  instruments().gatewayAdmissionDenied.add(1, {
+    [ATTR_APP_ID]: call.appId,
+    [ATTR_CAPABILITY]: call.capability,
+    [ATTR_REASON]: call.reason,
+  });
+}
+
 /**
  * Record the operational metrics for one gateway terminal (ADR-0037 decision 8).
  *
@@ -565,18 +576,6 @@ export class PgUsageStore implements UsageStore {
  *
  * They still share a call site, so the `outcome` vocabulary cannot drift.
  */
-export function meterAdmissionDenied(call: {
-  appId: string;
-  capability: string;
-  reason: AdmissionDenialReason;
-}): void {
-  instruments().gatewayAdmissionDenied.add(1, {
-    [ATTR_APP_ID]: call.appId,
-    [ATTR_CAPABILITY]: call.capability,
-    [ATTR_REASON]: call.reason,
-  });
-}
-
 export function meterGatewayCall(call: {
   appId: string;
   capability: string;
