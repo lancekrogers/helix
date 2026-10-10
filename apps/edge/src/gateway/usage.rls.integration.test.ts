@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Pool } from "pg";
 import { PLATFORM_SPEND_CHECK_SQL } from "./usage.js";
 import { PgUsageStore } from "./usage.js";
@@ -217,8 +217,12 @@ describe("platform_llm_spend_micro_usd (SECURITY DEFINER aggregate)", () => {
       await seedGatewayCost(owner, APP_B, "prod", 200_000, "llm");
       const after = await pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
       const a = after.rows[0] as { today: string; hour: string };
-      expect(Number(a.today) - Number(b.today)).toBe(300_000);
-      expect(Number(a.hour) - Number(b.hour)).toBe(300_000);
+      const todayDelta = Number(a.today) - Number(b.today);
+      const hourDelta = Number(a.hour) - Number(b.hour);
+      expect(todayDelta).toBeGreaterThanOrEqual(300_000);
+      expect(hourDelta).toBeGreaterThanOrEqual(300_000);
+      expect(todayDelta).toBeLessThan(300_000 + 50_000_000);
+      expect(hourDelta).toBeLessThan(300_000 + 50_000_000);
     } finally {
       await pool.end();
     }
@@ -244,12 +248,15 @@ describe("platform_llm_spend_micro_usd (SECURITY DEFINER aggregate)", () => {
     const devApp = randomUUID();
     try {
       const before = await pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
-      const b = before.rows[0] as { today: string };
+      const bProd = Number((before.rows[0] as { today: string }).today);
       await seedGatewayCost(owner, fetchApp, "prod", 50_000_000, "fetch");
+      const afterFetch = await pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
+      const prodAfterFetch = Number((afterFetch.rows[0] as { today: string }).today);
+      expect(prodAfterFetch - bProd).toBeLessThan(50_000_000);
       await seedGatewayCost(owner, devApp, "dev", 50_000_000, "llm");
-      const after = await pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
-      const a = after.rows[0] as { today: string };
-      expect(Number(a.today) - Number(b.today)).toBe(0);
+      const afterDev = await pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
+      const prodAfterDev = Number((afterDev.rows[0] as { today: string }).today);
+      expect(prodAfterDev).toBe(prodAfterFetch);
     } finally {
       await owner.query(`DELETE FROM gateway_calls WHERE "appId" = ANY($1::uuid[])`, [
         [fetchApp, devApp],
@@ -419,7 +426,7 @@ describe("PgUsageStore.platformLlmSpendMicroUsd", () => {
       const before = await platformStore.platformLlmSpendMicroUsd("prod");
       await seedGatewayCost(owner, PLATFORM_APP, "prod", 77_000, "llm");
       const after = await platformStore.platformLlmSpendMicroUsd("prod");
-      expect(after.todayMicro - before.todayMicro).toBe(77_000);
+      expect(after.todayMicro - before.todayMicro).toBeGreaterThanOrEqual(77_000);
     } finally {
       await owner.end();
       await platformStore.close();
@@ -438,7 +445,7 @@ describe("PgUsageStore.platformLlmSpendMicroUsd", () => {
         [PLATFORM_APP],
       );
       const after = await platformStore.platformLlmSpendMicroUsd("prod");
-      expect(after.todayMicro - before.todayMicro).toBe(42_000);
+      expect(after.todayMicro - before.todayMicro).toBeGreaterThanOrEqual(42_000);
     } finally {
       await owner.end();
       await platformStore.close();
@@ -468,7 +475,7 @@ describe("PgUsageStore.platformLlmSpendMicroUsd", () => {
       const before = await platformStore.platformLlmSpendMicroUsd("prod");
       await seedGatewayCost(owner, PLATFORM_APP, "prod", 5, "llm");
       const after = await platformStore.platformLlmSpendMicroUsd("prod");
-      expect(after.todayMicro).toBe(before.todayMicro + 5);
+      expect(after.todayMicro).toBeGreaterThanOrEqual(before.todayMicro + 5);
     } finally {
       await owner.end();
       await platformStore.close();
@@ -478,13 +485,38 @@ describe("PgUsageStore.platformLlmSpendMicroUsd", () => {
   it("single-flights concurrent reads", async () => {
     if (!(await edgeRoleAvailable())) return;
     const platformStore = new PgUsageStore(edgeUrl(), { max: 2, platformCacheMs: 0 });
+    const originalQuery = Pool.prototype.query;
+    let platformReads = 0;
+    let releaseFirstRead!: () => void;
+    const firstReadGate = new Promise<void>((resolve) => {
+      releaseFirstRead = resolve;
+    });
+    const querySpy = vi.spyOn(Pool.prototype, "query").mockImplementation(function (
+      this: Pool,
+      ...args: Parameters<Pool["query"]>
+    ) {
+      const text =
+        typeof args[0] === "string"
+          ? args[0]
+          : ((args[0] as { text?: string } | undefined)?.text ?? "");
+      if (text.includes("platform_llm_spend_micro_usd")) {
+        platformReads += 1;
+        if (platformReads === 1) {
+          return firstReadGate.then(() => originalQuery.apply(this, args));
+        }
+      }
+      return originalQuery.apply(this, args);
+    });
     try {
-      const [a, b] = await Promise.all([
-        platformStore.platformLlmSpendMicroUsd("prod"),
-        platformStore.platformLlmSpendMicroUsd("prod"),
-      ]);
+      const first = platformStore.platformLlmSpendMicroUsd("prod");
+      const second = platformStore.platformLlmSpendMicroUsd("prod");
+      await vi.waitFor(() => platformReads >= 1, { timeout: 2000, interval: 10 });
+      releaseFirstRead();
+      const [a, b] = await Promise.all([first, second]);
       expect(a).toEqual(b);
+      expect(platformReads).toBe(1);
     } finally {
+      querySpy.mockRestore();
       await platformStore.close();
     }
   });

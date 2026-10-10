@@ -1584,7 +1584,7 @@ describe("concurrency caps and the call deadline", () => {
       maxAppInFlight: 20,
       maxUserInFlight: 20,
       maxInFlight: 20,
-      // High enough for eight sequential hang-ups (~30 micro each), low enough to block a ninth.
+      // High enough for eight concurrent hang-ups (~30 micro each), low enough to block a ninth.
       platformCeilingDollars: 0.000_22,
       llm: { models: [MODEL], dollarsPerDay: 1000 },
     });
@@ -1604,20 +1604,19 @@ describe("concurrency caps and the call deadline", () => {
         origin: ORIGIN,
         cookie: `${SESSION_COOKIE}=${token}`,
       };
-      for (let i = 0; i < 8; i += 1) {
-        edge.provider.sawAbort = false;
-        const ac = new AbortController();
-        const pending = undiciRequest(`${base}/_api/llm/chat`, {
+      const hangUps = Array.from({ length: 8 }, () => new AbortController());
+      const pending = hangUps.map((ac) =>
+        undiciRequest(`${base}/_api/llm/chat`, {
           method: "POST",
           headers,
           body: JSON.stringify({ ...ASK, stream: true }),
           signal: ac.signal,
-        }).catch(() => undefined);
-        await until(() => edge.provider.calls.length === i + 1, `call ${i + 1}`);
-        ac.abort();
-        await pending;
-        await until(() => edge.usage.records.length === i + 1, `row ${i + 1}`);
-      }
+        }).catch(() => undefined),
+      );
+      await until(() => edge.provider.calls.length === 8, "eight upstream calls");
+      for (const ac of hangUps) ac.abort();
+      await Promise.all(pending);
+      await until(() => edge.usage.records.length === 8, "eight cut rows");
       for (const row of edge.usage.records) {
         expect(row.outcome).toBe("error");
         expect(row.errorDetail).toMatch(/;usage=/);

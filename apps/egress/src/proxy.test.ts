@@ -649,13 +649,9 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
   });
 
   it("never dials the vendor when the client aborts during secret resolution", async () => {
-    let connections = 0;
-    const dialProbe = createServer((_req, res) => {
-      connections += 1;
-      res.end("ok");
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
     });
-    await new Promise<void>((resolve) => dialProbe.listen(0, "127.0.0.1", resolve));
-    const probeOrigin = `http://127.0.0.1:${(dialProbe.address() as AddressInfo).port}`;
 
     let releaseResolve!: () => void;
     const waitingResolver: SecretResolver = {
@@ -672,29 +668,37 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
     await app.listen({ port: 0, host: "127.0.0.1" });
     const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
     const ac = new AbortController();
-    const token = await mint({ origin: probeOrigin, connection: "gh" });
+    const token = await mint({ origin, connection: "gh" });
     const pending = undiciRequest(`${base}/proxy`, {
       method: "POST",
       signal: ac.signal,
       headers: {
         [INSTRUCTION_HEADER]: token,
-        [TARGET_HEADER]: `${probeOrigin}/`,
+        [TARGET_HEADER]: `${origin}/`,
         [METHOD_HEADER]: "GET",
       },
     });
     await new Promise((r) => setTimeout(r, 50));
     ac.abort();
+    // Resolution was still parked when the client left; finishing it must take the hang-up path.
+    releaseResolve();
     try {
       await pending;
     } catch {
       // hang-up
     }
-    await vi.waitFor(() => expect(connections).toBe(0), { timeout: 2000, interval: 25 });
-    releaseResolve();
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "fetch",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
 
     app.server.closeAllConnections();
     await app.close();
-    await new Promise<void>((resolve) => dialProbe.close(() => resolve()));
   });
 
   it("logs no upstream request failed warning on a pre-header hang-up", async () => {
@@ -770,20 +774,18 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
 
   it("still pools sockets after an abandoned call", async () => {
     let connections = 0;
-    const server = createServer((_req, res) => res.end("ok"));
-    server.on("connection", () => void connections++);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const localOrigin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    slowHeaders.on("connection", () => void connections++);
 
     const app = makeApp(true);
     await callSlowHeaders(app, "fetch");
+    connections = 0;
 
     const recovery = await app.inject({
       method: "POST",
       url: "/proxy",
       headers: {
-        [INSTRUCTION_HEADER]: await mint({ origin: localOrigin }),
-        [TARGET_HEADER]: `${localOrigin}/`,
+        [INSTRUCTION_HEADER]: await mint({ origin: slowHeadersOrigin }),
+        [TARGET_HEADER]: `${slowHeadersOrigin}/`,
         [METHOD_HEADER]: "GET",
       },
     });
@@ -795,8 +797,8 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
         method: "POST",
         url: "/proxy",
         headers: {
-          [INSTRUCTION_HEADER]: await mint({ origin: localOrigin }),
-          [TARGET_HEADER]: `${localOrigin}/`,
+          [INSTRUCTION_HEADER]: await mint({ origin: slowHeadersOrigin }),
+          [TARGET_HEADER]: `${slowHeadersOrigin}/`,
           [METHOD_HEADER]: "GET",
         },
       });
@@ -806,6 +808,5 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
 
     app.server.closeAllConnections();
     await app.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });

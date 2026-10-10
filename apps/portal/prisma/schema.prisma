@@ -74,7 +74,7 @@ model App {
   /// empty is also a legal (deny-everyone) `group` state. Cap lives in zod
   /// (`MAX_VISIBILITY_GROUPS`), not here — an array needs no migration to
   /// re-tune it (ADR-0040 §5).
-  visibilityGroupIds String[]
+  visibilityGroupIds String[] @default([])
   // Shared-password credential for `password` visibility (docs/features/
   // authentication.md). `passwordHash`/`passwordSalt` (scrypt) are PROJECTED to
   // the edge to verify a login; `passwordEnc` (AES-256-GCM) is portal-only —
