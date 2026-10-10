@@ -34,7 +34,26 @@ node .claude/skills/run-helix/smoke.mjs --offset 2000   # a different isolated s
 node .claude/skills/run-helix/smoke.mjs --offset 0      # share the dev ports + database
 ```
 
-Groups: `idp`, `portal`, `edge`, `egress`, `spa`, `browser`, `cli`.
+Groups: `idp`, `portal`, `edge`, `egress`, `spa`, `browser`, `cli`, `split-tls`.
+
+### Split-domain mode
+
+Set `HELIX_APPS_DOMAIN` (for example `helix-apps.localhost`) to host apps on a second loopback domain while the control plane stays on `local.helix.azxlabs.io`. Until the edge and portal read the control domain (`EDGE_CONTROL_DOMAIN`, `CONTROL_PUBLIC_BASE`), split mode is **not** a working login stack — the supported check is:
+
+```bash
+HELIX_APPS_DOMAIN=helix-apps.localhost node .claude/skills/run-helix/smoke.mjs --only split-tls
+```
+
+Create the split TLS pair once per dev container (or when `local-helix-split.pem` is missing):
+
+```bash
+CAROOT=/workspace/.devcontainer/certs/caroot mkcert \
+  -cert-file /workspace/.devcontainer/certs/local-helix-split.pem \
+  -key-file /workspace/.devcontainer/certs/local-helix-split-key.pem \
+  "*.local.helix.azxlabs.io" local.helix.azxlabs.io \
+  "*.helix-apps.localhost" helix-apps.localhost \
+  "*.apps.local.helix.azxlabs.io" apps.local.helix.azxlabs.io
+```
 
 Output is one line per check. Screenshots and per-service logs land in a printed temp dir (`/tmp/helix-smoke-*/`) — `signed-out.png`, `dashboard.png`, `apps-list.png`, and `edge.log`, `portal.log`, etc. **Look at the screenshots**; a mounted-but-blank page still passes the DOM assertion.
 

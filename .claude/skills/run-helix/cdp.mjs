@@ -34,9 +34,16 @@ export function findChrome() {
  * Launch headless Chromium and attach one page session.
  * Returns a handle with navigate/evaluate/screenshot plus captured page errors.
  */
-export async function launchBrowser({ port = 9411, ignoreCertErrors = false, baseDomain } = {}) {
+export async function launchBrowser({
+  port = 9411,
+  ignoreCertErrors = false,
+  baseDomain,
+  hostRules,
+} = {}) {
   const bin = findChrome();
   if (!bin) throw new Error("no cached Chromium found (set HELIX_SMOKE_CHROME)");
+
+  const rules = hostRules ?? (baseDomain ? [baseDomain] : []).filter(Boolean);
 
   const chromeArgs = [
     "--headless=new",
@@ -51,9 +58,12 @@ export async function launchBrowser({ port = 9411, ignoreCertErrors = false, bas
   ];
   if (ignoreCertErrors) {
     chromeArgs.push("--ignore-certificate-errors");
-    if (baseDomain) {
-      chromeArgs.push(`--host-resolver-rules=MAP *.${baseDomain} 127.0.0.1`);
-    }
+  }
+  if (rules.length) {
+    const resolver = rules
+      .flatMap((domain) => [`MAP *.${domain} 127.0.0.1`, `MAP ${domain} 127.0.0.1`])
+      .join(", ");
+    chromeArgs.push(`--host-resolver-rules=${resolver}`);
   }
 
   const child = spawn(bin, chromeArgs, { stdio: "ignore" });

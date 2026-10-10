@@ -55,6 +55,18 @@ if [ ! -f "$CERT_DIR/local-helix.pem" ] && command -v mkcert >/dev/null; then
          "*.local.helix.azxlabs.io" local.helix.azxlabs.io
 fi
 
+# Split-domain dev (HELIX_APPS_DOMAIN): one cert for the control domain and both
+# candidate apps domains. A TLS wildcard covers a single label, so the same-site
+# fallback pair (apps.local.helix.azxlabs.io) needs its own wildcard SAN.
+if [ ! -f "$CERT_DIR/local-helix-split.pem" ] && command -v mkcert >/dev/null; then
+  mkdir -p "$CAROOT"
+  mkcert -cert-file "$CERT_DIR/local-helix-split.pem" \
+         -key-file "$CERT_DIR/local-helix-split-key.pem" \
+         "*.local.helix.azxlabs.io" local.helix.azxlabs.io \
+         "*.helix-apps.localhost" helix-apps.localhost \
+         "*.apps.local.helix.azxlabs.io" apps.local.helix.azxlabs.io
+fi
+
 # ── Dev secret-store KEK ──
 # The portal seals connection secrets under this key; egress opens them
 # (DEV_SECRETS_KEK_FILE, docker-compose). Generated ONCE here — not at process

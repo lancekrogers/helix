@@ -9,8 +9,14 @@
  * is reported as SKIP, never folded into the pass count.
  *
  * See ./SKILL.md for prerequisites and the flag reference.
+ *
+ * Split-domain dev (`HELIX_APPS_DOMAIN`): use `--only split-tls` until the edge and
+ * portal read the control domain; full login is not expected to work before that.
  */
 import { spawn, spawnSync } from "node:child_process";
+import dns from "node:dns";
+import tls from "node:tls";
+import { createRequire } from "node:module";
 import {
   copyFileSync,
   mkdtempSync,
@@ -62,12 +68,44 @@ const OUT = mkdtempSync(join(tmpdir(), "helix-smoke-"));
 const OFFSET = argv.includes("--offset")
   ? Number(argv[argv.indexOf("--offset") + 1])
   : Number(process.env.HELIX_PORT_OFFSET ?? 1000);
-const STACK = resolveStack({ offset: OFFSET });
+let STACK;
+try {
+  STACK = resolveStack({ offset: OFFSET });
+} catch (err) {
+  console.error(err.message);
+  process.exit(2);
+}
 /** Env every service in THIS stack boots with. */
 const SVC_ENV = { ...process.env, ...STACK.env };
 const PORTS = Object.values(STACK.ports);
 
-const GROUPS = ["idp", "portal", "edge", "egress", "spa", "browser", "cli"];
+const GROUPS = ["idp", "portal", "edge", "egress", "spa", "browser", "cli", "split-tls"];
+
+const SPLIT_CERT = join(ROOT, ".devcontainer/certs/local-helix-split.pem");
+const SPLIT_KEY = join(ROOT, ".devcontainer/certs/local-helix-split-key.pem");
+const MKCERT_SPLIT_CMD =
+  "CAROOT=/workspace/.devcontainer/certs/caroot mkcert -cert-file /workspace/.devcontainer/certs/local-helix-split.pem " +
+  "-key-file /workspace/.devcontainer/certs/local-helix-split-key.pem " +
+  '"*.local.helix.azxlabs.io" local.helix.azxlabs.io "*.helix-apps.localhost" helix-apps.localhost "*.apps.local.helix.azxlabs.io" apps.local.helix.azxlabs.io';
+
+const APPS_DOMAIN = STACK.appsDomain;
+const CONTROL_DOMAIN = STACK.controlDomain;
+
+// glibc does not resolve arbitrary *.localhost names, so never rely on getaddrinfo for the apps domain.
+const isAppsHost = (h) => h === APPS_DOMAIN || h.endsWith(`.${APPS_DOMAIN}`);
+const loopbackLookup = (hostname, opts, cb) => {
+  if (!STACK.split || !isAppsHost(hostname)) return dns.lookup(hostname, opts, cb);
+  return opts?.all ? cb(null, [{ address: "127.0.0.1", family: 4 }]) : cb(null, "127.0.0.1", 4);
+};
+
+/** @type {"undici-global-dispatcher" | "dns.lookup-patch" | null} */
+let splitFetchMechanism = null;
+if (STACK.split) {
+  const require = createRequire(join(ROOT, "apps/edge/package.json"));
+  const { Agent, setGlobalDispatcher } = require("undici");
+  setGlobalDispatcher(new Agent({ connect: { lookup: loopbackLookup } }));
+  splitFetchMechanism = "undici-global-dispatcher";
+}
 const wanted = (g) => !only || only === g;
 
 // ── result tracking ───────────────────────────────────────────────────────
@@ -213,7 +251,14 @@ function rawGet(url, headers = {}) {
     const u = new URL(url);
     const mod = u.protocol === "https:" ? httpsModule : httpModule;
     const req = mod.request(
-      { hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: "GET", headers },
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: "GET",
+        headers,
+        lookup: loopbackLookup,
+      },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -512,6 +557,102 @@ async function checkEdge() {
   });
 }
 
+async function checkSplitTls() {
+  group("split-tls");
+  console.log(
+    "\n\x1b[1msplit-tls\x1b[0m — split cert, Node fetch, and Chromium on the apps domain",
+  );
+  if (!STACK.split) {
+    skip("split-domain checks", "HELIX_APPS_DOMAIN is unset");
+    return;
+  }
+
+  await check("split TLS cert and key exist", async () => {
+    assert(existsSync(SPLIT_CERT) && existsSync(SPLIT_KEY), `run:\n  ${MKCERT_SPLIT_CMD}`);
+    return "local-helix-split.pem";
+  });
+
+  const smokeHost = `smoke-x.${APPS_DOMAIN}`;
+  const smokeUrl = `https://${smokeHost}:${STACK.ports.edge}/`;
+
+  await check("TLS handshake authorizes apps-domain SNI", async () => {
+    const sock = await new Promise((resolve, reject) => {
+      const s = tls.connect(
+        {
+          host: "127.0.0.1",
+          port: STACK.ports.edge,
+          servername: smokeHost,
+          rejectUnauthorized: true,
+          lookup: loopbackLookup,
+        },
+        () => resolve(s),
+      );
+      s.on("error", reject);
+    });
+    const peer = sock.getPeerCertificate();
+    sock.end();
+    assert(sock.authorized, `TLS not authorized: ${sock.authorizationError}`);
+    const san = peer.subjectaltname ?? "";
+    assert(
+      san.includes(`*.${APPS_DOMAIN}`) || san.includes(smokeHost),
+      `peer SAN missing *.${APPS_DOMAIN}: ${san}`,
+    );
+    return san.split(", ").slice(0, 2).join(", ");
+  });
+
+  await check("fetch reaches the edge on the apps domain (404)", async () => {
+    let mechanism = splitFetchMechanism;
+    let r;
+    try {
+      r = await fetch(smokeUrl);
+    } catch (e) {
+      const code = e.code ?? e.cause?.code;
+      if (code !== "ENOTFOUND") throw e;
+      const orig = dns.lookup;
+      dns.lookup = loopbackLookup;
+      mechanism = "dns.lookup-patch";
+      splitFetchMechanism = mechanism;
+      r = await fetch(smokeUrl);
+      dns.lookup = orig;
+    }
+    eq(r.status, 404, "status");
+    return mechanism ?? "fetch";
+  });
+
+  if (NO_BROWSER) {
+    skip("Chromium reaches the apps domain", "--no-browser");
+  } else if (!findChrome()) {
+    skip("Chromium reaches the apps domain", "no cached Chromium (set HELIX_SMOKE_CHROME)");
+  } else {
+    let browser;
+    try {
+      browser = await launchBrowser({
+        port: STACK.cdpPort + 2,
+        ignoreCertErrors: true,
+        hostRules: [APPS_DOMAIN, CONTROL_DOMAIN],
+      });
+    } catch (e) {
+      skip("Chromium reaches the apps domain", e.message);
+      return;
+    }
+    try {
+      await check("Chromium reaches the apps domain without cert errors", async () => {
+        browser.reset();
+        await browser.navigate(smokeUrl);
+        assert(
+          browser.failedRequests.length === 0,
+          `failed requests: ${browser.failedRequests.slice(0, 3).join(" | ")}`,
+        );
+        const certErr = browser.errors.some((e) => /certificate|SSL|TLS/i.test(e));
+        assert(!certErr, `certificate errors: ${browser.errors.slice(0, 3).join(" | ")}`);
+        return smokeHost;
+      });
+    } finally {
+      browser.close();
+    }
+  }
+}
+
 async function checkEgress() {
   group("egress");
   console.log("\n\x1b[1megress\x1b[0m — mechanism plane (attested instruction verification)");
@@ -691,12 +832,15 @@ async function checkBrowser() {
   let browser;
   let cspBrowser;
   try {
-    browser = await launchBrowser({ port: STACK.cdpPort });
+    browser = await launchBrowser({
+      port: STACK.cdpPort,
+      hostRules: STACK.split ? [APPS_DOMAIN, CONTROL_DOMAIN] : [],
+    });
     try {
       cspBrowser = await launchBrowser({
         port: STACK.cdpPort + 1,
         ignoreCertErrors: true,
-        baseDomain: BASE_DOMAIN,
+        hostRules: STACK.split ? [APPS_DOMAIN, CONTROL_DOMAIN] : [BASE_DOMAIN],
       });
     } catch (e) {
       browser.close();
@@ -906,6 +1050,16 @@ async function main() {
     console.error(`--only must be one of: ${GROUPS.join(", ")}`);
     process.exit(2);
   }
+  if (only === "split-tls" && !STACK.split) {
+    console.error("split-tls requires HELIX_APPS_DOMAIN to be set.");
+    process.exit(2);
+  }
+  if (STACK.split && (!existsSync(SPLIT_CERT) || !existsSync(SPLIT_KEY))) {
+    console.error(
+      `\x1b[31msplit TLS cert missing — create it before booting:\x1b[0m\n  ${MKCERT_SPLIT_CMD}\n`,
+    );
+    process.exit(2);
+  }
 
   console.log(`\x1b[1mHelix smoke test\x1b[0m   artifacts → ${OUT}`);
   console.log(
@@ -950,6 +1104,7 @@ async function main() {
       if (wanted("idp")) await checkIdp();
       if (wanted("portal")) await checkPortal();
       if (wanted("edge")) await checkEdge();
+      if (wanted("split-tls") && (STACK.split || only === "split-tls")) await checkSplitTls();
       if (wanted("egress")) await checkEgress();
       if (wanted("spa")) await checkSpa();
       if (wanted("browser")) await checkBrowser();
