@@ -1,17 +1,30 @@
 import { describe, expect, it } from "vitest";
+import { costUsd, limitsForModel } from "./pricing.js";
 import { CUT_CHARGE_BASES } from "./telemetry.js";
 import { BYTES_PER_TOKEN, estimateCutUsage } from "./usageEstimate.js";
 
+const MODEL = "claude-fable-5-1";
+
 describe("estimateCutUsage", () => {
   it("returns zero counts and estimated basis when there is no measurement and no bytes", () => {
-    const result = estimateCutUsage({ measured: undefined, requestBytes: 0, relayedBytes: 0 });
+    const result = estimateCutUsage({
+      measured: undefined,
+      requestBytes: 0,
+      relayedBytes: 0,
+      model: MODEL,
+    });
     expect(result.usage.inputTokens).toBe(0);
     expect(result.usage.outputTokens).toBe(0);
     expect(result.basis).toBe("estimated");
   });
 
   it("estimates from bytes with ceil and BYTES_PER_TOKEN when unmeasured", () => {
-    const result = estimateCutUsage({ measured: undefined, requestBytes: 9, relayedBytes: 9 });
+    const result = estimateCutUsage({
+      measured: undefined,
+      requestBytes: 9,
+      relayedBytes: 9,
+      model: MODEL,
+    });
     expect(result.usage.inputTokens).toBe(3);
     expect(result.usage.outputTokens).toBe(3);
     expect(result.basis).toBe("estimated");
@@ -28,6 +41,7 @@ describe("estimateCutUsage", () => {
       },
       requestBytes: 9999,
       relayedBytes: 3,
+      model: MODEL,
     });
     expect(result.usage.inputTokens).toBe(1200);
     expect(result.usage.outputTokens).toBe(Math.max(1, estimatedOutput));
@@ -43,6 +57,7 @@ describe("estimateCutUsage", () => {
       },
       requestBytes: 500,
       relayedBytes: 3,
+      model: MODEL,
     });
     expect(result.usage.outputTokens).toBe(100);
     expect(result.basis).toBe("measured");
@@ -58,6 +73,7 @@ describe("estimateCutUsage", () => {
       },
       requestBytes: 800,
       relayedBytes: 30,
+      model: MODEL,
     });
     const estimatedOutput = Math.ceil(30 / BYTES_PER_TOKEN);
     expect(estimatedOutput).toBeGreaterThan(1);
@@ -72,27 +88,69 @@ describe("estimateCutUsage", () => {
       measured: undefined,
       requestBytes: bytes,
       relayedBytes: 0,
+      model: MODEL,
     });
     expect(result.usage.inputTokens).toBe(Math.ceil(bytes / BYTES_PER_TOKEN));
   });
 
-  it("does not overflow on huge byte counts", () => {
+  it("caps unmeasured input at the model context window", () => {
+    const limits = limitsForModel(MODEL)!;
+    const oneMiB = 1024 * 1024;
+    const result = estimateCutUsage({
+      measured: undefined,
+      requestBytes: oneMiB,
+      relayedBytes: 0,
+      model: MODEL,
+    });
+    expect(result.usage.inputTokens).toBe(limits.contextWindowTokens);
+    const maxInputCost = costUsd({
+      model: MODEL,
+      inputTokens: limits.contextWindowTokens,
+      outputTokens: 0,
+    });
+    const charged = costUsd({
+      model: MODEL,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+    });
+    expect(charged).toBeLessThanOrEqual(maxInputCost);
+    expect(Math.ceil(oneMiB / BYTES_PER_TOKEN)).toBeGreaterThan(limits.contextWindowTokens);
+  });
+
+  it("keeps measured input above the context-window cap", () => {
+    const limits = limitsForModel(MODEL)!;
+    const above = limits.contextWindowTokens + 50_000;
+    const result = estimateCutUsage({
+      measured: {
+        inputTokens: above,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+      requestBytes: 1024 * 1024,
+      relayedBytes: 0,
+      model: MODEL,
+    });
+    expect(result.usage.inputTokens).toBe(above);
+  });
+
+  it("does not overflow on huge byte counts — estimates cap at the context window", () => {
+    const limits = limitsForModel(MODEL)!;
     const safe = estimateCutUsage({
       measured: undefined,
       requestBytes: Number.MAX_SAFE_INTEGER,
       relayedBytes: 0,
+      model: MODEL,
     });
-    expect(Number.isSafeInteger(safe.usage.inputTokens)).toBe(true);
-    expect(Number.isFinite(safe.usage.inputTokens)).toBe(true);
-    expect(safe.usage.inputTokens).toBe(Math.ceil(Number.MAX_SAFE_INTEGER / BYTES_PER_TOKEN));
+    expect(safe.usage.inputTokens).toBe(limits.contextWindowTokens);
 
     const huge = estimateCutUsage({
       measured: undefined,
       requestBytes: Number.MAX_VALUE,
       relayedBytes: 0,
+      model: MODEL,
     });
-    expect(Number.isSafeInteger(huge.usage.inputTokens)).toBe(true);
-    expect(huge.usage.inputTokens).toBe(Number.MAX_SAFE_INTEGER);
+    expect(huge.usage.inputTokens).toBe(limits.contextWindowTokens);
   });
 
   it("treats non-finite and negative byte counts as zero", () => {
@@ -101,6 +159,7 @@ describe("estimateCutUsage", () => {
         measured: undefined,
         requestBytes: bad,
         relayedBytes: bad,
+        model: MODEL,
       });
       expect(result.usage.inputTokens).toBeGreaterThanOrEqual(0);
       expect(result.usage.outputTokens).toBeGreaterThanOrEqual(0);
@@ -116,6 +175,7 @@ describe("estimateCutUsage", () => {
       measured: undefined,
       requestBytes: 10.4,
       relayedBytes: 0,
+      model: MODEL,
     });
     expect(result.usage.inputTokens).toBe(Math.ceil(10.4 / BYTES_PER_TOKEN));
     expect(Number.isInteger(result.usage.inputTokens)).toBe(true);
@@ -131,18 +191,24 @@ describe("estimateCutUsage", () => {
       },
       requestBytes: 0,
       relayedBytes: 0,
+      model: MODEL,
     });
     expect(withCache.usage.cacheReadInputTokens).toBe(100);
     expect(withCache.usage.cacheCreationInputTokens).toBe(50);
 
-    const without = estimateCutUsage({ measured: undefined, requestBytes: 0, relayedBytes: 0 });
+    const without = estimateCutUsage({
+      measured: undefined,
+      requestBytes: 0,
+      relayedBytes: 0,
+      model: MODEL,
+    });
     expect(without.usage.cacheReadInputTokens).toBe(0);
     expect(without.usage.cacheCreationInputTokens).toBe(0);
   });
 
   it("returns a basis that is a member of CUT_CHARGE_BASES", () => {
     const cases = [
-      estimateCutUsage({ measured: undefined, requestBytes: 0, relayedBytes: 0 }),
+      estimateCutUsage({ measured: undefined, requestBytes: 0, relayedBytes: 0, model: MODEL }),
       estimateCutUsage({
         measured: {
           inputTokens: 1,
@@ -152,6 +218,7 @@ describe("estimateCutUsage", () => {
         },
         requestBytes: 0,
         relayedBytes: 0,
+        model: MODEL,
       }),
       estimateCutUsage({
         measured: {
@@ -162,6 +229,7 @@ describe("estimateCutUsage", () => {
         },
         requestBytes: 0,
         relayedBytes: 9,
+        model: MODEL,
       }),
     ];
     for (const { basis } of cases) {
@@ -179,6 +247,7 @@ describe("estimateCutUsage", () => {
       },
       requestBytes: 100,
       relayedBytes: 0,
+      model: MODEL,
     });
     expect(result.basis).toBe("measured");
     expect(result.usage.outputTokens).toBe(0);

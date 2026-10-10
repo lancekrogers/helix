@@ -1038,8 +1038,9 @@ A monthly consumption budget on this resource group, notifying at 80% actual,
 is worth having before any app is deployed. It **notifies and does not enforce** —
 Azure will not stop a resource when a budget is crossed. The real limits are the
 per-app daily LLM budgets and the **enforced platform daily ceiling** on the edge
-(`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`, Bicep `llmPlatformDollarsPerDay`, default one tenth of
-`platformMonthlyUsdCap` per day). That ceiling is not this Azure budget — it is spend refused at
+(`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`, Bicep `llmPlatformDollarsPerDay`, default
+`max(platformMonthlyUsdCap / 10, 3 × llmDefaultDollarsPerDay)` per day). That ceiling is not this
+Azure budget — it is spend refused at
 the gateway when the day's ledger sum crosses the install setting. Operator rollout:
 `apps/docs/src/deploy/updates.md` ("Upgrading to the LLM spend controls").
 
@@ -1101,10 +1102,13 @@ after any deploy that flips the firewall.
 
 **Enforced LLM ceiling (separate from this budget).** `llmPlatformDollarsPerDay`
 (default `-1`) becomes `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` on the **edge only**
-(not the dev gateway). When unset (`-1`), the effective value is one tenth of
-`platformMonthlyUsdCap`, or `100` when that display line is `0`, so hiding the
-portal watch line does not disable enforcement. Set `0` to switch the ceiling
-off (one-organization installs, ADR-0028). Apply the
+(not the dev gateway). When unset (`-1`), the effective value is
+`max(one tenth of platformMonthlyUsdCap, 3 × llmDefaultDollarsPerDay)` — `150`
+with the stock `1000` / `50` defaults; when `platformMonthlyUsdCap` is `0` the
+monthly tenth is `100` before that floor. An explicit parameter value is kept
+as set. Set `0` to switch the ceiling off (one-organization installs,
+ADR-0028). The edge warns at boot (`platform_ceiling.below_app_default_multiple`)
+when the ceiling is on and below `3 × llmDefaultDollarsPerDay`. Apply the
 `platform_llm_spend_micro_usd` migration before deploying an edge image that
 enforces it. `modules/alerts.bicep` includes a rule on
 `helix.gateway.admission_denied` with `reason = platform_ceiling` (KQL unverified

@@ -422,7 +422,13 @@ export function makeLlmHandler(
         let stopReason: string | null = finalStopReason;
         let errorDetail = extra.errorDetail ?? null;
         if (extra.cut) {
-          const estimate = estimateCutUsage({ measured, requestBytes, relayedBytes });
+          const estimate = estimateCutUsage({
+            measured,
+            requestBytes,
+            relayedBytes,
+            model: chat.model,
+            maxTokens: chat.maxTokens,
+          });
           Object.assign(finalUsage, estimate.usage);
           // The default "end_turn" is false for a call that never finished.
           stopReason = null;

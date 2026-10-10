@@ -363,6 +363,18 @@ if (config.llm.platformDollarsPerDay > 0 && pgUsage) {
     }
   };
   ratioGauge.addCallback(observePlatformSpendRatio);
+  const minSaneCeiling = 3 * config.llm.defaultDollarsPerDay;
+  if (config.llm.defaultDollarsPerDay > 0 && config.llm.platformDollarsPerDay < minSaneCeiling) {
+    app.log.warn(
+      {
+        event: "platform_ceiling.below_app_default_multiple",
+        platformDollarsPerDay: config.llm.platformDollarsPerDay,
+        llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
+        minimumRecommended: minSaneCeiling,
+      },
+      "platform LLM ceiling is below three times the per-app default; one tenant can exhaust it for every app",
+    );
+  }
 }
 
 try {

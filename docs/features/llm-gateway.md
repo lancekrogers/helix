@@ -92,8 +92,9 @@ minutes). The upstream `AbortSignal` is the client hang-up signal or that timeou
 whichever comes first. A deadline abort is charged like a partial stream (ledger
 `error` with `deadline_exceeded;usage=…`), not a quota cut. Lease TTL is the deadline
 plus a one-minute grace period so a live call does not lose its slot before it finishes.
-The lease is released only after the ledger row is written, so freed capacity never
-admits a call that cannot yet see the previous call's spend.
+The lease is released only after the ledger row is written. Spend is still read **before** the
+lease is taken, so a newly admitted call may not see a row from a call that just finished; overshoot
+past the per-app cap is bounded by roughly **`appCap` concurrent calls** at worst-case cost, not zero.
 
 ### Provider seam + streaming
 

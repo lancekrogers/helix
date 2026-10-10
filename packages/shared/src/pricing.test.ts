@@ -4,6 +4,7 @@ import {
   CACHE_WRITE_MULTIPLIER,
   costUsd,
   MODEL_PRICING,
+  outputTokenCapForEstimate,
   priceForModel,
   providerForModel,
   supportsStructuredOutputs,
@@ -87,12 +88,25 @@ describe("pricing", () => {
       costUsd({ model: "some-future-model", inputTokens: 1_000_000, outputTokens: 1_000_000 }),
     ).toBe(0);
     expect(priceForModel("some-future-model")).toBeUndefined();
-    expect(priceForModel("claude-opus-4-8")).toEqual({
+    expect(priceForModel("claude-opus-4-8")).toMatchObject({
       inputPerMTok: 5,
       outputPerMTok: 25,
       provider: "anthropic",
       structuredOutputs: true,
+      contextWindowTokens: expect.any(Number),
+      maxOutputTokens: expect.any(Number),
     });
+  });
+
+  it("defines context-window and output limits for every priced model", () => {
+    for (const [model, price] of Object.entries(MODEL_PRICING)) {
+      expect(price.contextWindowTokens, model).toBeGreaterThan(0);
+      expect(price.maxOutputTokens, model).toBeGreaterThan(0);
+    }
+  });
+
+  it("matches Anthropic default output when maxTokens is unset", () => {
+    expect(outputTokenCapForEstimate("claude-fable-5-1")).toBe(1024);
   });
 });
 
