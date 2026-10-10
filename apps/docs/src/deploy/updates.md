@@ -559,6 +559,10 @@ real outages. Check the things that fail silently:
   the latency has passed. When a query comes back empty, suspect the query
   first — wrong workspace, wrong table, wrong schema. There are two Log
   Analytics workspaces per install, so **never index them by position**.
+- **Network controls after a networking change.** If the update touched NSG,
+  firewall, or private-endpoint parameters, run `just infra net-verify` and read
+  any failing `egress.netprobe_check` lines in the **egress** workspace
+  (**unverified in Azure** until you have run it on that install).
 
 ### Verification pitfalls
 

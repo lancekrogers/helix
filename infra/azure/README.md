@@ -56,6 +56,12 @@ infra/netsim/translate.test.mjs`, which also runs in the dev container). The sim
 
 ### The security shape, in one diagram
 
+With `deployFirewall=true`, forced tunneling sends both app subnets through the
+firewall; with the firewall off, edge and portal use default internet egress
+while every install still gets the `snet-egress` NSG and the application SSRF
+filter. Posture for a given install is the `netControls` output plus the last
+`egress.netprobe_result`, not this diagram alone.
+
 ```
                  Internet
                     │ (inbound: edge only)        ▲ (outbound: egress only)
@@ -70,9 +76,12 @@ infra/netsim/translate.test.mjs`, which also runs in the dev container). The sim
        (app images pulled from public GHCR, not a private registry)
 ```
 
-- **edge** can be reached from the internet (public ingress) but **cannot reach
-  it** — its subnet's default route goes to the firewall, which denies.
-- **egress** is the only subnet the firewall lets out. It has no public ingress.
+- **edge** can be reached from the internet (public ingress). With the firewall
+  on, its subnet's default route goes to the firewall, which denies general
+  internet egress; with the firewall off, outbound internet is allowed by Azure's
+  default route.
+- **egress** is the only subnet the firewall lets out when the firewall is on. It
+  has no public ingress. The NSG on `snet-egress` applies either way.
 - **portal** is internal ingress only — not routable from app subdomains.
 - All data services are private-endpoint only; `publicNetworkAccess` is off.
 - The **edge identity has no role on `kv-connections`** — an edge RCE cannot read
@@ -139,6 +148,9 @@ az containerapp exec -n <prefix>-portal -g <resource-group> \
 
 Adjust the JSON array to your deployed allow-list. Do not paste connection
 secrets or database URLs into the command line.
+
+Operator rollout order, compatibility breaks, and the accepted-risk pointer live
+in [`docs/features/network-controls.md`](../../docs/features/network-controls.md).
 
 The Standard firewall deployment charge is approximately $900/month before data
 processing. `deployFirewall` defaults to true; operators can disable it with the
@@ -1397,36 +1409,53 @@ if a deploy misbehaves:
 
 ## Verifying the isolation (post-deploy)
 
-> Assumes `deployFirewall=true` (the default). With the firewall **off**, the
-> edge outbound check below **succeeds** instead of failing — the egress-only
-> zone is not enforced (see "Optional: the egress firewall"). The private
-> data-services checks hold regardless of the flag.
+**Start with declared posture and the probe.** After deploy, read the `netControls`
+output from the same deployment and compare it to the latest
+`egress.netprobe_result` in the egress Log Analytics workspace. On demand:
 
 ```bash
-# the images carry no curl/wget, and exec needs a TTY — probe with node over a
-# pseudo-TTY (script(1) supplies it)
+just infra net-verify <resource-group> [namePrefix]
+```
 
-# from an edge replica: outbound internet must FAIL, egress must succeed
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-edge --command \
-  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
-# expect: ERR (blocked)
+The recipe starts `<prefix>-netprobe`, waits for the job execution, and prints
+`egress.netprobe_check` / `egress.netprobe_result` lines. Interpreting them
+against your NSG and firewall settings is **unverified in Azure** until you have
+run it on that install. Local rule-order checks (no Azure semantics):
+`just infra net-sim` on a Docker host — see "Verifying the network controls"
+above.
 
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-edge --command \
+**Edge→egress inbound** is not exercised by the probe (it dials from inside the
+egress environment). Keep this check after any full apply that rewrites
+`EDGE_EGRESS_URL`:
+
+```bash
+script -q /dev/null az containerapp exec -g <rg> -n <prefix>-edge --command \
   "node -e \"fetch(process.env.EDGE_EGRESS_URL+'/health').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
 # expect: 200
-
-# edge -> portal rides EDGE_PORTAL_URL — probe it before trusting the
-# connections surfaces, the same way
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-edge --command \
-  "node -e \"fetch(process.env.EDGE_PORTAL_URL+'/health').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
-# expect: 200
-
-# from an egress replica: outbound internet must SUCCEED
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-egress --command \
-  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
-# expect: 200
-
-# data services are private — confirm publicNetworkAccess is Disabled
-az postgres flexible-server show -g <rg> -n helix-prod-pg --query network
-az keyvault show -n helix-prod-kvc --query properties.publicNetworkAccess
 ```
+
+**Firewall on vs off.** With `deployFirewall=true`, an edge replica's fetch to
+`https://example.com` should fail (forced tunnel denies apps subnet internet).
+With the firewall **off**, that same fetch **succeeds** — only the egress NSG
+and application filter govern egress paths; the edge has default internet egress.
+The egress NSG still applies in both cases.
+
+```bash
+# edge outbound internet — outcome depends on deployFirewall (see above)
+script -q /dev/null az containerapp exec -g <rg> -n <prefix>-edge --command \
+  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
+
+# egress outbound internet — expect reachability when NSG mode allows (probe covers this)
+script -q /dev/null az containerapp exec -g <rg> -n <prefix>-egress --command \
+  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
+```
+
+**Data services stay private** regardless of `deployFirewall`:
+
+```bash
+az postgres flexible-server show -g <rg> -n <prefix>-pg --query network
+az keyvault show -n <prefix>-kvc --query properties.publicNetworkAccess
+```
+
+Optional: edge→portal via `EDGE_PORTAL_URL` the same way as edge→egress. Full
+rollout steps: [`docs/features/network-controls.md`](../../docs/features/network-controls.md).

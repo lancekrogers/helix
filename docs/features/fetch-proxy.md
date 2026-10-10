@@ -1,6 +1,6 @@
 # Fetch proxy
 
-> **Related ADRs:** [ADR-0005](../adr/0005-ssrf-egress-controls.md) (SSRF + secret injection) · [ADR-0013](../adr/0013-egress-trust-model.md) (egress trust model) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split / edge posture) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0031](../adr/0031-connection-providers-delegated-auth.md) (connection providers — the delegated-auth catalog).
+> **Related ADRs:** [ADR-0005](../adr/0005-ssrf-egress-controls.md) (SSRF + secret injection) · [ADR-0013](../adr/0013-egress-trust-model.md) (egress trust model) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split / edge posture) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0031](../adr/0031-connection-providers-delegated-auth.md) (connection providers — the delegated-auth catalog). Network layers beyond the application filter: [network-controls.md](./network-controls.md).
 
 Apps call third-party APIs through a same-origin URL, for example
 `fetch('/_api/fetch/https://api.github.com/...')`. The platform checks permissions,
@@ -45,8 +45,11 @@ decides *whether* the call may happen and to *where*; egress actually makes it.
    `(app, user, capability, origin, connection?, request-id)` and forwards the
    request + instruction to egress over the `EgressProvider` HTTP seam. The edge
    has **no grant on `app_secrets`** (it cannot read an app's connection secret)
-   and no *arbitrary* outbound route — only egress reaches the open internet — so
-   it can only ask egress to make a call it already authorized. The edge is *not*
+   and, when `deployFirewall` is true, no general outbound internet route — only
+   egress reaches the open internet (with the firewall off, edge and portal have
+   default internet egress; see `infra/azure/README.md` and
+   [network-controls.md](./network-controls.md)) — so it can only ask egress to make
+   a call it already authorized. The edge is *not*
    secretless, though: it holds its own operational keys (auth/instruction/OIDC)
    and today an over-broad Blob access key (tightening that to a read-only managed
    identity is tracked). (ADR-0001.)
@@ -421,7 +424,8 @@ build well:
 
 The egress image ships a standalone probe (`apps/egress/src/netprobe.ts`) used by the
 Azure `<prefix>-netprobe` job and by local net simulation. It reads only `PROBE_*`
-environment variables (no secrets):
+environment variables (no secrets). Posture and rollout: [network-controls.md](./network-controls.md)
+(when the firewall is deployed; see `infra/azure/README.md`).
 
 | Variable | Meaning |
 | --- | --- |
@@ -463,8 +467,9 @@ summary; see `docs/design/logging.md`.
   (authenticates to Key Vault as itself) and **own** network zone — a forked
   process shares both and "buys you almost nothing." The split buys three things:
   credential isolation that is true-by-architecture not by-code-review;
-  **network/SSRF isolation** (the big one — the edge has no *arbitrary* outbound
-  route, only egress reaches the open internet, so an SSRF bug in the edge itself
+  **network/SSRF isolation** (the big one — with `deployFirewall` true the edge has
+  no general outbound route; only egress reaches the open internet, so an SSRF bug
+  in the edge itself
   reaches nothing; ADR-0001); and dependency
   isolation (the fat HTTP deps live on egress, the edge stays minimal §3). Honest
   limit: extraction *relocates* the all-secrets read, it doesn't eliminate it —
@@ -501,8 +506,8 @@ summary; see `docs/design/logging.md`.
   brackets (`[::1]`) which `isIP` rejects — they're stripped before resolve. The
   whole host is refused if *any* resolved address is blocked (defeats a
   dual-A-record split), and the connection is pinned to the validated IP against
-  rebind. App-layer checks here are the belt; an NSG/firewall is the
-  network-layer suspenders in prod.
+  rebind. App-layer checks here are the baseline; the `snet-egress` NSG and the
+  optional Azure Firewall are the network tiers ([network-controls.md](./network-controls.md)).
 
 ## Planned / not yet built
 

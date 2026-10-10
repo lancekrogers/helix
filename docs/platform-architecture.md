@@ -114,7 +114,7 @@ already deploys them separately; deployment review enforces that separation
 ([ADR-0012](adr/0012-edge-portal-codeploy.md)). Egress must always run separately
 to preserve its network and credential isolation.
 
-All three containers run on Azure Container Apps for v1 (AKS if/when needed), keeping the stack portable. Egress sits in its own egress-permitted network zone; the edge and portal run with no outbound internet route.
+All three containers run on Azure Container Apps for v1 (AKS if/when needed), keeping the stack portable. Egress sits in its own egress-permitted network zone; when `deployFirewall` is true, the edge and portal subnets are forced through the firewall and denied general internet egress. With the firewall off they use default internet egress while egress traffic stays governed by the application SSRF filter and the `snet-egress` NSG (see [network controls](features/network-controls.md)).
 
 ---
 

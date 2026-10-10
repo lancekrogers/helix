@@ -159,3 +159,7 @@ mechanism, because there is no secret to seal.
   per-app daily token budgets (synchronous, at the edge) and the
   per-deployment TPM `capacity`, which is the hard, real-time, Azure-side
   bound on burn rate.
+
+## Amendment (2026-10-10): the firewall allow-list
+
+When `egressFqdnMode` is `allowlist` and `deployFirewall` is true, the Foundry account host (`<foundryAccountName>.services.ai.azure.com`, derived in `main.bicep` from `deployFoundry` or from `egressManagedIdentityConnections`) must appear in the egress product FQDN list the firewall enforces. A private-endpoint Foundry account remains unsupported: a PE resolves to a private address the SSRF connector blocks (the "Deliberately not done" bullet above).

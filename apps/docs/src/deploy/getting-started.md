@@ -52,13 +52,17 @@ normal deploy builds nothing locally — you pick a published image tag.
 ## What it costs
 
 The default shape costs roughly **$125/month**. The one expensive optional is
-the Azure Firewall: about **$920/month**, flat whether busy or idle. It is the
-primary egress control — it is what stops a compromised app (or the edge
-itself) from reaching the internet directly — so it is on by default.
+the Azure Firewall: about **$920/month**, flat whether busy or idle. **Baseline
+egress control on every install** is the application SSRF filter plus the
+`snet-egress` NSG. The firewall adds FQDN allow-listing and threat intelligence
+when `deployFirewall=true`; it is on by default in the template.
 
-- Production, or anything hosting apps from multiple authors: keep it.
+- Production, or anything hosting apps from multiple authors: keep the firewall.
+  Use `egressFqdnMode=allowlist` on new installs; existing firewall installs
+  stay on `any` until you flip explicitly (operator cost: maintain
+  `egressAllowedFqdns` — see [network controls](/deploy/configuration#feature-gates)).
 - A dev or test install: `deployFirewall=false` saves the money. Data services
-  stay private either way.
+  stay private either way; the NSG and application filter still apply.
 
 A monthly budget alert is deployed alongside, sized from these two numbers, so
 tune `expectedMonthlyUsdExFirewall` if your Postgres SKU differs much from the

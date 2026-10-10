@@ -17,9 +17,11 @@
 // a bare request limit reachability there.
 //
 // Rules load from ../nsg-egress-rules.json (shared with the local net simulation).
-// Rows marked hypothesis in that file — platform flows (100, 140–143), DNS via
-// 168.63.129.16, the 100.64.0.0/10 deny, ILB source addresses, service-tag
-// membership — are unverified in Azure until an operator runs net-verify.
+// Rows marked hypothesis in that file — platform flows (100, 140–143), the
+// 100.64.0.0/10 deny, ILB source addresses, service-tag membership — are
+// unverified in Azure until an operator runs net-verify. Prefix denies on
+// 168.63.129.16 and 169.254.169.254 do not filter Azure's documented host-node
+// paths; ssrf.ts is the control there (see ADR-0005 amendment).
 
 @description('Azure region.')
 param location string

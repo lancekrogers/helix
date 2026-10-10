@@ -130,7 +130,7 @@
       "destinationPorts": ["*"],
       "modes": ["deny-list-only", "enforce"],
       "status": "hypothesis",
-      "note": "wire server and health-probe address; safe whether or not it answers from a replica"
+      "note": "documented belt-and-braces row; Azure exempts 168.63.129.16 on ports 80 and 32526 and DNS to it from prefix-based NSG rules — the application block list in ssrf.ts is the control on those paths"
     },
     {
       "name": "deny-link-local",
@@ -143,7 +143,7 @@
       "destinationPorts": ["*"],
       "modes": ["deny-list-only", "enforce"],
       "status": "known",
-      "note": "IMDS and link-local"
+      "note": "does not filter IMDS at 169.254.169.254 (exempt unless AzurePlatformIMDS is targeted); covers the rest of 169.254.0.0/16 — application block list controls IMDS for proxied traffic"
     },
     {
       "name": "deny-vnet",

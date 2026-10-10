@@ -315,6 +315,14 @@ component, so traces and metrics land in the same Log Analytics workspace the
 environment already ships stdout to. Metrics arrive in `customMetrics`
 (`AppMetrics` under the workspace schema — the two names are the same table).
 
+**Network probe logs (stdout, not OTLP).** The `<prefix>-netprobe` job emits
+structured lines `egress.netprobe_check` (per destination) and
+`egress.netprobe_result` (roll-up). They are registered in
+[`docs/design/logging.md`](../design/logging.md); alerts in
+`alerts-netprobe.bicep` query `ContainerAppConsoleLogs_CL` in the **egress**
+workspace. Whether job console JSON lands in that table with the expected shape
+is **unverified in Azure** until an operator runs `just infra net-verify`.
+
 Two alert rules read the registry gauges, and they read **different signals on
 purpose** (`infra/azure/modules/alerts.bicep`); a third reads the trust-proxy
 one:
