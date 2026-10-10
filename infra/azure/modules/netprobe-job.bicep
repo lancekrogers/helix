@@ -11,8 +11,8 @@
 // no Azure API. A dedicated user-assigned identity with zero grants keeps a
 // compromise worthless, unlike migrate-job.bicep which must read kv-platform.
 //
-// NOT A DEPLOY GATE (decision N4): the schedule and alerts surface drift; an
-// operator confirms with `just infra net-verify`. A failed run is a result to
+// NOT A DEPLOY GATE: the schedule and alerts surface drift; an operator confirms
+// with `just infra net-verify`. A failed run is a result to
 // read, not something to retry into a pass — replicaRetryLimit is 0.
 //
 // Unverified in Azure: that the job starts on schedule and on demand, that the

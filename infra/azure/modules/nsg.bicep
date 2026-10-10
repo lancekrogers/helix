@@ -1,24 +1,25 @@
 // nsg.bicep — network security group for snet-egress only.
 //
 // Created before the VNet (like routing.bicep) so the subnet can reference it
-// inline at creation time. Azure rejects late association on a subnet that
-// already holds Container Apps infrastructure — the same limit documented for
-// route tables in network.bicep — and whether a populated ACA subnet accepts an
+// inline at creation time. Late association on a populated subnet is documented
+// for route tables in network.bicep; whether a populated ACA subnet accepts an
 // NSG as an update is unverified in Azure.
 //
 // Edge, portal, dev-gateway, certbot and migrate share snet-apps on one ACA
-// environment, so an NSG there cannot separate them (decision N5); egress is
+// environment, so an NSG there cannot separate them (deferred); egress is
 // alone on snet-egress apart from its OTel collector, so layer-2 control lands
 // here first. snet-pe has privateEndpointNetworkPolicies Disabled, so an NSG
 // there would not filter endpoint traffic anyway.
 //
-// The NSG cannot stop SSRF to Postgres or the two vaults egress legitimately
-// uses (rules allow them); only the application filter and absent credentials on
-// a bare request limit reachability there.
+// The NSG cannot stop SSRF to Postgres or the vaults egress legitimately uses:
+// rules must allow kv-connections, kv-delegated, and kv-platform (egress Key
+// Vault references). Only the application filter and absent credentials on a bare
+// request limit reachability there; narrowing the egress identity's kv-platform
+// grant is follow-up work (see TODO.md).
 //
 // Rules load from ../nsg-egress-rules.json (shared with the local net simulation).
-// Rows marked hypothesis in that file — platform flows (100, 140–143), the
-// 100.64.0.0/10 deny, ILB source addresses, service-tag membership — are
+// Rows marked hypothesis in that file — platform flows (100, 140–143), deny-cgnat
+// (100.64.0.0/10, enforce mode only), ILB source addresses, service-tag membership — are
 // unverified in Azure until an operator runs net-verify. Prefix denies on
 // 169.254.169.254 do not filter IMDS on Azure's documented host-node paths;
 // ssrf.ts is the only control on 168.63.129.16 (Microsoft says not to deny that

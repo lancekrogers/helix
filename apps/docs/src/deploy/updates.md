@@ -216,7 +216,10 @@ SELECT slug FROM apps
    with your parameters. Set the four concurrency parameters (`llmMaxAppInFlight`,
    `llmMaxUserInFlight`, `llmMaxInFlight`, `fetchMaxAppInFlight`), the call deadline
    (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. See
-   [Configuration](/deploy/configuration).
+   [Configuration](/deploy/configuration). If this template also ships network controls, read
+   [Upgrading to the network controls](#upgrading-to-the-network-controls) step 0 first — set
+   `egressNsgEnforce = 'off'` until the scratch-copy test passes before any full apply, including
+   this step.
 
 7. **Mixed replicas.** An edge revision without `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` disables the
    platform ceiling on that replica, so a rolling deploy with old and new replicas does not refuse
@@ -234,6 +237,58 @@ has an off value (`0`) except the call deadline. Migrations are additive and can
 (compile-checked only); the platform-spend alert rule's query and whether it fires; the production
 owner role under `FORCE` RLS; abort propagation through the Container Apps ingress between edge and
 egress; lease behavior across real replicas.
+
+## Upgrading to the network controls
+
+These notes mirror the operator rollout in `docs/features/network-controls.md` in the
+repository. Nothing here runs automatically.
+
+0. **Hold the NSG off until the scratch copy passes.** Until you have attached the egress NSG on a
+   non-production copy of the install and run `just infra net-verify` there, set
+   `egressNsgEnforce = 'off'` in your parameter file before **any** full template apply — including
+   step 6 of [Upgrading to the LLM spend controls](#upgrading-to-the-llm-spend-controls) if that
+   apply ships this template. Also decide `deployNetprobe`: the probe job and its two log alerts
+   deploy by default (`deployNetprobe` true, requires `deployApps`), and the no-recent-success alert
+   fires until the first scheduled or on-demand run.
+
+   Any full apply of this template changes more than the NSG, even with `egressNsgEnforce = 'off'`:
+   it deploys the `<prefix>-netprobe` job and its alerts (unless `deployNetprobe = false`), sets
+   threat intelligence to `Deny` on firewall installs (`threatIntelMode`), adds `login.microsoft.com`
+   to the egress platform firewall list (Key Vault references), excludes the probe's canary host from
+   the firewall-denial alert query, and sets `EGRESS_EXTRA_BLOCKED_CIDRS` on the egress container.
+
+1. **Scratch copy first.** Test NSG attachment on a non-production copy of the install. Resolve
+   hypothesis rows with `just infra net-verify` and fill the ADR-0005 probe table in the repository.
+
+2. **Application layer.** Roll the next egress image with a scoped `az containerapp update` (same
+   shape as [Roll the apps](#2-roll-the-apps) above). `EGRESS_EXTRA_BLOCKED_CIDRS` arrives with the
+   first full template apply, not with the image roll alone.
+
+3. **Non-80/443 origins.** Audit live manifests for approved fetch origins on other ports; they stop
+   working once `egressNsgEnforce=enforce` and the closing deny is active.
+
+4. **Private-endpoint pinning.** For new installs set `pinPrivateEndpointAddresses=true`. On an
+   existing install list current endpoint addresses (`az network private-endpoint list`), pick
+   non-clashing values for `privateEndpointAddresses`, then enable pinning — Azure may require
+   recreating endpoints (**unverified in Azure**).
+
+5. **NSG `deny-list-only`.** Apply the template with `egressNsgEnforce=deny-list-only`, then verify
+   `/health`, a proxied fetch, an LLM call, a connection-secret read, edge→egress `/health` from inside
+   the edge replica (the probe cannot test inbound rules), and `just infra net-verify`.
+
+6. **`enforce`.** Once the probe is green **and** edge→egress `/health` returns 200, move one install
+   at a time to `egressNsgEnforce=enforce`.
+
+7. **Subnet recreation fallback.** If a populated subnet cannot take an NSG as a plain update,
+   recreating the egress environment is the documented disruption — schedule it.
+
+8. **Accepted-risk record.** In the deployments repo, point the firewall-off acceptance at the
+   `netControls` deployment output and the last successful `egress.netprobe_result` instead of
+   duplicating posture in prose.
+
+**Existing firewall installs:** `egressFqdnMode` stays `any` on template upgrade unless your
+parameter file sets `allowlist`; `threatIntelMode=Deny` can ship on apply. Flipping to `allowlist`
+requires maintaining `egressAllowedFqdns` (use `just infra egress-hosts`).
 
 ## What a rollout actually does
 

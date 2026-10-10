@@ -62,12 +62,13 @@ param deployFirewall = true
 // param threatIntelMode = 'Alert'  // 'Deny' drops known-bad destinations; use 'Alert' to log only
 // egressFqdnMode only applies when deployFirewall is true. allowlist = product FQDNs plus platform
 // rules; any = * on 80/443 (template default — installs with their own param file keep any unless set).
-param egressFqdnMode = 'allowlist'
+// param egressFqdnMode = 'allowlist'  // new firewall installs; existing installs stay on 'any' until `just infra egress-hosts` shows the list is complete
 // param egressAllowedFqdns = ['api.vendor.example']  // connection providers + approved fetch origins
 
 // Egress subnet NSG (layer 2). enforce = deny list + closing deny-all; deny-list-only =
 // safe first step on an existing install (no row 4000); off = no NSG. Unverified in
 // Azure whether a populated ACA subnet accepts NSG attachment as an update.
+// param egressNsgEnforce = 'off'  // existing installs: keep off until the scratch-copy test and net-verify pass
 // param egressNsgEnforce = 'enforce'  // new installs; existing installs keep the deny-list-only default until net-verify passes
 // param egressAllowedPorts = ['80', '443']  // non-standard approved-origin ports need values here
 

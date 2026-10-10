@@ -13,12 +13,12 @@ Outbound traffic from hosted apps is governed at the fetch proxy ([fetch-proxy.m
 
 ## Per-install settings
 
-Defaults are the strict or safe-on-upgrade values in `infra/azure/main.bicep`. Relax only with a documented operator decision.
+Defaults are the strict or upgrade-conservative values in `infra/azure/main.bicep`. Relax only with a documented operator decision.
 
 | Knob | Default | Strict vs relaxed |
 | --- | --- | --- |
 | `EGRESS_EXTRA_BLOCKED_CIDRS` | Set by template to `vnetAddressPrefix` + `100.100.0.0/17` | Strict: blocks the install VNet and ACA infra slice at the application layer |
-| `egressNsgEnforce` | `deny-list-only` | Safe on upgrade: the deny rows without the closing deny-all. Strict: `enforce` adds the closing deny-all. `off` removes the NSG |
+| `egressNsgEnforce` | `deny-list-only` | Designed not to change platform flows on upgrade: explicit deny rows without the closing deny-all (**unverified in Azure** until `just infra net-verify` and the edge→egress check pass). Strict: `enforce` adds the closing deny-all and the `100.64.0.0/10` row. `off` detaches the NSG |
 | `egressAllowedPorts` | `80`, `443` | Strict: non-standard approved fetch ports need explicit values before `enforce` |
 | `pinPrivateEndpointAddresses` | `false` | Relaxed for upgrades: dynamic PE IPs; `true` pins `.4`–`.7` of `snet-pe` (overridable) for tighter NSG rows |
 | `privateEndpointAddresses` | Derived when pinning | Overrides per-endpoint IPv4 when pinning is on |
@@ -33,11 +33,27 @@ Defaults are the strict or safe-on-upgrade values in `infra/azure/main.bicep`. R
 
 Read the effective posture from the deployment output `netControls` (firewall flag, FQDN mode, NSG mode, extra CIDRs, pinned addresses, probe expectations).
 
+`deny-list-only` activates every outbound deny row in `nsg-egress-rules.json` except the closing deny-all (row 4000) and `deny-cgnat` (`100.64.0.0/10`, which is **enforce-only**). Inbound `deny-vnet-in` is also enforce-only so ILB backend traffic from the apps subnet is not dropped on the default path.
+
 ## The probe
 
-`apps/egress/src/netprobe.ts` dials forbidden and required destinations from the egress subnet, classifies each attempt (`blocked`, `reachable`, `unresolved`, `error`), and prints JSON lines `egress.netprobe_check` (per check) and `egress.netprobe_result` (summary). Wire-server (`168.63.129.16`) and IMDS checks are **informational in every mode**: Azure documents that prefix-based NSG rules do not filter those host-node paths ([168.63.129.16](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16), [NSG platform considerations](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview)); the application block list is the control for proxied traffic.
+`apps/egress/src/netprobe.ts` dials forbidden and required destinations from the egress subnet, classifies each attempt (`blocked`, `reachable`, `unresolved`, `error`), and prints JSON lines `egress.netprobe_check` (per check) and `egress.netprobe_result` (summary). **The probe tests outbound paths only** — a green `egress.netprobe_result` does not prove edge→egress or portal→egress inbound through the internal load balancer; run the edge→egress `/health` check in `infra/azure/README.md` after apply.
+
+Wire-server (`168.63.129.16`) and IMDS checks are **informational in every mode**: Microsoft documents that prefix-based NSG rules do not filter WireServer on ports 80 and 32526 unconditionally, and filter DNS to `168.63.129.16` only when targeted with the `AzurePlatformDNS` service tag ([Container Apps firewall integration](https://learn.microsoft.com/en-us/azure/container-apps/firewall-integration), [168.63.129.16](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)); `ssrf.ts` is the only control on `168.63.129.16` for proxied traffic (there is no NSG deny row on that address).
 
 `PROBE_PE_ADDRESSES` is `pinned` when `pinPrivateEndpointAddresses` is true (15 checks) or `dynamic` when off (11 checks — private-endpoint rows omitted). Expectations depend on `PROBE_EXPECT_NSG`, `PROBE_EXPECT_FIREWALL`, and `PROBE_EXPECT_FQDN_ALLOWLIST` (wired from `netControls`).
+
+When `PROBE_PE_ADDRESSES=pinned` and the NSG is not `off`:
+
+| Check id | Expected |
+| --- | --- |
+| `kv-platform-443` | `reachable` (egress Key Vault references to kv-platform) |
+| `kv-connections-443`, `kv-delegated-443` | `reachable` |
+| `blob-pe-443` | `blocked` when NSG is on; informational when `off` |
+| `postgres-5432`, `public-allowed-443`, `dns-resolve` | `reachable` |
+| `public-canary-443` | `blocked` when FQDN allow-list is on; else `reachable` |
+| `public-port-25`, `public-port-22`, `public-port-8443` | `blocked` when `enforce`; informational in `deny-list-only` |
+| `wire-server-*`, `imds-80`, `apps-env-443` | `informational` |
 
 | Recipe | Purpose |
 | --- | --- |
@@ -61,10 +77,10 @@ Alerts (`alerts-netprobe.bicep`) read the **egress** Log Analytics workspace. Fi
 
 ## What this does not stop
 
-- **Postgres and the two vaults egress uses** — NSG and firewall rules must allow `kv-connections`, `kv-delegated`, and Postgres; only the application filter and absent credentials limit bare reachability.
+- **Postgres, kv-connections, kv-delegated, and kv-platform** — NSG and firewall rules must allow them. Egress loads its own secrets from kv-platform through Key Vault references fetched from `snet-egress`, so the NSG must allow kv-platform when pinning is on. The egress identity holds Key Vault Secrets User on the whole kv-platform vault, so the network layer cannot stop an egress compromise from reading platform secrets; per-secret role assignments or a separate egress-only vault is the real fix (deferred in `TODO.md`). A bare HTTP request without an injected credential is still limited by the application filter.
 - **Exfiltration to a host the allow-list must permit** — when `egressFqdnMode=allowlist`, any hostname in `egressAllowedFqdnsEffective` remains reachable on allowed ports.
 - **DNS tunnelling** — not in scope of the NSG/FQDN rules described here.
-- **Lateral movement on `snet-apps`** — edge, portal, and dev-gateway share one subnet; an NSG there cannot separate them (decision N5, deferred).
+- **Lateral movement on `snet-apps`** — edge, portal, and dev-gateway share one subnet; an NSG there cannot separate them (deferred).
 
 ## Planned / not yet built
 
@@ -78,8 +94,9 @@ Until an operator records results in [ADR-0005](../adr/0005-ssrf-egress-controls
 | --- | --- |
 | NSG attach on a populated Container Apps subnet | Azure may reject late association |
 | Platform-flow allow rows (MCR, Front Door, Entra, Monitor, ILB) | Marked `hypothesis` in rule JSON |
-| `100.64.0.0/10` deny vs ingress | Hypothesis row |
+| `deny-cgnat` (`100.64.0.0/10`) on `enforce` | Enforce-only row; hypothesis until net-verify |
 | Replica behavior at `168.63.129.16` / IMDS | Informational probe checks |
+| Do edge and portal reach egress through the internal load balancer on 31080 and 31443 with the NSG on? | Inbound ILB backend ports; not covered by the probe |
 | Edge→egress source IP seen by NSG | Inbound rule hypothesis |
 | Static private-endpoint `ipConfigurations` | API and update semantics |
 | Firewall runtime (SNI-only rules, collection limits, post-handshake drop, threat intel on SKU) | Template declares; probe uses TLS handshake assumption |
@@ -88,12 +105,12 @@ Until an operator records results in [ADR-0005](../adr/0005-ssrf-egress-controls
 
 ## Operator rollout notes
 
-1. **Scratch copy first (N1).** Test NSG attachment on a non-production copy of the install. Resolve hypothesis rows with `just infra net-verify` and fill the ADR-0005 probe table.
-2. **Application layer.** Ship the next egress image; no infra change required. The template sets `EGRESS_EXTRA_BLOCKED_CIDRS`.
+1. **Scratch copy first.** Test NSG attachment on a non-production copy of the install. Resolve hypothesis rows with `just infra net-verify` and fill the ADR-0005 probe table.
+2. **Application layer.** Roll the next egress image with a scoped `az containerapp update` (see the operator updates doc, "Roll the apps"). `EGRESS_EXTRA_BLOCKED_CIDRS` arrives with the first full template apply.
 3. **Non-80/443 origins.** Audit live manifests for approved fetch origins on other ports; they stop working once `egressNsgEnforce=enforce` and the closing deny is active.
-4. **Private-endpoint pinning (N2).** For new installs set `pinPrivateEndpointAddresses=true`. On an existing install list current endpoint addresses (`az network private-endpoint list`), pick non-clashing values for `privateEndpointAddresses`, then enable pinning — Azure may require recreating endpoints (**unverified in Azure**).
+4. **Private-endpoint pinning.** For new installs set `pinPrivateEndpointAddresses=true`. On an existing install list current endpoint addresses (`az network private-endpoint list`), pick non-clashing values for `privateEndpointAddresses`, then enable pinning — Azure may require recreating endpoints (**unverified in Azure**).
 5. **NSG `deny-list-only`.** Apply the template with `egressNsgEnforce=deny-list-only`, then verify `/health`, a proxied fetch, an LLM call, a connection-secret read, edge→egress `/health` from inside the edge replica (the probe cannot test inbound rules), and `just infra net-verify`.
-6. **`enforce`.** Once the probe is green, move one install at a time to `egressNsgEnforce=enforce`.
+6. **`enforce`.** Once the probe is green and edge→egress `/health` returns 200, move one install at a time to `egressNsgEnforce=enforce`.
 7. **Subnet recreation fallback.** If a populated subnet cannot take an NSG as a plain update, recreating the egress environment is the documented disruption — schedule it.
 8. **Accepted-risk record.** In the deployments repo, point the firewall-off acceptance at `netControls` and the last successful `egress.netprobe_result` instead of duplicating posture in prose.
 

@@ -424,8 +424,8 @@ build well:
 
 The egress image ships a standalone probe (`apps/egress/src/netprobe.ts`) used by the
 Azure `<prefix>-netprobe` job and by local net simulation. It reads only `PROBE_*`
-environment variables (no secrets). Posture and rollout: [network-controls.md](./network-controls.md)
-(when the firewall is deployed; see `infra/azure/README.md`).
+environment variables (no secrets). Posture and rollout: [network-controls.md](./network-controls.md).
+When `deployFirewall` is true, see also `infra/azure/README.md`.
 
 | Variable | Meaning |
 | --- | --- |

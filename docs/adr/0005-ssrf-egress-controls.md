@@ -109,11 +109,11 @@ The **primary control** wording in the Challenge outcome (line 43) and the Deplo
 
 The block at lines 79–87 is unchanged. Those installs hold an exception of: firewall off, application filter on, NSG on once an operator has applied it (`egressNsgEnforce` not `off`), trusted single-tenant, with the probe result as the standing evidence. Update the operator's deployments-repo acceptance to point at `netControls` and the last successful `egress.netprobe_result` instead of restating posture here.
 
-NSG rows still **unverified in Azure** until an operator records probe results below include: platform-flow allows (MCR, Front Door, Entra, Azure Monitor, load-balancer paths), the `100.64.0.0/10` deny versus ingress, ILB source addresses for edge→egress, service-tag membership, and static private-endpoint addressing when `pinPrivateEndpointAddresses` is true.
+NSG rows still **unverified in Azure** until an operator records probe results below include: platform-flow allows (MCR, Front Door, Entra, Azure Monitor, load-balancer paths), whether `deny-cgnat` (`100.64.0.0/10`, enforce-only) breaks ingress, ILB backend ports for edge→egress, service-tag membership, and static private-endpoint addressing when `pinPrivateEndpointAddresses` is true.
 
 ### Host-node paths (documented Azure behavior)
 
-The NSG table includes prefix denies on `168.63.129.16` and `169.254.0.0/16`. Microsoft documents that traffic to the platform address `168.63.129.16` on ports 80/tcp and 32526/tcp, and DNS to that address, is not subject to configured NSG rules unless targeted with the `AzurePlatformDNS` service tag ([What is IP address 168.63.129.16?](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)). Instance metadata at `169.254.169.254` is similarly exempt unless the `AzurePlatformIMDS` tag is used ([Network security groups overview — Azure platform considerations](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview)). The application block list (`168.63.129.16/32`, `169.254.0.0/16`) is therefore the control on those addresses for proxied egress traffic. What a Container Apps replica actually sees at those addresses remains **unverified in Azure** until recorded in the probe table.
+There is no NSG deny row on `168.63.129.16` — Microsoft says not to explicitly deny that address on a Container Apps subnet ([Securing a Virtual Network in Azure Container Apps](https://learn.microsoft.com/en-us/azure/container-apps/firewall-integration)). Microsoft documents that traffic to `168.63.129.16` on ports 80/tcp and 32526/tcp is not subject to configured NSG rules. DNS to that address is not filtered unless the rule targets the `AzurePlatformDNS` service tag ([What is IP address 168.63.129.16?](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)). Instance metadata at `169.254.169.254` is similarly exempt unless the `AzurePlatformIMDS` tag is used ([Network security groups overview — Azure platform considerations](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview)). `ssrf.ts` is therefore the only control on `168.63.129.16` and on IMDS for proxied egress traffic. What a Container Apps replica actually sees at those addresses remains **unverified in Azure** until recorded in the probe table.
 
 ### New ranges
 
@@ -121,7 +121,7 @@ The filter now also blocks: `168.63.129.16/32`, IPv4 documentation `192.0.2.0/24
 
 ### The honest limit
 
-The NSG and firewall cannot protect Postgres or the two Key Vault private endpoints egress legitimately uses (`kv-connections`, `kv-delegated`): the rule table must allow them. A bare HTTP request without an injected credential is still limited by the application filter; exfiltration with a stolen instruction is a separate trust-boundary problem (ADR-0013).
+The NSG and firewall cannot protect Postgres or the Key Vault private endpoints egress legitimately uses (`kv-connections`, `kv-delegated`, and **kv-platform** for egress's own Key Vault references): the rule table must allow them. The egress identity holds Key Vault Secrets User on the whole kv-platform vault, so the network layer cannot stop an egress compromise from reading platform secrets; narrowing that grant (per-secret role assignments or a separate egress-only vault) is deferred in `TODO.md`. A bare HTTP request without an injected credential is still limited by the application filter; exfiltration with a stolen instruction is a separate trust-boundary problem (ADR-0013).
 
 ### Probe results
 
@@ -133,7 +133,8 @@ Fill this in on a real install after `just infra net-verify`. Until then every r
 | What does a replica see at `169.254.169.254`? | `netprobe` IMDS check (informational) | not yet run on a real install | | |
 | Can a populated Container Apps subnet accept an NSG as an update? | Operator rollout / Azure support | not yet run on a real install | | |
 | Which platform flows the NSG must allow (MCR, Front Door, Entra, Monitor, ILB) | `nsg-egress-rules.json` rows marked hypothesis | not yet run on a real install | | |
-| Does the `100.64.0.0/10` deny break ingress? | NSG row `deny-cgnat` | not yet run on a real install | | |
+| Does the `100.64.0.0/10` deny break ingress? | NSG row `deny-cgnat` (enforce mode only) | not yet run on a real install | | |
+| Do edge and portal reach egress through the internal load balancer on 31080 and 31443 with the NSG on? | Inbound ILB backend ports (`allow-apps-subnet`) | not yet run on a real install | | |
 | What source address does the NSG see for edge→egress traffic? | Inbound ILB rule hypothesis | not yet run on a real install | | |
 | Are static private-endpoint addresses accepted when pinning is on? | `pinPrivateEndpointAddresses` + PE rows | not yet run on a real install | | |
 | Does Basic firewall SKU support threat-intel `Deny`? | `threatIntelMode` (template uses Standard) | not yet run on a real install | | |

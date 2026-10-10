@@ -50,7 +50,7 @@ excepted — it has no off value). A one-organization install on this model may 
 individual controls without forking code. Later network-egress and domain-split work extends this same
 amendment rather than adding a second one. Detail: ADR [0051](0051-llm-admission-control.md).
 
-- **Network egress:** `egressFqdnMode`, `egressNsgEnforce`, and `EGRESS_EXTRA_BLOCKED_CIDRS` (set by the template from `vnetAddressPrefix`) are per-install settings. Unlike the admission settings, the two network modes default to the values that keep an existing install working on a template update (`any`, `deny-list-only`); the strict values (`allowlist`, `enforce`) are an operator's step once the network probe is green. See the network-controls amendment in ADR [0005](0005-ssrf-egress-controls.md).
+- **Network egress:** `egressFqdnMode`, `egressNsgEnforce`, and `EGRESS_EXTRA_BLOCKED_CIDRS` (set by the template from `vnetAddressPrefix`) are per-install settings. Unlike the admission settings, the two network modes default to the upgrade-conservative values (`any`, `deny-list-only`); the strict values (`allowlist`, `enforce`) are an operator's step once `just infra net-verify` and the edge→egress check pass — designed not to change platform flows on upgrade, **unverified in Azure** until then. See the network-controls amendment in ADR [0005](0005-ssrf-egress-controls.md).
 
 ## Considered and rejected
 

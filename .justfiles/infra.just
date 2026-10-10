@@ -59,6 +59,11 @@ net-verify resource-group prefix='helix-prod':
     else
       printf '%s\n' "$logs"
     fi
+    echo ""
+    echo "The probe exercises outbound paths from snet-egress only. Before treating the install as healthy, run the edge→egress /health check from infra/azure/README.md (Verifying the isolation):"
+    echo '  script -q /dev/null az containerapp exec -g <rg> -n <prefix>-edge --command \'
+    echo '    "node -e \"fetch(process.env.EDGE_EGRESS_URL+'\''/health'\'').then(r=>console.log(r.status)).catch(e=>console.log('\''ERR'\'',e.cause?.code))\"" < /dev/null'
+    echo "  expect: 200"
     if [ "$status" = "Succeeded" ]; then
       exit 0
     fi
