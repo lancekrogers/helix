@@ -466,6 +466,15 @@ param acmeServer string = 'https://acme-staging-v02.api.letsencrypt.org/director
 @description('Declare the wildcard TLS custom-domain bindings in-template (ADR-0044), referencing the cert in the ACA environment store by its deterministic name. TRUE only after the certbot bootstrap has run — a cert must exist before a hostname can bind, the one ordering a declarative template cannot express, and this flag bridges it: a gated apply on an install with no cert fails LOUDLY at the app PUT (invalid certificate reference) rather than silently. While false, applies keep the pre-ADR-0044 semantics: customDomains is omitted from the ingress entirely and any runtime-made binding is stripped (README "Known deploy gotchas"). Leave false for a fresh install\'s apps-phase apply, flip it after the first certbot job run, and never look back. Set it LITERALLY in the params file — do not source it from an env var: readEnvironmentVariable renders a set-but-blank variable as \'\' = false, and the blank direction is the silent-wipe one.')
 param wildcardTlsBound bool = false
 
+@description('Serve hosted apps on a separate domain from the control hosts (auth., portal., dev-api.). Empty (default) = apps stay on appsDomain, the single-domain layout. When set, appsDomain becomes the CONTROL domain (auth/portal/dev-api, Entra and vendor callback URLs do not move) and apps live at <slug>.<hostedAppsDomain>. Delegate the zone, list it on the Public Suffix List if it is a subdomain of a domain you own (without that the two are the same site and the cookie protection is lost), and set hostedAppsTlsBound after the second certbot run. The edge refuses to start if appsDomain (the control domain) is a subdomain of hostedAppsDomain, because an app could then set cookies that reach the control hosts; the reverse, hostedAppsDomain under appsDomain, boots and needs the Public Suffix List entry. Two wildcard certificates on one Container App are UNVERIFIED IN AZURE.')
+param hostedAppsDomain string = ''
+
+@description('Declare the hosted-apps wildcard binding in-template, the second gate beside wildcardTlsBound (ADR-0044). TRUE only after the second certbot job has run: a declarative binding to a certificate that does not exist fails the edge app PUT loudly. Set it literally in the params file, never from an env var. Only meaningful with hostedAppsDomain. UNVERIFIED IN AZURE.')
+param hostedAppsTlsBound bool = false
+
+@description('Redirect old <slug>.<appsDomain> app URLs to the new apps domain with a 307 (EDGE_LEGACY_APP_REDIRECT), and keep the control zone wildcard DNS record while it is on. Only meaningful with hostedAppsDomain. Turn it off when the helix.edge.legacy_app_redirects counter has been zero for a period you choose. Default false.')
+param legacyAppRedirect bool = false
+
 @description('Expose the portal on the public LB at portal.<appsDomain>, gated by Entra OIDC (portal audience + platform-admin App Role). Default false (internal ingress — secure by default). The portal is the control plane + the azx-cli target, so a customer-run install (ADR-0028) generally needs it reachable; per-app authz is enforced by ownsApp (ADR-0007, issue #9 closed), and identity/device posture is the perimeter (Conditional Access), not network location. When true, portal.<appsDomain> gets its own custom-domain binding on the wildcard cert (runtime-bound by the certbot job, declared in-template once wildcardTlsBound=true — ADR-0044). See README "Portal access".')
 param portalExternal bool = false
 
@@ -1337,11 +1346,25 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
 // CERT_NAME), so the job's uploads and these bindings cannot drift apart.
 var wildcardCertName = 'wildcard-${replace(appsDomain, '.', '-')}'
 var wildcardCertId = '${appsEnv.outputs.environmentId}/certificates/${wildcardCertName}'
+var hostedSplit = !empty(hostedAppsDomain) && hostedAppsDomain != appsDomain
+var appHostsDomain = hostedSplit ? hostedAppsDomain : appsDomain
+var hostedCertName = 'wildcard-${replace(hostedAppsDomain, '.', '-')}'
+var hostedCertId = '${appsEnv.outputs.environmentId}/certificates/${hostedCertName}'
+var certbotEnabled = deployApps && deployCertbot && !empty(acmeEmail)
 // The gate: bindings are declared only once the bootstrap has run. Ungated
 // (fresh install, or an install that never flipped), customDomains comes
 // through as [] and containerapp.bicep omits the property entirely — the
 // byte-identical pre-ADR-0044 shape.
-var declarativeTls = deployApps && deployCertbot && !empty(acmeEmail) && wildcardTlsBound
+var declarativeTls = certbotEnabled && wildcardTlsBound
+var declarativeHostedTls = hostedSplit && certbotEnabled && hostedAppsTlsBound
+// Omitted entirely when hostedSplit is false so a single-domain install sees no
+// new environment variables (not blank placeholders).
+var splitEdgeEnv = concat(
+  hostedSplit ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomain } ] : [],
+  hostedSplit && legacyAppRedirect ? [ { name: 'EDGE_LEGACY_APP_REDIRECT', value: 'true' } ] : []
+)
+var splitPortalEnv = hostedSplit ? [ { name: 'CONTROL_PUBLIC_BASE', value: 'https://${appsDomain}' } ] : []
+var splitDevGatewayEnv = hostedSplit ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomain } ] : []
 
 module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
   name: 'app-edge'
@@ -1356,15 +1379,11 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
     // The wildcard custom domain (ADR-0044). Declared once the install's
     // bootstrap has run; until then the job's runtime bind is the mechanism
     // and an apply strips it (README "Known deploy gotchas").
-    customDomains: declarativeTls
-      ? [
-          {
-            name: '*.${appsDomain}'
-            bindingType: 'SniEnabled'
-            certificateId: wildcardCertId
-          }
-        ]
-      : []
+    customDomains: concat(
+      declarativeTls ? [ { name: '*.${appsDomain}', bindingType: 'SniEnabled', certificateId: wildcardCertId } ] : [],
+      // Hosted-apps wildcard on a second cert when the domain split is configured (UNVERIFIED IN AZURE).
+      declarativeHostedTls ? [ { name: '*.${hostedAppsDomain}', bindingType: 'SniEnabled', certificateId: hostedCertId } ] : []
+    )
     secretValues: {
       'edge-database-url': {
         keyVaultUrl: '${platformSecretsUri}edge-database-url'
@@ -1392,7 +1411,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
         identity: identity.outputs.edgeIdentityId
       }
     }
-    envVars: [
+    envVars: concat([
       { name: 'NODE_ENV', value: 'production' }
       { name: 'LOG_LEVEL', value: logLevel }
       // OTLP destination (ADR-0037). Empty when telemetry is not deployed, which
@@ -1412,7 +1431,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       // which fails Entra's redirect-URI match (AADSTS50011) and, more quietly,
       // breaks the per-app Origin check in auth/validate.ts for every app.
       { name: 'EDGE_PUBLIC_PORT', value: '443' }
-      { name: 'EDGE_BASE_DOMAIN', value: appsDomain }
+      { name: 'EDGE_BASE_DOMAIN', value: appHostsDomain }
       { name: 'BLOB_CONTAINER', value: blobContainerName }
       // Blob reads via managed identity (issue #15) — no account key. AZURE_CLIENT_ID
       // selects the user-assigned identity for the AAD token fetch; IDENTITY_ENDPOINT/
@@ -1473,7 +1492,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_AUTH_SECRET', secretRef: 'edge-auth-secret' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_INTERNAL_SECRET', secretRef: 'helix-internal-secret' }
-    ]
+    ], splitEdgeEnv)
   }
   dependsOn: [
     rbac
@@ -1523,7 +1542,7 @@ module portalApp 'modules/containerapp.bicep' = if (deployApps) {
         identity: identity.outputs.portalIdentityId
       }
     }
-    envVars: [
+    envVars: concat([
       { name: 'NODE_ENV', value: 'production' }
       { name: 'LOG_LEVEL', value: logLevel }
       // OTLP destination (ADR-0037). Empty when telemetry is not deployed, which
@@ -1559,7 +1578,7 @@ module portalApp 'modules/containerapp.bicep' = if (deployApps) {
       // Deployment topology, served to the prebuilt portal SPA at runtime by
       // GET /api/v1/config — the bundle is baked into this image, so anything it
       // burned in at build time would be wrong in every environment but one.
-      { name: 'APP_PUBLIC_BASE', value: 'https://${appsDomain}' }
+      { name: 'APP_PUBLIC_BASE', value: 'https://${appHostsDomain}' }
       // Empty when the opt-in dev gateway isn't deployed; the portal reads that
       // as "not enabled" and the SPA hides the dev-mode API base accordingly.
       {
@@ -1581,7 +1600,7 @@ module portalApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'PORTAL_SECRET', secretRef: 'portal-secret' }
       { name: 'HELIX_INTERNAL_SECRET', secretRef: 'helix-internal-secret' }
       { name: 'HELIX_EXCHANGE_SECRET', secretRef: 'helix-exchange-secret' }
-    ]
+    ], splitPortalEnv)
   }
   dependsOn: [
     rbac
@@ -1644,7 +1663,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
         identity: identity.outputs.devIdentityId
       }
     }
-    envVars: [
+    envVars: concat([
       { name: 'NODE_ENV', value: 'production' }
       { name: 'LOG_LEVEL', value: logLevel }
       // OTLP destination (ADR-0037). Empty when telemetry is not deployed, which
@@ -1658,7 +1677,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_DEV_GATEWAY_PORT', value: '8082' }
       // The per-plane opt-in; the dev-gateway entrypoint exits unless this is true.
       { name: 'EDGE_ALLOW_DEV_MODE', value: 'true' }
-      { name: 'EDGE_BASE_DOMAIN', value: appsDomain }
+      { name: 'EDGE_BASE_DOMAIN', value: appHostsDomain }
       // Same LLM upstream wiring as the edge (ADR-0046).
       { name: 'EDGE_LLM_ENDPOINT', value: llm.anthropicEndpoint }
       { name: 'EDGE_LLM_ANTHROPIC_PATH', value: llm.anthropicPath }
@@ -1684,7 +1703,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_DEV_DATABASE_URL', secretRef: 'edge-dev-database-url' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_INTERNAL_SECRET', secretRef: 'helix-internal-secret' }
-    ]
+    ], splitDevGatewayEnv)
   }
   dependsOn: [
     rbac
@@ -1703,6 +1722,17 @@ module dns 'modules/dns.bicep' = {
     edgeStaticIp: appsEnv.outputs.staticIp
     domainVerificationId: domainVerificationId
     deployDevGateway: deployDevGateway
+    hostsWildcard: !hostedSplit || legacyAppRedirect
+  }
+}
+
+module dnsHosted 'modules/dns.bicep' = if (hostedSplit) {
+  name: 'dns-hosted'
+  params: {
+    appsDomain: hostedAppsDomain
+    edgeStaticIp: appsEnv.outputs.staticIp
+    domainVerificationId: domainVerificationId
+    hostsControlPlane: false
   }
 }
 
@@ -1742,6 +1772,33 @@ module certbot 'modules/certbot.bicep' = if (deployApps && deployCertbot && !emp
     portalApp
     devGatewayApp
     dns
+  ]
+}
+
+module certbotHosted 'modules/certbot.bicep' = if (hostedSplit && certbotEnabled) {
+  name: 'certbot-hosted'
+  params: {
+    location: location
+    // Distinct identity and job names (certbot.bicep:80, :148). Short on purpose: an ACA job name is
+    // limited to 32 characters, and <namePrefix>-ap-certbot must fit.
+    namePrefix: '${namePrefix}-ap'
+    appsDomain: hostedAppsDomain
+    wildcardCertName: hostedCertName
+    acaEnvName: '${namePrefix}-apps-env'
+    acaEnvId: appsEnv.outputs.environmentId
+    edgeAppName: '${namePrefix}-edge'
+    portalAppName: ''
+    devGatewayAppName: ''
+    image: '${imageRegistry}/helix-certbot:${imageTag}'
+    acmeEmail: acmeEmail
+    acmeServer: acmeServer
+    // The control instance runs at 03:00 UTC. Both jobs add and bind hostnames on the same edge app, so
+    // offset the second by half an hour rather than racing two writes to one Container App.
+    cronExpression: '30 3 * * *'
+  }
+  dependsOn: [
+    edgeApp
+    dnsHosted
   ]
 }
 

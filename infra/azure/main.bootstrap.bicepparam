@@ -88,6 +88,10 @@ param acmeServer = readEnvironmentVariable('HELIX_ACME_SERVER', 'https://acme-st
 // not readEnvironmentVariable this one — a set-but-blank env var renders ''
 // (= false), and the blank direction is the silent-wipe one.
 param wildcardTlsBound = false
+// Hosted apps on a separate domain (see the hostedAppsDomain description in main.bicep).
+// param hostedAppsDomain = 'apps.example.test'
+// param hostedAppsTlsBound = false
+// param legacyAppRedirect = false
 
 // Portal access. false = internal ingress (secure default). true = expose the
 // control plane at portal.<appsDomain> on the public LB, gated by Entra OIDC
