@@ -13,6 +13,10 @@ import { Agent, buildConnector } from "undici";
  * `allowPrivate` is a deliberate **test/dev** seam: integration tests point the
  * proxy at a loopback upstream, and dev may too. It is false in prod and in the
  * adversarial suite, where 127.0.0.1 / 169.254.169.254 must be refused.
+ *
+ * `ssrfRegistry.test.ts` compares the built-in block lists to a snapshot of the
+ * IANA IPv4/IPv6 special-purpose registries so a missing range fails CI unless
+ * it is named in that file's explicit exceptions list.
  */
 
 export class SsrfBlockedError extends Error {
@@ -169,6 +173,7 @@ const V6_BLOCKED: [string, number][] = [
   ["fc00::", 7], // unique-local (ULA)
   ["64:ff9b:1::", 48], // NAT64 local-use (RFC 8215) — block wholesale
   ["100::", 64], // discard-only (RFC 6666)
+  ["100:0:0:1::", 64], // Dummy IPv6 Prefix (IANA special-purpose registry)
   ["2001:db8::", 32], // documentation
   ["2002::", 16], // 6to4 (deprecated, RFC 7526)
   ["2001::", 23], // Teredo / ORCHIDv2 / benchmarking (defense-in-depth)
