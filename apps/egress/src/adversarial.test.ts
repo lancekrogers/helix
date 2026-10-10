@@ -145,6 +145,8 @@ describe("egress SSRF hardening", () => {
     "http://127.0.0.1/secret",
     "http://10.0.0.5/internal",
     "http://[::1]/loopback",
+    "http://168.63.129.16/",
+    "http://[::ffff:a83f:8110]/",
   ]) {
     it(`refuses ${new URL(target).host}`, async () => {
       const app = makeApp(false);
@@ -163,6 +165,24 @@ describe("egress SSRF hardening", () => {
       await app.close();
     });
   }
+
+  it("returns a blocked-address message for the Azure platform IP (no dial)", async () => {
+    const app = makeApp(false);
+    const target = "http://168.63.129.16/";
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(new URL(target).origin),
+        [TARGET_HEADER]: target,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe("blocked");
+    expect(res.json().message).toMatch(/blocked address/);
+    await app.close();
+  });
 });
 
 describe("egress header smuggling", () => {

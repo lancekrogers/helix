@@ -69,7 +69,9 @@ plaintext secrets or the public internet:
    connection on the plane that holds plaintext secrets, and attaches the
    idle-client `'error'` listener (ADR-0002 ISSUE-05).
 3. **SSRF controls** (`apps/egress/src/ssrf.ts`): resolve every address and
-   refuse private / loopback / link-local / `169.254.169.254` (IMDS); pin the
+   refuse private / loopback / link-local / `169.254.169.254` (IMDS), the Azure
+   platform address `168.63.129.16`, and IPv4 documentation ranges (TEST-NET-1/2/3
+   and the deprecated 6to4 relay anycast); pin the
    connection to the validated IP (cert/SNI still checked against the hostname),
    defeating DNS rebinding; no redirect-following (undici 7 only follows redirects
    when a `redirect` interceptor is composed onto the dispatcher, and egress
