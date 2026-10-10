@@ -68,50 +68,70 @@ works with the firewall off, which is the posture of the live installs.
 
 The Azure Firewall (Standard tier) is the stronger optional tier for the
 egress-only network zone when `deployFirewall=true`: it forces both app subnets'
-`0.0.0.0/0` through itself, **allows only `snet-egress` out** (to any FQDN) plus
-a narrow platform allow-list, and **denies the apps subnet** (edge/portal) by
-default. The baseline for every install is the egress application's
-`ssrf.ts` IP validation + header filtering and the `snet-egress` NSG
-(`egressNsgEnforce`); the firewall FQDN filter adds a network layer on top when
-enabled. See [ADR-0005](../../docs/adr/0005-ssrf-egress-controls.md) (ADR
-[0001](../../docs/adr/0001-three-runtime-split.md),
-[0013](../../docs/adr/0013-egress-trust-model.md)).
+`0.0.0.0/0` through itself, applies a narrow **platform** allow-list per
+subnet (`aca-platform` in `modules/firewall.bicep`), and controls **egress
+internet** destinations with `egressFqdnMode`:
 
-Threat intelligence on the firewall policy now defaults to `Deny`
-(`threatIntelMode`); earlier templates used `Alert`. An install that already
-runs the firewall becomes stricter on its next template apply: traffic to
-destinations Microsoft's feed marks as malicious is dropped instead of logged.
-If a legitimate vendor is blocked, confirm it in the firewall logs and set
-`threatIntelMode = 'Alert'` to return to log-only.
+| `egressFqdnMode`                            | Egress subnet internet rule                                                                              | When to use                                                         |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `any` (Bicep default)                       | `targetFqdns: ['*']` on ports 80 and 443                                                                 | Existing firewall installs on template upgrade — behavior unchanged |
+| `allowlist` (reference `.bicepparam` files) | Named product FQDNs (`egressAllowedFqdnsEffective` output: LLM vendors + `egressAllowedFqdns`) on 80/443 | New installs that run the firewall                                  |
+
+The apps subnet stays **deny-by-default** for general internet; only its
+platform list is allowed. Baseline for every install remains `ssrf.ts` plus the
+`snet-egress` NSG (`egressNsgEnforce`). See
+[ADR-0005](../../docs/adr/0005-ssrf-egress-controls.md).
+
+Threat intelligence defaults to `Deny` (`threatIntelMode`); set `Alert` to log
+without blocking if a vendor is false-positive-blocked. Firewall application-rule,
+network-rule, and threat-intelligence logs ship to the apps environment Log
+Analytics workspace via `modules/firewall-diagnostics.bicep`; an infra alert
+fires on application-rule **denials** sourced from `snet-egress` (table/column
+names are **unverified in Azure** until an operator confirms a row).
+
+The list is **not** generated from portal approvals (static Bicep +
+`egressAllowedFqdns`). When an admin approves a new fetch origin or a connection
+provider host changes, egress stays blocked until the operator adds the host and
+re-applies:
+
+1. Run `just infra egress-hosts -- --deployed-file <effective-list.json>` (or
+   `--deployed host1,host2`) where the deployed list matches
+   `egressAllowedFqdnsEffective` / your parameter file.
+2. Add every **MISSING** host to `egressAllowedFqdns` in your `.bicepparam`.
+3. Re-deploy the template.
+
+Postgres is private-endpoint-only, so the drift command cannot run from a
+laptop against production data. **Unverified in Azure:** run it inside the
+portal container replica (the image ships `pnpm` and `tsx`):
+
+```bash
+az containerapp exec -n <prefix>-portal -g <resource-group> \
+  --command "pnpm --filter @azx-pbc/portal egress:hosts -- --deployed-file -" \
+  <<< '["api.anthropic.com","api.openai.com"]'
+```
+
+Adjust the JSON array to your deployed allow-list. Do not paste connection
+secrets or database URLs into the command line.
 
 The Standard firewall deployment charge is approximately $900/month before data
-processing, as estimated for this deployment. It applies even when idle.
-`deployFirewall` defaults to true; operators can disable it with the security
+processing. `deployFirewall` defaults to true; operators can disable it with the
 trade-offs below.
 
 **What you lose when `deployFirewall=false`:**
 
-- The firewall and its forced-tunnel routes are not created; both app subnets get
-  **default internet egress**. A compromised **edge can now reach the internet**
-  directly. The `snet-egress` NSG and `ssrf.ts` remain the baseline outbound
-  controls; they govern egress-plane traffic and do not stop a compromised edge
-  on the apps subnet from dialing the internet.
-- The isolation guarantee in the diagram above no longer holds; the
-  isolation-verification checks below invert (edge outbound **succeeds**).
+- No firewall or forced-tunnel routes; both app subnets get **default internet
+  egress**. A compromised **edge** can reach the internet directly. The egress
+  NSG and `ssrf.ts` still govern egress-plane traffic only.
+- Isolation-verification checks below invert (edge outbound **succeeds**).
 
-**What you keep either way:** all data services stay private — Postgres, Blob,
-and both Key Vaults remain private-endpoint-only (`publicNetworkAccess` disabled)
-regardless of this flag. Turning the firewall off does **not** expose them.
+**What you keep either way:** Postgres, Blob, and Key Vaults stay on private
+endpoints.
 
-**When off is acceptable:** dev, smoketest/integration scaffolding, or a trusted
-single-tenant install where you accept the app-level denylist as the outbound
-control. **When it is not:** production, or any install hosting untrusted /
-multi-tenant apps — keep the firewall (or your own equivalent network egress
-control). Cheaper options if you want _some_ always-on control: Azure Firewall
-**Basic** (~$290/mo, same FQDN model) or — losing FQDN filtering — NAT Gateway +
-NSGs. An NSG-only substitute cannot replicate the apps-subnet
-posture because the platform image pulls (GHCR/MCR) require **FQDN** rules NSGs
-can't express, which is why a firewall was chosen in the first place. For a
+**When off is acceptable:** dev, smoketest, or trusted single-tenant installs.
+**When it is not:** production or untrusted multi-tenant hosting. Cheaper
+options: Azure Firewall **Basic** (~$290/mo, same FQDN model) or NAT Gateway +
+NSGs (no FQDN filtering). NSGs alone cannot express GHCR/MCR image pulls on the
+apps subnet. For a
 temporary install, `az network firewall deallocate` also stops the hourly charge
 between test sessions without losing config.
 
@@ -524,6 +544,7 @@ modules/
   nsg.bicep           egress subnet NSG (rules from nsg-egress-rules.json)
   routing.bicep       2 empty route tables (routes added by firewall.bicep)
   firewall.bicep      Azure Firewall + policy + default routes
+  firewall-diagnostics.bicep  firewall logs to Log Analytics + egress denial alert
   privatedns.bicep    private DNS zones + VNet links
   private-endpoint.bicep  reusable PE + DNS zone group
   storage.bicep       storage account + app-bundles container + PE

@@ -409,6 +409,14 @@ param budgetStartDate string = utcNow('yyyy-MM-01')
 @description('Deploy the Azure Firewall FQDN-filtering tier for the egress-only network zone (ADR-0001). Default true. The baseline for every install is the egress application filter (apps/egress/src/ssrf.ts) plus the snet-egress NSG (egressNsgEnforce); the firewall is the stronger optional tier when enabled. Setting false SKIPS the firewall + its forced-tunnel routes to save ~$900/mo: both app subnets get default internet egress, so a compromised edge can reach the internet directly while egress traffic remains governed by ssrf.ts and the NSG. Data services stay private (private endpoints) either way. Only disable for dev / smoketest / trusted single-tenant installs — NOT production or untrusted-app hosting. See README "Optional: the egress firewall".')
 param deployFirewall bool = true
 
+@allowed(['any', 'allowlist'])
+@description('''
+  Egress internet FQDN mode when deployFirewall is true. any = snet-egress may reach every FQDN on 80/443 (existing firewall installs stay here on template update). allowlist = only platform hosts plus egressAllowedFqdnsEffective (LLM vendors, operator additions). New reference parameter files set allowlist; flipping modes is explicit. Each new approved origin needs its host in egressAllowedFqdns and a template apply — run just infra egress-hosts to see drift.''')
+param egressFqdnMode string = 'any'
+
+@description('Operator additions to the egress product allow-list (connection-provider hosts, approved fetch origins). LLM vendor hosts are derived from llm* params and egressManagedIdentityConnections. Ignored when egressFqdnMode is any.')
+param egressAllowedFqdns array = []
+
 @description('''
   Firewall threat intelligence mode (only when deployFirewall is true). Default Deny blocks known-bad destinations; Alert logs without blocking; Off disables intel. Deny can false-positive on a vendor IP — use firewall logs to diagnose and set Alert to revert to log-only. Whether Basic firewall SKU supports Deny is unverified in Azure (this template uses Standard). Existing installs that used Alert before this parameter can set threatIntelMode = 'Alert' to avoid a stricter default on upgrade.''')
 @allowed(['Alert', 'Deny', 'Off'])
@@ -641,6 +649,8 @@ module firewall 'modules/firewall.bicep' = if (deployFirewall) {
     egressRouteTableName: routing.outputs.egressRouteTableName
     threatIntelMode: threatIntelMode
     acmeServerHost: acmeServerHost
+    egressFqdnMode: egressFqdnMode
+    egressProductFqdns: egressProductFqdns
   }
 }
 
@@ -781,6 +791,16 @@ var llm = {
 var foundryMiConnections = deployFoundry
   ? 'foundry=${foundryHost},foundry-openai=${foundryHost}'
   : egressManagedIdentityConnections
+
+func hostOf(url string) string => split(split(replace(replace(url, 'https://', ''), 'http://', ''), '/')[0], ':')[0]
+
+var vendorHosts = union(
+  [hostOf(llm.anthropicEndpoint), hostOf(llm.openaiEndpoint)],
+  empty(foundryMiConnections)
+    ? []
+    : map(split(foundryMiConnections, ','), p => split(trim(p), '=')[1])
+)
+var egressProductFqdns = union(vendorHosts, egressAllowedFqdns)
 
 // What the portal advertises (ADR-0047): an explicit allowlist wins; on a
 // deployFoundry install with none, the deployed set IS the advertised set —
@@ -1078,6 +1098,22 @@ module infraAlerts 'modules/alerts-infra.bicep' = if (deployInfraAlerts && deplo
     edgeServerErrorThreshold: edgeServerErrorThreshold
     actionGroupId: actionGroupId
   }
+}
+
+module firewallDiagnostics 'modules/firewall-diagnostics.bicep' = if (deployFirewall) {
+  name: 'firewall-diagnostics'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    firewallName: '${namePrefix}-fw'
+    workspaceId: appsEnv.outputs.logAnalyticsWorkspaceId
+    egressSubnetPrefix: egressSubnetPrefix
+    actionGroupId: actionGroupId
+    includeDenialAlert: deployInfraAlerts
+  }
+  dependsOn: [
+    firewall
+  ]
 }
 
 // The budget amount is DERIVED FROM THE DEPLOYMENT SHAPE, not from a constant
@@ -1745,3 +1781,6 @@ output foundryOrigin string = foundry.?outputs.origin ?? ''
 
 @description('Model deployments created on the Foundry account (deployment name == catalog model id). Empty when deployFoundry is false.')
 output foundryDeployments array = foundry.?outputs.deploymentNames ?? []
+
+@description('FQDNs the firewall enforces for egress product traffic when egressFqdnMode is allowlist (LLM vendors plus egressAllowedFqdns).')
+output egressAllowedFqdnsEffective array = egressProductFqdns

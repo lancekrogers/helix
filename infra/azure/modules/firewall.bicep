@@ -28,6 +28,13 @@ param appsSubnetPrefix string
 @description('Address prefix of snet-egress (rule source matching).')
 param egressSubnetPrefix string
 
+@allowed(['any', 'allowlist'])
+@description('any = snet-egress may reach every FQDN on 80/443 (the behavior before the allow-list existed). allowlist = only the platform hosts (aca-platform collection) and egressProductFqdns.')
+param egressFqdnMode string = 'any'
+
+@description('Hosts the egress app legitimately calls beyond the platform: the LLM vendor hosts and the operator additions (connection providers, approved fetch origins). Used only in allowlist mode.')
+param egressProductFqdns array = []
+
 @description('Name of the apps route table (default route is added to it).')
 param appsRouteTableName string
 
@@ -95,6 +102,30 @@ param egressPlatformFqdns array = [
   'packages.microsoft.com'
 ]
 
+var internetRule = egressFqdnMode == 'any'
+  ? {
+      ruleType: 'ApplicationRule'
+      name: 'egress-to-any-https'
+      sourceAddresses: [egressSubnetPrefix]
+      targetFqdns: ['*']
+      protocols: [
+        { protocolType: 'Https', port: 443 }
+        { protocolType: 'Http', port: 80 }
+      ]
+    }
+  : {
+      ruleType: 'ApplicationRule'
+      name: 'egress-to-product-fqdns'
+      sourceAddresses: [egressSubnetPrefix]
+      targetFqdns: empty(egressProductFqdns)
+        ? fail('egressFqdnMode is allowlist but the product host list is empty; egress would have no internet access. Set egressAllowedFqdns or the LLM endpoints.')
+        : egressProductFqdns
+      protocols: [
+        { protocolType: 'Https', port: 443 }
+        { protocolType: 'Http', port: 80 }
+      ]
+    }
+
 resource firewallPip 'Microsoft.Network/publicIPAddresses@2024-05-01' = {
   name: '${namePrefix}-fw-pip'
   location: location
@@ -124,8 +155,8 @@ resource ruleCollectionGroup 'Microsoft.Network/firewallPolicies/ruleCollectionG
     priority: 200
     ruleCollections: [
       {
-        // The egress zone: snet-egress reaches the whole internet over HTTP(S).
-        // This is helix-egress doing its job (governed outbound for the fetch-proxy).
+        // Egress internet: any = one rule to * on 80/443; allowlist = product hosts only
+        // (platform plumbing is the aca-platform collection below).
         ruleCollectionType: 'FirewallPolicyFilterRuleCollection'
         name: 'egress-internet'
         priority: 100
@@ -133,16 +164,7 @@ resource ruleCollectionGroup 'Microsoft.Network/firewallPolicies/ruleCollectionG
           type: 'Allow'
         }
         rules: [
-          {
-            ruleType: 'ApplicationRule'
-            name: 'egress-to-any-https'
-            sourceAddresses: [egressSubnetPrefix]
-            targetFqdns: ['*']
-            protocols: [
-              { protocolType: 'Https', port: 443 }
-              { protocolType: 'Http', port: 80 }
-            ]
-          }
+          internetRule
         ]
       }
       {

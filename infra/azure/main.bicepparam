@@ -46,6 +46,10 @@ param deployDevGateway = false
 // "Optional: the egress firewall".
 param deployFirewall = true
 // param threatIntelMode = 'Alert'  // 'Deny' drops known-bad destinations; use 'Alert' to log only
+// egressFqdnMode only applies when deployFirewall is true. allowlist = product FQDNs plus platform
+// rules; any = * on 80/443 (template default — installs with their own param file keep any unless set).
+param egressFqdnMode = 'allowlist'
+// param egressAllowedFqdns = ['api.vendor.example']  // connection providers + approved fetch origins
 
 // Egress subnet NSG (layer 2). enforce = deny list + closing deny-all; deny-list-only =
 // safe first step on an existing install (no row 4000); off = no NSG. Unverified in

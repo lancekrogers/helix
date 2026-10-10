@@ -15,3 +15,8 @@ build:
     az bicep build-params --file infra/azure/main.bootstrap.bicepparam --stdout > /dev/null
     az bicep build --file infra/entra/main.bicep --stdout > /dev/null
     az bicep build-params --file infra/entra/main.bicepparam --stdout > /dev/null
+
+# Print the hosts approved apps and connection providers need and mark those missing from a deployed allow-list; arguments go to the script, e.g. --deployed a.example.com,b.example.com
+[positional-arguments]
+egress-hosts *args:
+    pnpm --filter @azx-pbc/portal egress:hosts -- "$@"

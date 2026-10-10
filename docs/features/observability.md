@@ -335,6 +335,7 @@ process:
 | `alerts-infra.bicep` | Azure platform metrics: `is_db_alive`, `storage_percent`, `RestartCount`, ingress `Requests` 5xx, Service Health | Postgres down or filling, container crash loops, edge server errors, Azure's own incidents |
 | `alerts-cost.bicep` | Billing | A monthly budget over the platform-infra resource groups (LLM spend is excluded by topology — the Foundry account has its own group). Notifies; never enforces |
 | `alerts-cost-foundry.bicep` | Billing | With `deployFoundry`: a monthly budget on the Foundry account's group — the LLM axis. Notifies; never enforces |
+| `firewall-diagnostics.bicep` | Log Analytics `AZFWApplicationRule` (and `AZFWNetworkRule`, `AZFWThreatIntel` for diagnostics) | Application-rule **denials** from the egress subnet when `deployFirewall` and `deployInfraAlerts` are on — usually a host missing from `egressAllowedFqdns`. KQL table/column names are **unverified in Azure** |
 
 The availability tests are the probe this page used to list under "not built":
 `/health` always answers 200, so grading it means reading the body, and a
