@@ -87,7 +87,9 @@ pnpm dev:clean    #         free any of those ports left held by a dead process
 `/etc/hosts` edits. When the dev container sets `HELIX_APPS_DOMAIN=helix-apps.localhost`, apps serve on
 `<slug>.helix-apps.localhost` and control hosts stay on `local.helix.azxlabs.io` — a working split
 login stack. That needs the split TLS pair from `.devcontainer/post-create.sh` (or the mkcert command in
-`.claude/skills/run-helix/SKILL.md`). Unset `HELIX_APPS_DOMAIN` restores today's single-domain dev.
+`.claude/skills/run-helix/SKILL.md`). A dev container created with `HELIX_APPS_DOMAIN` set bakes
+split variables into the environment — recreate the container without it before single-domain smoke
+or the connections lane; unsetting the variable alone is not enough.
 A malformed value makes `scripts/stack-env.mjs` exit with an error rather than booting a half-split stack.
 Fixture identities at the IdP (pick one on the login page):
 

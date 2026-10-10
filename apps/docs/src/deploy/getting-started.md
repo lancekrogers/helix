@@ -164,6 +164,9 @@ Copy `main.bootstrap.bicepparam` and set, at minimum:
   globally unique).
 - `appsDomain` — your control domain (or your only domain in the single-domain layout).
 - `hostedAppsDomain` — optional; when set, apps live here and `appsDomain` is control-only.
+  On a new split install also set `hostedAppsLive = true`. On an existing install leave
+  `hostedAppsLive = false` until DNS and the apps certificate are ready ([rollout
+  notes](/deploy/updates#upgrading-to-hosted-app-containment)).
 - The Entra ids from step 1: `edgeOidcClientId`, `portalOidcAudience` (the
   bare client-id GUID), `portalAdminGroupId` (`platform-admin`),
   `azxCliClientId`, `azxWebClientId`. (The edge OIDC **certificate pair** is a
@@ -333,8 +336,8 @@ that routine is in [Deploying updates](/deploy/updates).
 
 1. **Delegate the domain(s).** In the parent zone, add NS records for
    `<appsDomain>` pointing at the nameservers in the deployment output
-   `dnsNameServers`. With `hostedAppsDomain`, delegate that zone too before running
-   either certbot job.
+   `dnsNameServers`. With `hostedAppsDomain`, delegate that zone at the parent using
+   the `hostedDnsNameServers` output before running either certbot job.
 2. **Bootstrap the wildcard certificate.** A scheduled job (`certbot`) issues
    and renews `*.<appsDomain>` via Let's Encrypt DNS-01 and binds it. It needs
    the domain verified first: take the `customDomainVerificationId` from the

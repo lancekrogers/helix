@@ -57,6 +57,7 @@ updates](/deploy/updates#when-you-do-need-a-full-apply).
 | --- | --- | --- |
 | `appsDomain` | — | Your control domain when split: sign-in on `auth.<appsDomain>`, portal on `portal.<appsDomain>`. When `hostedAppsDomain` is empty, apps also live on `<slug>.<appsDomain>` (single-domain layout) |
 | `hostedAppsDomain` | `''` | Optional apps-only domain. Empty: apps stay on `appsDomain`. Set: apps live on `<slug>.<hostedAppsDomain>` and `appsDomain` is the control domain |
+| `hostedAppsLive` | `false` | With `hostedAppsDomain` set: `false` provisions the apps zone, second certbot job, and optional apps TLS binding while apps stay on `appsDomain`; `true` cuts over app URLs and sets the edge, portal, and dev-gateway split env vars. Meaningless when `hostedAppsDomain` is empty. Default `false` fails toward no containment gain |
 | `hostedAppsTlsBound` | `false` | Second ADR-0044 gate for `*.<hostedAppsDomain>` on the edge. `true` only after the second certbot run; `true` without a certificate fails the edge PUT loudly. Meaningful only with `hostedAppsDomain` (**unverified in Azure**) |
 | `legacyAppRedirect` | `false` | `307` from old `<slug>.<appsDomain>` to the apps domain (`EDGE_LEGACY_APP_REDIRECT`). Split only; off leaves legacy hosts on 404 |
 | `deployCertbot` | `true` | The scheduled job that issues and renews the `*.<appsDomain>` Let's Encrypt certificate via DNS-01 |

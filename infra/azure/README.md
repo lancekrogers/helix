@@ -469,10 +469,19 @@ When `hostedAppsDomain` is non-empty, `appsDomain` is the **control** domain (`a
 dashes>`. Job `<namePrefix>-ap-certbot` (half-hour cron offset from the control job). Gate
   `hostedAppsTlsBound`. Portal and dev-gateway bindings stay on the control cert.
 
-Order: deploy with both gates false → run control certbot → flip `wildcardTlsBound` → run apps
-certbot → flip `hostedAppsTlsBound`. Each cert name is computed once in `main.bicep` and passed to
-its job and its declarative edge binding (ADR-0044 per cert). **Unverified in Azure** for the full
-two-binding path.
+**New install** order: deploy with both gates false → run control certbot → flip `wildcardTlsBound`
+→ run apps certbot → flip `hostedAppsTlsBound`. Each cert name is computed once in `main.bicep` and
+passed to its job and its declarative edge binding (ADR-0044 per cert). On an **existing** install,
+`wildcardTlsBound` is already true — do not set it false (that strips `auth.` TLS on the next apply);
+follow [Deploying updates](../../apps/docs/src/deploy/updates.md#upgrading-to-hosted-app-containment) for the staged
+`hostedAppsLive` cutover instead. **Unverified in Azure** for the full two-binding path.
+
+| Parameter        | Default | Role                                                                                                                                                                                                     |
+| ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hostedAppsLive` | `false` | With `hostedAppsDomain` set: `false` = provision zone, second certbot job, and apps TLS binding only; `true` = move app URLs and emit split edge/portal/dev-gateway env. Default fails toward no cutover |
+
+Deployment output `hostedDnsNameServers` lists the apps zone name servers when `hostedAppsDomain` is
+set (control zone: `dnsNameServers`).
 
 ## Container shutdown (graceful drain)
 
@@ -955,9 +964,9 @@ existed pick it up on their own; nothing needs restarting.
 ### 7. DNS + TLS
 
 - Delegate the control zone (`appsDomain` in the params file — your control domain when
-  `hostedAppsDomain` is set). With a split, also delegate `hostedAppsDomain` as a second zone;
-  both need NS records at the parent before any certbot run (**unverified in Azure** for the
-  two-zone path).
+  `hostedAppsDomain` is set) using output `dnsNameServers`. With a split, also delegate
+  `hostedAppsDomain` as a second zone using output `hostedDnsNameServers`; both need NS records at
+  the parent before any certbot run (**unverified in Azure** for the two-zone path).
 - Bind the wildcard cert (`*.<zone>`) and ACA custom domains — the `deployCertbot` job(s) do this
   (see "Wildcard TLS"). Supply `domainVerificationId` to write the `asuid` TXT record ACA needs.
   A custom-domain binding is **per container app**, so the job binds each plane that has its own
@@ -1075,6 +1084,7 @@ URL, which is what `availabilityTestFrequencySeconds` and
 | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `https://auth.<appsDomain>/health`        | always                                                                                                                                  |
 | `https://portal.<appsDomain>/health`      | `portalExternal=true`                                                                                                                   |
+| `https://www.<hostedAppsDomain>/health`   | `hostedAppsTlsBound=true` with `hostedAppsDomain` set (`edge-health-apps`; platform JSON on a reserved label)                           |
 | whatever `availabilityExtraTargets` lists | e.g. a real hosted app, which is the only way to cover Blob asset serving — update these URLs when app hosts move to `hostedAppsDomain` |
 
 Three things about that table are load-bearing:

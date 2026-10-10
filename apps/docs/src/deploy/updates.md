@@ -139,7 +139,7 @@ Two things that look like reasons to skip it, and are not:
 
 ### 2. Roll the apps
 
-If this release tightens `img-src`, read [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy) step 0 first — set `imgSrcReportOnly = true` in your parameter file before rolling the edge image.
+If this release tightens `img-src`, read [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy) step 0 first — set `imgSrcReportOnly = true` in your parameter file before rolling the edge image. If it ships hosted-app containment, read [Upgrading to hosted-app containment](#upgrading-to-hosted-app-containment) step 0 before rolling the edge image or running any full apply.
 
 ```bash
 for app in edge portal egress; do
@@ -253,9 +253,9 @@ repository. Nothing here runs automatically.
    non-production copy of the install and run `just infra net-verify` there, set
    `egressNsgEnforce = 'off'` in your parameter file before **any** full template apply — including
    step 6 of [Upgrading to the LLM spend controls](#upgrading-to-the-llm-spend-controls) if that
-   apply ships this template, and before the second certbot run in [Upgrading to hosted-app
-   containment](#upgrading-to-hosted-app-containment) when that template ships the firewall-tier
-   platform lists. Also decide `deployNetprobe`: the probe job and its two log alerts
+   apply ships this template, and before the apply that creates the second certbot job in
+   [Upgrading to hosted-app containment](#upgrading-to-hosted-app-containment) when that template
+   ships the firewall-tier platform lists. Also decide `deployNetprobe`: the probe job and its two log alerts
    deploy by default (`deployNetprobe` true, requires `deployApps`), and the no-recent-success alert
    fires until the first scheduled or on-demand run.
 
@@ -345,9 +345,17 @@ These notes cover the three containment parts shipped together: response-header 
 tightened CSP, and the optional apps/control domain split. Nothing runs automatically — you choose
 the order and parameter values.
 
+0. **Applies to all three parts.** Before rolling the edge image or running any full template apply
+   in this release:
+
+   - Set `imgSrcReportOnly = true` in your parameter file ([image policy step
+     0](#upgrading-to-the-tightened-image-policy)).
+   - Keep `egressNsgEnforce = 'off'` until the scratch-copy test passes ([network controls step
+     0](#upgrading-to-the-network-controls)).
+
 ### Part 3 — proxied response headers
 
-Deploy the new egress and edge images. No install setting is involved.
+Deploy the new egress and edge images after step 0; the header blocklist itself needs no setting.
 
 The edge strips a fixed blocklist of response headers on every `/_api/fetch/*` response (the list lives
 in `packages/shared/src/fetch.ts`). Browsers do not act on a `Link` header in a `fetch()` response,
@@ -358,13 +366,13 @@ blocklist is the single source of truth.
 ### Part 2 — CSP (`img-src` / `object-src`)
 
 Follow [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy): step 0
-(`imgSrcReportOnly = true`) before any edge roll or full apply that ships the measurement build; then
-the Violations screen and `helix.edge.csp_reports` (`disposition=report` during measurement); then
-enforce (remove the flag or set `EDGE_IMG_SRC_REPORT_ONLY=false`). Pre-grant per app or list
-operator-trusted image hosts in `EDGE_IMG_SRC_EXTRA` — never an image proxy that fetches
-attacker-chosen URLs. One-organization installs that accept the open channel set
-`EDGE_IMG_SRC_ALLOW_ALL=true`. Parameter names in Bicep: `imgSrcExtra`, `imgSrcReportOnly`,
-`imgSrcAllowAll`.
+(`imgSrcReportOnly = true`) before any edge roll or full apply that ships the measurement mode (one
+edge image; the flag selects the mode); then the Violations screen and `helix.edge.csp_reports`
+(`disposition=report` during measurement); then enforce (remove the flag or set
+`EDGE_IMG_SRC_REPORT_ONLY=false`). Pre-grant per app or list operator-trusted image hosts in
+`EDGE_IMG_SRC_EXTRA` — never an image proxy that fetches attacker-chosen URLs. One-organization
+installs that accept the open channel set `EDGE_IMG_SRC_ALLOW_ALL=true`. Parameter names in Bicep:
+`imgSrcExtra`, `imgSrcReportOnly`, `imgSrcAllowAll`.
 
 ### Part 1 — domain split
 
@@ -372,44 +380,66 @@ attacker-chosen URLs. One-organization installs that accept the open channel set
 
 1. Choose two domains, or one domain plus a delegated subdomain you will list on the Public Suffix
    List (**operator-run**; without that entry the two remain the same site and host-only cookies do
-   not stop a `Domain=` cookie from reaching the control hosts). Create and delegate both zones.
-2. Set `appsDomain` (the **control** domain: `auth.`, `portal.`, `dev-api.`) and `hostedAppsDomain`
-   (the apps domain) in the parameter file. Deploy with `wildcardTlsBound` and `hostedAppsTlsBound`
-   `false`.
+   not stop a `Domain=` cookie from reaching the control hosts). The template creates both DNS zones
+   in step 2; delegate each at its parent from the `dnsNameServers` and `hostedDnsNameServers`
+   deployment outputs (**operator-run**) before running the certbot jobs.
+2. Set `appsDomain` (the **control** domain: `auth.`, `portal.`, `dev-api.`), `hostedAppsDomain`
+   (the apps domain), and `hostedAppsLive = true` in the parameter file. Deploy with
+   `wildcardTlsBound` and `hostedAppsTlsBound` `false`.
 3. On a firewall install, apply the release that carries the per-subnet platform FQDN lists (ACME,
-   Resource Manager, Entra) **before** the second certbot run, or issuance can fail silently
-   (**operator-run**; prerequisite from the network-controls work).
+   Resource Manager, Entra) **before** the apply that creates the second certbot job, or issuance can
+   fail silently (**operator-run**; prerequisite from the network-controls work).
 4. Run the first certbot job (`<namePrefix>-certbot`), then the second (`<namePrefix>-ap-certbot`);
    flip both bound flags and redeploy. The TLS what-if canary must never show
    `Delete properties.configuration.ingress.customDomains` for either binding (**unverified in Azure**
-   with two bindings on one Container App).
+   with two bindings on one Container App). Confirm the `edge-health-apps` availability test is green
+   once `hostedAppsTlsBound` is on.
 5. Register Entra redirect URIs for the control domain as in [Entra setup](/deploy/entra-setup).
 6. Submit the apps zone to the Public Suffix List when it is a delegated subdomain (**operator-run**).
 
 **Existing install — keep the current domain as control** (sign-in, portal, dev-api, Entra and vendor
 callbacks stay put; only app URLs move)
 
-0. If this release also ships CSP or network controls, read [Upgrading to the tightened image
-   policy](#upgrading-to-the-tightened-image-policy) step 0 and [Upgrading to the network
-   controls](#upgrading-to-the-network-controls) step 0 before any full apply that carries those
-   templates.
+0. Complete [step 0](#upgrading-to-hosted-app-containment) above before rolling the edge image or
+   running any full apply.
 1. Deploy new edge and portal images with all split settings absent; confirm a no-op before changing
    parameters.
-2. Choose and delegate the apps domain; add the apps zone and its `asuid` record.
-3. Add the second certbot instance, run it, flip `hostedAppsTlsBound`.
-4. **Operator-run, on a staging app:** verify cross-site sign-in in Chrome, Firefox, and Safari.
-   Tracking-protection heuristics may treat an auth host that redirects without a click as a bounce
-   tracker — symptom: login loop at `/start`, visible in the `helix.session.gate_denied` counter and the
-   `helix.auth.handoff.complete` span (**unverified in Safari, Firefox and Chrome on real domains**).
-5. In one release, set `legacyAppRedirect`, `hostedAppsDomain`, portal `CONTROL_PUBLIC_BASE`, and
-   `APP_PUBLIC_BASE` (Bicep sets both from the parameter pair). Edge and portal must flip together.
+2. **Provision.** Set `hostedAppsDomain` and keep `hostedAppsLive = false`, then apply. Read the
+   deployment output `hostedDnsNameServers` and delegate the apps zone at the parent
+   (**operator-run**). On a firewall install, apply the release with the per-subnet platform FQDN
+   lists before the apply that creates the second certbot job. Start `<namePrefix>-ap-certbot` once
+   delegation resolves publicly; check from outside that `https://www.<hostedAppsDomain>/health`
+   answers over HTTPS with a valid certificate. Set `hostedAppsTlsBound = true`, apply, run the TLS what-if canary for both bindings, and
+   confirm the `edge-health-apps` availability test is green (**unverified in Azure**).
+3. **Verify.** Run the cross-browser sign-in check (Chrome, Firefox, Safari) on a **separate staging
+   install** configured like the scratch copy in [network controls step
+   1](#upgrading-to-the-network-controls), with `hostedAppsLive = true` and the same domain shape.
+   The edge moves all apps or none, so this production install cannot host one staging app on the new
+   domain while the rest stay on the old hosts. Tracking-protection heuristics may treat an auth host
+   that redirects without a click as a bounce tracker — symptom: login loop at `/start`, visible in
+   the `helix.session.gate_denied` counter and the `helix.auth.handoff.complete` span (**unverified in
+   Safari, Firefox and Chrome on real domains**).
+4. **Cut over.** Set `hostedAppsLive = true` and `legacyAppRedirect = true` in one apply. Bicep sets
+   `EDGE_BASE_DOMAIN`, `EDGE_CONTROL_DOMAIN`, `APP_PUBLIC_BASE`, `CONTROL_PUBLIC_BASE`, and
+   `EDGE_LEGACY_APP_REDIRECT` from that parameter pair, so the edge, portal, and dev gateway flip
+   together.
+5. **Operator check after cutover.** `GET /api/v1/providers` (authenticated) must list
+   `callbackUrl` exactly `https://auth.<EDGE_CONTROL_DOMAIN>/connections/callback` — the only way to
+   catch an edge/portal mismatch the portal cannot detect at boot alone.
 6. Tell app owners URLs changed; update `availabilityExtraTargets` (it holds app URLs) and any
    external registration by old host.
-7. Watch `helix.edge.legacy_app_redirects`. When `redirected` has been near zero for your chosen
-   period: set `legacyAppRedirect` to `false` and re-apply; delete the control zone's `*` A record
-   by hand (a re-apply does not delete DNS records); **keep** the edge's `*.<control domain>` binding
-   — `auth.<control domain>` terminates TLS through it and certbot re-binds it on every run; keep the
-   `auth`, `portal`, and `dev-api` records.
+7. **Sunset.** Watch `helix.edge.legacy_app_redirects`. When `redirected` has been near zero for your
+   chosen period: set `legacyAppRedirect` to `false` and re-apply; delete the control zone's `*` A
+   record by hand (a re-apply does not delete DNS records); **keep** the edge's `*.<control domain>`
+   binding — `auth.<control domain>` terminates TLS through it and certbot re-binds it on every run;
+   keep the `auth`, `portal`, and `dev-api` records.
+
+**Rollback (cutover).** Set `hostedAppsLive` back to `false` and apply. The template omits the
+split-only environment variables and replaces each app's env list whole, so the edge, portal, and dev
+gateway revert to the single-domain values while the apps zone and second certbot job stay (incremental
+mode). Sessions minted on the new app hosts are lost. The legacy redirect is a `307` with `no-store`,
+so browsers do not cache it and a rollback stays clean. Leave `hostedAppsDomain` set if you plan to
+retry cutover without reprovisioning DNS and TLS.
 
 **Data migration:** none — apps are keyed by slug and id.
 
@@ -418,7 +448,9 @@ state on the old origin does not carry over; `/_api` clients that hard-coded the
 (relative URLs are correct); the grace redirect softens GET navigations only.
 
 Split topology on Azure (**unverified in Azure** until exercised on your install): two wildcard
-certificates, two certbot jobs, two declarative bindings when both TLS gates are on.
+certificates, two certbot jobs, two declarative bindings when both TLS gates are on. New split installs
+never create a `*` A record in the control zone; whether Container Apps still binds and re-binds
+`*.<control>` without that record is not documented — check the first certbot run.
 
 ## What a rollout actually does
 
@@ -721,7 +753,12 @@ real outages. Check the things that fail silently:
     https://auth.<appsDomain>/health
   ```
 
-  `tls=0` is a verified chain.
+  `tls=0` is a verified chain. With a split install (`hostedAppsLive = true`), also probe
+  `https://www.<hostedAppsDomain>/health` the same way.
+- **Split installs:** `GET /api/v1/providers` must list `callbackUrl` as
+  `https://auth.<control domain>/connections/callback` (same value as `EDGE_CONTROL_DOMAIN` on the
+  edge). A mismatch means the portal and edge disagree and vendor OAuth will fail even when both
+  services boot.
 - **The edge→egress hop resolves**, after any full apply. The apply rewrites
   that URL on every caller from a `reference()` the diff could never resolve,
   so an apply is exactly when this hop breaks. Probe it from inside the

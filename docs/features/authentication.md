@@ -77,11 +77,13 @@ scope does not widen. The Origin and Fetch Metadata guard (`apps/edge/src/auth/v
 accepts only `same-origin`; both `same-site` and `cross-site` are refused, so moving a sibling
 app from same-site to cross-site changes nothing for `/_api/*`.
 
-**Boot rules:** `controlDomain` must be a valid hostname and must not be equal to, a subdomain of,
-or a parent of `appsDomain` unless the two are equal. The edge cannot verify Public Suffix List
-membership without a new dependency; it logs the split at boot and the operator documentation
-states the requirement: a **delegated apps subdomain** only separates sites when that zone is
-listed on the Public Suffix List.
+**Boot rules:** `controlDomain` and `appsDomain` must each be a valid hostname. They may be equal
+(single-domain layout) or the control domain may be a **parent** of the apps domain (the delegated
+subdomain case — that zone must be on the Public Suffix List or the two remain the same site). The
+control domain must **not** be a subdomain of the apps domain. The apps domain must not be on or
+under `auth.`, `portal.`, or `dev-api.` of the control domain. The edge cannot verify Public Suffix
+List membership without a new dependency; it logs the split at boot and the operator documentation
+states the PSL requirement for delegated apps zones.
 
 **Recorded browser check (dev container, Chromium 156 headless):** navigation from
 `<slug>.helix-apps.localhost` to `auth.local.helix.azxlabs.io` reported `Sec-Fetch-Site:
