@@ -20,6 +20,7 @@ import {
   INSTR_GATEWAY_PLATFORM_SPEND_RATIO,
   INSTR_GATEWAY_CALLS,
   INSTR_GATEWAY_DURATION,
+  INSTR_LEGACY_APP_REDIRECTS,
   INSTR_REGISTRY_LOAD_FAILURES,
   INSTR_REGISTRY_STALE_FOR_MS,
   INSTR_SESSION_GATE_DENIED,
@@ -73,6 +74,8 @@ export interface EdgeInstruments {
   trustProxyUnresolved: ObservableGauge;
   /** `appId`, `outcome` ∈ `VISIT_RECORD_OUTCOMES` (ADR-0050). */
   appVisits: Counter;
+  /** `outcome` ∈ `LEGACY_REDIRECT_OUTCOMES`. */
+  legacyAppRedirects: Counter;
   /** `appId`, `directive` ∈ `CSP_REPORT_DIRECTIVES`, `disposition` ∈ `CSP_REPORT_DISPOSITIONS`. */
   cspReports: Counter;
   /** `appId`, `basis` ∈ `CUT_CHARGE_BASES` — operational only, never reconciled with the ledger. */
@@ -142,6 +145,11 @@ export function instruments(): EdgeInstruments {
       description:
         "Hosted-app document loads the edge tried to record, by outcome. Operational only — " +
         "the owner-facing counts come from app_visits.",
+    }),
+    legacyAppRedirects: meter.createCounter(INSTR_LEGACY_APP_REDIRECTS, {
+      description:
+        "Requests to an old <slug>.<control domain> host while the legacy redirect is on, by outcome. " +
+        "No host, path or slug is recorded: this is the signal that says when to turn the redirect off.",
     }),
     cspReports: meter.createCounter(INSTR_CSP_REPORTS, {
       description:

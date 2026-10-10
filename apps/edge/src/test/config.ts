@@ -67,6 +67,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
     // disallow path override these to false.
     allowPublicApps: true,
     allowPasswordApps: true,
+    legacyAppRedirect: false,
     publicScheme: "https",
     publicPort: 8080,
     tls: null,

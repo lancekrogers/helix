@@ -7,6 +7,7 @@ import type { BlobReader } from "./blob/client.js";
 import type { RegistryFreshnessReader, RegistryReader } from "./registry/projection.js";
 import { registryFreshnessCheck } from "./registry/health.js";
 import { classifyHost, type HostClass } from "./routing/hosts.js";
+import { makeLegacyRedirectHook } from "./routing/legacyRedirect.js";
 import { trustProxyCheck, wireTrustProxyHealth } from "./routing/trustProxyHealth.js";
 import { makeAssetHandler } from "./serving/assets.js";
 import { makeVisitRecorder, type VisitStore } from "./serving/visits.js";
@@ -392,8 +393,17 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
 
   app.decorateRequest("hostClass");
   app.addHook("onRequest", async (req) => {
-    req.hostClass = classifyHost(req.headers.host, config.baseDomain, config.controlDomain);
+    req.hostClass = classifyHost(
+      req.headers.host,
+      config.baseDomain,
+      config.controlDomain,
+      config.legacyAppRedirect,
+    );
   });
+
+  if (config.legacyAppRedirect) {
+    app.addHook("onRequest", makeLegacyRedirectHook({ config, registry: deps.registry }));
+  }
 
   // The trust-proxy self-report (ADR-0011): watch whether the forwarded walk
   // ever moves, so a well-formed EDGE_TRUST_PROXY pointed at the wrong network

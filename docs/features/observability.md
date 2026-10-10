@@ -43,6 +43,7 @@ terminates untrusted traffic (decision 4).
 | `helix.gateway.llm` / `.fetch` / `.data` | the `/_api/*` handlers |
 | `helix.auth.oidc.start` / `.callback`, `helix.auth.handoff.complete` | the auth routes |
 | `helix.auth.connections.proxy` | the auth host's `/connections/*` reverse proxy |
+| `helix.edge.legacy_app_redirect` | the split-layout grace redirect on old `<slug>.<controlDomain>` hosts (`onRequest`, before platform routes) |
 | `helix.consent.start` | the app host's `/_api/connections/:ref/start` route — the consent popup's prod entry |
 | `helix.consent.start.dev` | the dev gateway's `/:slug/_api/connections/:ref/start` route — the dev tier's bearer POST → single-use popup URL |
 | `helix.consent.cancel.edge` | the app host's `/_api/connections/attempt/cancel` route — the connect helper's cancellation acknowledgement, forwarding to the portal's own `.cancel` span |
@@ -210,6 +211,7 @@ looked up:
 | `helix.session.gate_denied` | counter | `reason` |
 | `helix.edge.trust_proxy.unresolved` | observable gauge | — |
 | `helix.app.visits` | counter | `appId`, `outcome` (`recorded` / `failed` / `dropped` / `deduplicated`; the fire-and-forget `app_visits` write, ADR-0050. Alert on a sustained `failed` or `dropped` rate. The owner's numbers come from the table, never this counter) |
+| `helix.edge.legacy_app_redirects` | counter | `outcome` (`redirected` / `unknown_app` / `refused_path`; when `redirected` stays at zero for your chosen period, turn `EDGE_LEGACY_APP_REDIRECT` off) |
 | `helix.edge.csp_reports` | counter | `appId`, `directive` (`img-src` / `connect-src` / `script-src` / `style-src` / `font-src` / `object-src` / `other`), `disposition` (`enforce` / `report` / `unknown`; `report` only during `EDGE_IMG_SRC_REPORT_ONLY`, `enforce` after the tightened policy is on the enforced header), `helix.outcome` (`recorded` / `dropped` / `failed` — whether the report row was inserted, dropped past the per-app cap, or the insert failed). Blocked and document URIs are never recorded on this counter. Owner-facing counts come from `csp_reports`, not this counter |
 | `helix.consent.operations` | counter | `operation`, `outcome` (ADR-0031 as amended; the portal's first instrument — see the `helix.outcome` vocabularies in `@azx-pbc/shared/telemetry`) |
 

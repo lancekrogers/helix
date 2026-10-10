@@ -395,6 +395,7 @@ try {
       allowUnauthenticated: config.allowUnauthenticated,
       allowPublicApps: config.allowPublicApps,
       allowPasswordApps: config.allowPasswordApps,
+      legacyAppRedirect: config.legacyAppRedirect,
       llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
       llmPlatformDollarsPerDay: config.llm.platformDollarsPerDay,
       llmMaxAppInFlight: config.llm.maxAppInFlight,

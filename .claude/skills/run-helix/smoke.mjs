@@ -79,7 +79,7 @@ try {
 const SVC_ENV = {
   ...process.env,
   ...STACK.env,
-  ...(STACK.split ? { EDGE_SESSION_REFRESH_MS: "3000" } : {}),
+  ...(STACK.split ? { EDGE_SESSION_REFRESH_MS: "3000", EDGE_LEGACY_APP_REDIRECT: "true" } : {}),
 };
 const PORTS = Object.values(STACK.ports);
 
@@ -1123,6 +1123,16 @@ async function checkSplit() {
     r = await navGet(appUrl(slug), jar);
     eq(r.status, 200, "authenticated app page");
     return `${slug} on ${APPS}`;
+  });
+
+  await check("legacy control host redirects to apps origin", async () => {
+    const legacyUrl = `https://${slug}.${CONTROL}:${STACK.ports.edge}/`;
+    const r = await fetch(legacyUrl, { redirect: "manual" });
+    eq(r.status, 307, "legacy host");
+    const loc = r.headers.get("location") ?? "";
+    assert(loc.startsWith(appUrl(slug)), `expected apps origin, got ${loc}`);
+    assert(r.headers.get("cache-control") === "no-store", "cache-control");
+    return loc;
   });
 
   let browser;

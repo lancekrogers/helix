@@ -39,6 +39,7 @@ export const INSTR_EGRESS_RENEWALS = "helix.egress.renewals";
 export const INSTR_EGRESS_RETIREMENTS = "helix.egress.retirements";
 export const INSTR_EGRESS_UPSTREAM_ABORTS = "helix.egress.upstream_aborts";
 export const INSTR_APP_VISITS = "helix.app.visits";
+export const INSTR_LEGACY_APP_REDIRECTS = "helix.edge.legacy_app_redirects";
 export const INSTR_CSP_REPORTS = "helix.edge.csp_reports";
 export const INSTR_GATEWAY_CUT_CHARGES = "helix.gateway.cut_charges";
 export const INSTR_GATEWAY_ADMISSION_DENIED = "helix.gateway.admission_denied";
@@ -139,6 +140,7 @@ export const SPAN_PROVIDERS_RECONCILE = "helix.providers.reconcile";
 export const SPAN_AUTH_START = "helix.auth.oidc.start";
 export const SPAN_AUTH_CALLBACK = "helix.auth.oidc.callback";
 export const SPAN_AUTH_COMPLETE = "helix.auth.handoff.complete";
+export const SPAN_LEGACY_APP_REDIRECT = "helix.edge.legacy_app_redirect";
 export const SPAN_CONNECTIONS_PROXY = "helix.auth.connections.proxy";
 export const SPAN_DEPLOY_BUNDLE = "helix.deploy.bundle";
 export const SPAN_DEPLOY_VALIDATE = "helix.deploy.validate";
@@ -183,6 +185,7 @@ export const ROUTE_DATA = "/_api/data/*";
 export const ROUTE_AUTH_START = "/start";
 export const ROUTE_AUTH_CALLBACK = "/callback";
 export const ROUTE_AUTH_COMPLETE = "/_auth/complete";
+export const ROUTE_LEGACY_APP_REDIRECT = "/*";
 export const ROUTE_CONNECTIONS = "/connections/*";
 export const ROUTE_CONSENT_START = "/_api/connections/:ref/start";
 export const ROUTE_CONSENT_START_DEV = "/:slug/_api/connections/:ref/start";
@@ -270,6 +273,19 @@ export type RegistryLoadOutcome = (typeof REGISTRY_LOAD_OUTCOMES)[number];
  */
 export const VISIT_RECORD_OUTCOMES = ["recorded", "failed", "dropped", "deduplicated"] as const;
 export type VisitRecordOutcome = (typeof VISIT_RECORD_OUTCOMES)[number];
+
+/**
+ * What the edge did with a request to an old `<slug>.<controlDomain>` host — the
+ * `helix.edge.legacy_app_redirects` dimension. When `redirected` stays at zero
+ * for the operator's chosen period, the redirect can be turned off.
+ * - `redirected`: a 307 to the app's new origin.
+ * - `unknown_app`: unknown, archived, nothing live, mode not permitted, or the
+ *   registry not loaded; all answer 404 and none is told apart.
+ * - `refused_path`: a path that starts with `_` or fails return-path validation,
+ *   or a method other than GET/HEAD; answered with 404.
+ */
+export const LEGACY_REDIRECT_OUTCOMES = ["redirected", "unknown_app", "refused_path"] as const;
+export type LegacyRedirectOutcome = (typeof LEGACY_REDIRECT_OUTCOMES)[number];
 
 export const CSP_REPORT_DIRECTIVES = [
   "img-src",

@@ -9,7 +9,11 @@ import { SLUG_PATTERN } from "@azx-pbc/shared";
  * only `auth.<controlDomain>` is auth; `auth.<baseDomain>` is reserved and
  * classifies as platform so it never runs the handoff.
  */
-export type HostClass = { kind: "app"; slug: string } | { kind: "auth" } | { kind: "platform" };
+export type HostClass =
+  | { kind: "app"; slug: string }
+  | { kind: "legacy-app"; slug: string }
+  | { kind: "auth" }
+  | { kind: "platform" };
 
 /**
  * Subdomain labels that can never be apps — reserved for platform services
@@ -23,6 +27,7 @@ export function classifyHost(
   hostHeader: string | undefined,
   baseDomain: string,
   controlDomain: string = baseDomain,
+  legacyAppRedirect = false,
 ): HostClass {
   if (!hostHeader || hostHeader.includes("[")) {
     return { kind: "platform" }; // absent or IPv6 literal — never an app host
@@ -46,6 +51,18 @@ export function classifyHost(
   }
   if (host === `auth.${controlDomain}`) {
     return { kind: "auth" };
+  }
+  const controlSuffix = `.${controlDomain}`;
+  if (legacyAppRedirect && controlDomain !== baseDomain && host.endsWith(controlSuffix)) {
+    const label = host.slice(0, -controlSuffix.length);
+    if (
+      !label.includes(".") &&
+      SLUG_PATTERN.test(label) &&
+      !RESERVED_SUBDOMAINS.has(label) &&
+      label !== "dev-api"
+    ) {
+      return { kind: "legacy-app", slug: label };
+    }
   }
   return { kind: "platform" };
 }

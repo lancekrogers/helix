@@ -28,6 +28,7 @@ function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
     allowUnauthenticated: true,
     allowPublicApps: true,
     allowPasswordApps: true,
+    legacyAppRedirect: false,
     publicScheme: "https",
     publicPort: 8080,
     tls: null,

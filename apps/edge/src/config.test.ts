@@ -87,6 +87,29 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...ENV, EDGE_ALLOW_PUBLIC_APPS: "1" }).allowPublicApps).toBe(false);
   });
 
+  it("parses EDGE_LEGACY_APP_REDIRECT strictly and only in split layout", () => {
+    expect(loadConfig(ENV).legacyAppRedirect).toBe(false);
+    expect(loadConfig({ ...ENV, EDGE_LEGACY_APP_REDIRECT: "true" }).legacyAppRedirect).toBe(false);
+    for (const value of ["TRUE", "1", "", "  "]) {
+      expect(loadConfig({ ...ENV, EDGE_LEGACY_APP_REDIRECT: value }).legacyAppRedirect).toBe(false);
+    }
+    const split = loadConfig({
+      ...ENV,
+      EDGE_BASE_DOMAIN: "helix-apps.localhost",
+      EDGE_CONTROL_DOMAIN: "helix-control.localhost",
+      EDGE_LEGACY_APP_REDIRECT: "true",
+    });
+    expect(split.legacyAppRedirect).toBe(true);
+    expect(
+      loadConfig({
+        ...ENV,
+        EDGE_BASE_DOMAIN: "helix-apps.localhost",
+        EDGE_CONTROL_DOMAIN: "helix-control.localhost",
+        EDGE_LEGACY_APP_REDIRECT: "TRUE",
+      }).legacyAppRedirect,
+    ).toBe(false);
+  });
+
   it("honors overrides", () => {
     const config = loadConfig({
       ...ENV,

@@ -331,6 +331,12 @@ export interface EdgeConfig extends GatewayConfig {
    * "allow"/default-off polarity as {@link allowPublicApps}.
    */
   allowPasswordApps: boolean;
+  /**
+   * When true (split layout only), GET/HEAD to `<slug>.<controlDomain>` for a live
+   * permitted app answer 307 to the same path on the apps origin. Default off;
+   * with `controlDomain === baseDomain` the effective value is always false.
+   */
+  legacyAppRedirect: boolean;
   /** Per-IP rate limit for the anonymous tier on `public` apps (app-data design §7). Caps every anonymous `/_api/*` gateway call, keyed per IP+app within a
    * fixed window — the anonymous writer/visitor has no per-user budget to
    * charge, so this is the only per-source cap on an open public surface.
@@ -1033,8 +1039,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     );
   }
 
+  const gateway = loadGatewayConfig(env);
+
   return {
-    ...loadGatewayConfig(env),
+    ...gateway,
     databaseUrl,
     blob,
     auth: loadAuthConfig(env),
@@ -1044,6 +1052,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     // EdgeConfig); a deployment opts a surface back in per environment.
     allowPublicApps: env.EDGE_ALLOW_PUBLIC_APPS === "true",
     allowPasswordApps: env.EDGE_ALLOW_PASSWORD_APPS === "true",
+    // Allow-polarity, default off. Meaningful only in the split layout; with one domain the old and
+    // new hosts are the same host, so the flag is forced off rather than left to confuse the log.
+    legacyAppRedirect:
+      env.EDGE_LEGACY_APP_REDIRECT === "true" && gateway.controlDomain !== gateway.baseDomain,
     anonRateLimit: {
       max: Number(env.EDGE_ANON_RATE_LIMIT ?? 60),
       windowMs: Number(env.EDGE_ANON_RATE_WINDOW_MS ?? 60_000),

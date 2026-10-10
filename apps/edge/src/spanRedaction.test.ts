@@ -15,6 +15,9 @@ import {
   SPAN_CONSENT_STATUS_EDGE,
   SPAN_FETCH,
   SPAN_LLM,
+  SPAN_LEGACY_APP_REDIRECT,
+  ATTR_APP_ID,
+  ATTR_OUTCOME,
 } from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "./telemetry.js";
 import { buildApp } from "./app.js";
@@ -22,7 +25,13 @@ import { buildDevGateway } from "./devGateway/app.js";
 import type { DevTokenStore } from "./devGateway/devTokenStore.js";
 import { SESSION_COOKIE } from "./auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "./auth/sessions.js";
-import { testAuthConfig, testDevGatewayConfig, testEdgeConfig } from "./test/config.js";
+import {
+  SPLIT_CONTROL_DOMAIN,
+  splitEdgeConfig,
+  testAuthConfig,
+  testDevGatewayConfig,
+  testEdgeConfig,
+} from "./test/config.js";
 import { until } from "./test/socket.js";
 import {
   FakeAppDataStore,
@@ -326,6 +335,52 @@ describe("span attributes never carry a credential", () => {
       // And the route is still identifiable — `url.path` only, no query.
       const routeSpan = recording.spans().find((s) => s.name === "helix.auth.connections.proxy");
       expect(routeSpan?.attributes["url.path"]).toBe("/connections/callback");
+    });
+  });
+
+  describe("the legacy app host redirect", () => {
+    const PLANTED_SLUG = "planted-legacy-slug";
+    const PLANTED_TOKEN = "PLANTED-LEGACY-REDIRECT-TOKEN";
+    const PLANTED_CODE = "PLANTED-LEGACY-REDIRECT-CODE";
+    const APP_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    it("records only bounded attributes and never the query, host, slug or path", async () => {
+      const app = buildApp({
+        config: splitEdgeConfig({ legacyAppRedirect: true }),
+        registry: new FakeRegistry([
+          registryEntry({
+            appId: APP_ID,
+            slug: PLANTED_SLUG,
+            blobPrefix: "apps/b/1/",
+          }),
+        ]),
+        blob: new FakeBlobReader(),
+      });
+      const res = await app.inject({
+        method: "GET",
+        url: `/secret-path?token=${PLANTED_TOKEN}&code=${PLANTED_CODE}`,
+        headers: { host: `${PLANTED_SLUG}.${SPLIT_CONTROL_DOMAIN}` },
+      });
+      expect(res.statusCode).toBe(307);
+      await app.close();
+
+      const span = recording.spans().find((s) => s.name === SPAN_LEGACY_APP_REDIRECT);
+      expect(span).toBeDefined();
+      expect(Object.keys(span?.attributes ?? {}).sort()).toEqual([
+        ATTR_APP_ID,
+        ATTR_OUTCOME,
+        "http.route",
+      ]);
+      const dump = JSON.stringify(recording.spans().map((s) => s.attributes));
+      for (const secret of [
+        PLANTED_TOKEN,
+        PLANTED_CODE,
+        PLANTED_SLUG,
+        "secret-path",
+        SPLIT_CONTROL_DOMAIN,
+      ]) {
+        expect(dump, `leaked ${secret}`).not.toContain(secret);
+      }
     });
   });
 

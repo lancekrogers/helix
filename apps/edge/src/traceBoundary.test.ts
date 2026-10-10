@@ -16,12 +16,19 @@ import {
   SPAN_CONSENT_START,
   SPAN_CONSENT_START_DEV,
   SPAN_CONSENT_STATUS_EDGE,
+  SPAN_LEGACY_APP_REDIRECT,
 } from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "./telemetry.js";
 import { buildApp } from "./app.js";
 import { buildDevGateway } from "./devGateway/app.js";
 import type { DevTokenStore } from "./devGateway/devTokenStore.js";
-import { testAuthConfig, testDevGatewayConfig, testEdgeConfig } from "./test/config.js";
+import {
+  SPLIT_CONTROL_DOMAIN,
+  splitEdgeConfig,
+  testAuthConfig,
+  testDevGatewayConfig,
+  testEdgeConfig,
+} from "./test/config.js";
 import {
   FakeBlobReader,
   FakeOidcClient,
@@ -332,6 +339,39 @@ describe("the connection-status route is a fresh root too (ADR-0031 as amended)"
     );
     expect(dump).not.toContain(APP_TRACE_ID);
     expect(dump).not.toContain("vendor=app-chosen");
+  });
+});
+
+describe("the legacy app host redirect is a fresh root too", () => {
+  it("an inbound traceparent never parents the route span", async () => {
+    propagation.setGlobalPropagator(propagatorFor("inject-only"));
+    const app: FastifyInstance = buildApp({
+      config: splitEdgeConfig({ legacyAppRedirect: true }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: "22222222-2222-4222-8222-222222222222",
+          slug: "planted-slug",
+          blobPrefix: "apps/a/1/",
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/page?token=PLANTED-QUERY-SECRET&code=PLANTED-CODE",
+      headers: {
+        host: `planted-slug.${SPLIT_CONTROL_DOMAIN}`,
+        traceparent: APP_TRACEPARENT,
+        tracestate: "vendor=app-chosen",
+      },
+    });
+    expect(res.statusCode).toBe(307);
+    await app.close();
+
+    const span = recording.spans().find((sp) => sp.name === SPAN_LEGACY_APP_REDIRECT);
+    expect(span).toBeDefined();
+    expect(span?.spanContext().traceId).not.toBe(APP_TRACE_ID);
+    expect(span?.parentSpanContext).toBeUndefined();
   });
 });
 

@@ -89,6 +89,27 @@ describe("split layout", () => {
     expect(classify(`dev-api.${APPS}`)).toEqual({ kind: "app", slug: "dev-api" });
   });
 
+  it("legacy-app on the control suffix when redirect is enabled", () => {
+    expect(classifyHost(`demo.${CONTROL}`, APPS, CONTROL, true)).toEqual({
+      kind: "legacy-app",
+      slug: "demo",
+    });
+    expect(classifyHost(`demo.${CONTROL}`, APPS, CONTROL, false)).toEqual({ kind: "platform" });
+    expect(classifyHost(`auth.${CONTROL}`, APPS, CONTROL, true)).toEqual({ kind: "auth" });
+    for (const label of ["portal", "api", "www", "dev-api"]) {
+      expect(classifyHost(`${label}.${CONTROL}`, APPS, CONTROL, true)).toEqual({
+        kind: "platform",
+      });
+    }
+    expect(classifyHost(`a.b.${CONTROL}`, APPS, CONTROL, true)).toEqual({ kind: "platform" });
+    expect(classifyHost(`demo.${APPS}`, APPS, CONTROL, true)).toEqual({
+      kind: "app",
+      slug: "demo",
+    });
+    expect(classifyHost(`demo.${CONTROL}`, APPS, APPS, true)).toEqual({ kind: "platform" });
+    expect(classifyHost(`demo.apps.${CONTROL}`, APPS, CONTROL, true)).toEqual({ kind: "platform" });
+  });
+
   it("delegated-subdomain: control parent of apps", () => {
     const parent = "helix.customer.test";
     const apps = "apps.helix.customer.test";
