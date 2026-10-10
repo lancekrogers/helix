@@ -1,6 +1,6 @@
 # Bicep templates. infra/azure is the source of truth for the deployed
-# topology; deployment steps live in infra/azure/README.md and are not wrapped
-# here.
+# topology; deployment steps live in infra/azure/README.md, except net-verify,
+# the operator recipe below. net-sim is local tooling for the NSG rule table.
 
 set working-directory := ".."
 
@@ -20,3 +20,46 @@ build:
 [positional-arguments]
 egress-hosts *args:
     pnpm --filter @azx-pbc/portal egress:hosts -- "$@"
+
+# Simulate the egress NSG rule table with Docker networks and iptables, run the probe against stand-ins (needs a Docker daemon on this host, not the dev container); --static runs only the translator tests
+[positional-arguments]
+net-sim *args:
+    node infra/netsim/run.mjs "$@"
+
+# OPERATOR STEP, not CI: start the network probe job in a deployed install and print its result. Unverified in Azure by the work that added it; needs `az login` and the containerapp extension.
+net-verify resource-group prefix='helix-prod':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    job_name="{{prefix}}-netprobe"
+    rg="{{resource-group}}"
+    exec_name="$(az containerapp job start -g "$rg" -n "$job_name" --query name -o tsv)"
+    echo "started execution ${exec_name}"
+    deadline=$(( $(date +%s) + 600 ))
+    status="Unknown"
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      status="$(az containerapp job execution show -g "$rg" -n "$job_name" --job-execution-name "$exec_name" --query properties.status -o tsv 2>/dev/null || echo Running)"
+      case "$status" in
+        Running|Processing|Unknown|"") ;;
+        *) break ;;
+      esac
+      sleep 10
+    done
+    echo "execution status: ${status}"
+    logs=""
+    log_deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$log_deadline" ]; do
+      logs="$(az containerapp job logs show -g "$rg" -n "$job_name" --execution "$exec_name" --container netprobe --format text 2>/dev/null || true)"
+      if [ -n "$logs" ]; then
+        break
+      fi
+      sleep 15
+    done
+    if [ -z "$logs" ]; then
+      echo "no probe output yet (Log Analytics may still be ingesting); retry: az containerapp job logs show -g $rg -n $job_name --execution $exec_name --container netprobe --format text"
+    else
+      printf '%s\n' "$logs"
+    fi
+    if [ "$status" = "Succeeded" ]; then
+      exit 0
+    fi
+    exit 1

@@ -41,6 +41,19 @@ NSG does not block those host-node paths the way the rule table suggests. Alerts
 the KQL matches real job console logs is unverified in Azure until an operator runs
 the job.
 
+### Verifying the network controls
+
+- **`just infra net-sim`** — on a host with Docker (not the dev container), applies
+  `nsg-egress-rules.json` as iptables rules on a probe container attached to
+  stand-in subnets and runs the same `netprobe` entry point as the Azure job.
+  `just infra net-sim --static` runs only the translator tests (`node --test
+infra/netsim/translate.test.mjs`, which also runs in the dev container). The simulation proves rule ordering and first-match logic, not
+  Azure NSG semantics, subnet attachment, or real platform-address behavior
+  (**unverified in Azure**).
+- **`just infra net-verify`** — operator step against a deployed install: starts
+  `<prefix>-netprobe`, waits for the execution, prints probe lines. **Unverified in
+  Azure** by the recipe itself until an operator runs it.
+
 ### The security shape, in one diagram
 
 ```

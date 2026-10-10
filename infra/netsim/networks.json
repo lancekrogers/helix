@@ -1,0 +1,58 @@
+{
+  "networks": {
+    "egress": { "subnet": "10.0.4.0/23" },
+    "apps": { "subnet": "10.0.2.0/23" },
+    "postgres": { "subnet": "10.0.6.0/24" },
+    "pe": { "subnet": "10.0.7.0/24" },
+    "platform": { "subnet": "168.63.129.0/24" },
+    "imds": { "subnet": "169.254.169.0/24" },
+    "public": { "subnet": "198.51.100.0/24" }
+  },
+  "probe": { "network": "egress", "ip": "10.0.4.10" },
+  "standins": [
+    { "name": "apps-ilb", "network": "apps", "ip": "10.0.2.10", "listen": [443] },
+    { "name": "postgres", "network": "postgres", "ip": "10.0.6.4", "listen": [5432] },
+    { "name": "kv-platform", "network": "pe", "ip": "10.0.7.4", "listen": [443] },
+    { "name": "kv-connections", "network": "pe", "ip": "10.0.7.5", "listen": [443] },
+    { "name": "kv-delegated", "network": "pe", "ip": "10.0.7.6", "listen": [443] },
+    { "name": "blob-pe", "network": "pe", "ip": "10.0.7.7", "listen": [443] },
+    {
+      "name": "wire-server",
+      "network": "platform",
+      "ip": "168.63.129.16",
+      "listen": [80, 32526],
+      "dns": true
+    },
+    { "name": "imds", "network": "imds", "ip": "169.254.169.254", "listen": [80] },
+    {
+      "name": "public-allowed",
+      "network": "public",
+      "ip": "198.51.100.10",
+      "listen": [443, 25, 22, 8443]
+    },
+    { "name": "public-canary", "network": "public", "ip": "198.51.100.11", "listen": [443] }
+  ],
+  "names": {
+    "pg.sim.test": "10.0.6.4",
+    "allowed.sim.test": "198.51.100.10",
+    "canary.sim.test": "198.51.100.11"
+  },
+  "refs": {
+    "$vnet": "10.0.0.0/16",
+    "$egressSubnet": "10.0.4.0/23",
+    "$appsSubnet": "10.0.2.0/23",
+    "$postgresSubnet": "10.0.6.0/24",
+    "$privateEndpointSubnet": "10.0.7.0/24",
+    "$kvConnectionsIp": "10.0.7.5",
+    "$kvDelegatedIp": "10.0.7.6"
+  },
+  "allowedPorts": ["80", "443"],
+  "tags": {
+    "Internet": "0.0.0.0/0",
+    "MicrosoftContainerRegistry": "192.0.2.0/28",
+    "AzureFrontDoor.FirstParty": "192.0.2.16/28",
+    "AzureActiveDirectory": "192.0.2.32/28",
+    "AzureMonitor": "192.0.2.48/28",
+    "AzureLoadBalancer": "192.0.2.64/28"
+  }
+}
