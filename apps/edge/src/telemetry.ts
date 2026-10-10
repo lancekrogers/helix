@@ -14,6 +14,7 @@ import {
 import {
   DURATION_BUCKETS_MS,
   INSTR_APP_VISITS,
+  INSTR_CSP_REPORTS,
   INSTR_GATEWAY_ADMISSION_DENIED,
   INSTR_GATEWAY_CUT_CHARGES,
   INSTR_GATEWAY_PLATFORM_SPEND_RATIO,
@@ -72,6 +73,8 @@ export interface EdgeInstruments {
   trustProxyUnresolved: ObservableGauge;
   /** `appId`, `outcome` ∈ `VISIT_RECORD_OUTCOMES` (ADR-0050). */
   appVisits: Counter;
+  /** `appId`, `directive` ∈ `CSP_REPORT_DIRECTIVES`, `disposition` ∈ `CSP_REPORT_DISPOSITIONS`. */
+  cspReports: Counter;
   /** `appId`, `basis` ∈ `CUT_CHARGE_BASES` — operational only, never reconciled with the ledger. */
   gatewayCutCharges: Counter;
   /**
@@ -139,6 +142,11 @@ export function instruments(): EdgeInstruments {
       description:
         "Hosted-app document loads the edge tried to record, by outcome. Operational only — " +
         "the owner-facing counts come from app_visits.",
+    }),
+    cspReports: meter.createCounter(INSTR_CSP_REPORTS, {
+      description:
+        "CSP violation reports received, by app, directive and disposition. Operational only; " +
+        "the owner-facing counts come from csp_reports.",
     }),
     gatewayCutCharges: meter.createCounter(INSTR_GATEWAY_CUT_CHARGES, {
       description:

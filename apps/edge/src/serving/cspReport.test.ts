@@ -1,9 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
+import { INSTR_CSP_REPORTS } from "@azx-pbc/shared/telemetry";
+import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { buildApp } from "../app.js";
 import type { EdgeConfig } from "../config.js";
 import { FakeBlobReader, FakeRegistry, registryEntry } from "../test/fakes.js";
-import { extractReport, type CspReportRecord, type CspReportStore } from "./cspReport.js";
+import {
+  extractReport,
+  foldDirective,
+  type CspReportRecord,
+  type CspReportStore,
+} from "./cspReport.js";
+import { CSP_REPORT_DIRECTIVES } from "@azx-pbc/shared/telemetry";
 
 const APP_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -48,6 +56,7 @@ function testConfig(): EdgeConfig {
       maxCallMs: 600_000,
     },
     anonRateLimit: { max: 0, windowMs: 60_000 },
+    imgSrcExtra: [],
     trustProxy: false,
     fetch: {
       egressUrl: null,
@@ -63,7 +72,9 @@ function testConfig(): EdgeConfig {
 
 class FakeCspReportStore implements CspReportStore {
   records: CspReportRecord[] = [];
+  fail = false;
   async record(r: CspReportRecord): Promise<void> {
+    if (this.fail) throw new Error("store down");
     this.records.push(r);
   }
   async close(): Promise<void> {}
@@ -83,7 +94,38 @@ describe("extractReport", () => {
       directive: "connect-src",
       blockedUri: "https://api.foo.com/x",
       documentUri: "https://demo.local.helix.azxlabs.io/",
+      disposition: "unknown",
     });
+  });
+
+  it("parses legacy disposition", () => {
+    expect(
+      extractReport({
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": "https://x.io/a.png",
+          disposition: "report",
+        },
+      })?.disposition,
+    ).toBe("report");
+    expect(
+      extractReport({
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": "https://x.io/a.png",
+          disposition: "enforce",
+        },
+      })?.disposition,
+    ).toBe("enforce");
+    expect(
+      extractReport({
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": "https://x.io/a.png",
+          disposition: "bogus",
+        },
+      })?.disposition,
+    ).toBe("unknown");
   });
 
   it("parses a Reporting-API array body", () => {
@@ -94,13 +136,46 @@ describe("extractReport", () => {
           body: { effectiveDirective: "img-src", blockedURL: "https://x.io/a.png" },
         },
       ]),
-    ).toMatchObject({ directive: "img-src", blockedUri: "https://x.io/a.png" });
+    ).toMatchObject({
+      directive: "img-src",
+      blockedUri: "https://x.io/a.png",
+      disposition: "unknown",
+    });
+    expect(
+      extractReport([
+        {
+          type: "csp-violation",
+          body: {
+            effectiveDirective: "img-src",
+            blockedURL: "https://x.io/a.png",
+            disposition: "report",
+          },
+        },
+      ])?.disposition,
+    ).toBe("report");
   });
 
   it("returns null when there is no blocked URL", () => {
     expect(extractReport({ "csp-report": {} })).toBeNull();
     expect(extractReport({})).toBeNull();
     expect(extractReport("garbage")).toBeNull();
+  });
+});
+
+describe("foldDirective", () => {
+  for (const name of CSP_REPORT_DIRECTIVES) {
+    if (name === "other") continue;
+    it(`folds ${name}`, () => {
+      expect(foldDirective(name)).toBe(name);
+    });
+  }
+  it("folds CSP3 sub-directives and hostile input", () => {
+    expect(foldDirective("script-src-elem")).toBe("script-src");
+    expect(foldDirective("IMG-SRC")).toBe("img-src");
+    expect(foldDirective("img-src 'self'")).toBe("img-src");
+    expect(foldDirective("default-src")).toBe("other");
+    expect(foldDirective("")).toBe("other");
+    expect(foldDirective("x".repeat(5000))).toBe("other");
   });
 });
 
@@ -170,5 +245,126 @@ describe("POST /_csp-report", () => {
       payload: JSON.stringify({ "csp-report": { "blocked-uri": "https://x" } }),
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  async function injectReport(
+    app: FastifyInstance,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    await app.inject({
+      method: "POST",
+      url: "/_csp-report",
+      headers: { host: "demo.local.helix.azxlabs.io", "content-type": "application/csp-report" },
+      payload: JSON.stringify(payload),
+    });
+  }
+
+  function buildMetricEdge(reportStore: FakeCspReportStore): FastifyInstance {
+    const registry = new FakeRegistry([
+      registryEntry({ appId: APP_ID, slug: "demo", blobPrefix: `apps/${APP_ID}/1/` }),
+    ]);
+    return buildApp({
+      config: testConfig(),
+      registry,
+      blob: new FakeBlobReader(),
+      cspReports: reportStore,
+    });
+  }
+
+  it("increments the counter with bounded dimensions", async () => {
+    const recording = startRecordingTelemetry();
+    const localStore = new FakeCspReportStore();
+    const app = buildMetricEdge(localStore);
+    await app.ready();
+    await injectReport(app, {
+      "csp-report": {
+        "effective-directive": "img-src",
+        "blocked-uri": "https://x.io/a.png",
+        disposition: "report",
+      },
+    });
+    await app.close();
+    const points = await recording.metrics();
+    const hit = points.find((p) => p.name === INSTR_CSP_REPORTS);
+    expect(hit?.value).toBe(1);
+    expect(Object.keys(hit?.attributes ?? {}).sort()).toEqual([
+      "helix.app_id",
+      "helix.csp.directive",
+      "helix.csp.disposition",
+    ]);
+    expect(hit?.attributes["helix.csp.directive"]).toBe("img-src");
+    expect(hit?.attributes["helix.csp.disposition"]).toBe("report");
+    await recording.restore();
+  });
+
+  it("folds a hostile directive to other", async () => {
+    const recording = startRecordingTelemetry();
+    const localStore = new FakeCspReportStore();
+    const app = buildMetricEdge(localStore);
+    await app.ready();
+    await injectReport(app, {
+      "csp-report": {
+        "effective-directive": "app-chosen-directive",
+        "blocked-uri": "https://x.io/a.png",
+      },
+    });
+    await app.close();
+    const points = await recording.metrics();
+    const hit = points.find((p) => p.name === INSTR_CSP_REPORTS);
+    expect(hit?.attributes["helix.csp.directive"]).toBe("other");
+    await recording.restore();
+  });
+
+  it("counts before insert when the store throws", async () => {
+    const recording = startRecordingTelemetry();
+    const localStore = new FakeCspReportStore();
+    localStore.fail = true;
+    const app = buildMetricEdge(localStore);
+    await app.ready();
+    const res = await app.inject({
+      method: "POST",
+      url: "/_csp-report",
+      headers: { host: "demo.local.helix.azxlabs.io", "content-type": "application/csp-report" },
+      payload: JSON.stringify({
+        "csp-report": {
+          "effective-directive": "connect-src",
+          "blocked-uri": "https://api.foo.com",
+        },
+      }),
+    });
+    await app.close();
+    expect(res.statusCode).toBe(204);
+    const points = await recording.metrics();
+    expect(points.filter((p) => p.name === INSTR_CSP_REPORTS).length).toBeGreaterThan(0);
+    await recording.restore();
+  });
+
+  it("does not count a report with no blocked-uri", async () => {
+    const recording = startRecordingTelemetry();
+    const app = buildMetricEdge(new FakeCspReportStore());
+    await app.ready();
+    await injectReport(app, { "csp-report": { "effective-directive": "img-src" } });
+    await app.close();
+    const points = await recording.metrics();
+    expect(points.filter((p) => p.name === INSTR_CSP_REPORTS)).toHaveLength(0);
+    await recording.restore();
+  });
+
+  it("does not count on unknown slug", async () => {
+    const recording = startRecordingTelemetry();
+    const app = buildMetricEdge(new FakeCspReportStore());
+    await app.ready();
+    await app.inject({
+      method: "POST",
+      url: "/_csp-report",
+      headers: { host: "nope.local.helix.azxlabs.io", "content-type": "application/csp-report" },
+      payload: JSON.stringify({
+        "csp-report": { "effective-directive": "img-src", "blocked-uri": "https://x" },
+      }),
+    });
+    await app.close();
+    const points = await recording.metrics();
+    expect(points.filter((p) => p.name === INSTR_CSP_REPORTS)).toHaveLength(0);
+    await recording.restore();
   });
 });

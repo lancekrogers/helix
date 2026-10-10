@@ -307,19 +307,26 @@ async function seedRegistry() {
 
   const dir = join(OUT, "seed-app");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    join(dir, "index.html"),
+  const plainHtml =
     "<!doctype html><html><head><title>helix smoke</title></head>" +
-      "<body><h1>helix smoke fixture</h1></body></html>\n",
-  );
+    "<body><h1>helix smoke fixture</h1></body></html>\n";
+  const cspHtml =
+    "<!doctype html><html><head><title>helix smoke csp</title></head><body>" +
+    `<img id="remote" src="https://auth.${BASE_DOMAIN}:${STACK.ports.edge}/health">` +
+    '<img id="inline" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">' +
+    "</body></html>\n";
 
   await check("cli bundle for seeding", () => buildCli());
 
-  for (const [slug, visibility] of [
-    ["smoke-public", "public"],
-    ["smoke-internal", "internal"],
+  // smoke-csp redeploys every run so the served page always matches cspHtml;
+  // the browser check depends on its exact images.
+  for (const [slug, visibility, html, redeploy] of [
+    ["smoke-public", "public", plainHtml, false],
+    ["smoke-internal", "internal", plainHtml, false],
+    ["smoke-csp", "public", cspHtml, true],
   ]) {
     await check(`live ${visibility} app (${slug})`, async () => {
+      writeFileSync(join(dir, "index.html"), html);
       // scope=all, not the default mine: the question is "does this slug exist
       // with a live version", not "is it mine". A principal-id re-base (e.g.
       // ADR-0048 changing the dev-token actor's oid) otherwise makes rows
@@ -328,7 +335,7 @@ async function seedRegistry() {
       const { body: apps } = await jget(`${PORTAL}/api/v1/apps?scope=all`, { headers: auth });
       const existing = Array.isArray(apps) ? apps.find((a) => a.slug === slug) : null;
       let how = "reused";
-      if (!existing?.currentVersionId) {
+      if (!existing?.currentVersionId || redeploy) {
         if (!existing) {
           const c = helix("create", "--slug", slug, "--visibility", visibility);
           assert(c.status === 0, `create: ${(c.stderr || c.stdout || "").slice(-300)}`);
@@ -443,8 +450,16 @@ async function checkEdge() {
     await check("CSP is injected", async () => {
       const { headers } = await jget(EDGE(pub.slug));
       const csp = headers.get("content-security-policy");
+      const reportOnly = headers.get("content-security-policy-report-only");
       assert(csp, "no CSP header");
+      assert(reportOnly, "no Report-Only CSP header");
       assert(csp.includes("frame-ancestors 'none'"), "frame-ancestors not locked down");
+      assert(csp.includes("img-src https:"), "enforced img-src still open");
+      assert(reportOnly.includes("object-src 'none'"), "Report-Only missing object-src");
+      assert(
+        reportOnly.includes("img-src 'self' data: blob:"),
+        "Report-Only missing tightened img-src",
+      );
     });
   }
 
@@ -653,8 +668,14 @@ async function checkBrowser() {
   }
 
   let browser;
+  let cspBrowser;
   try {
     browser = await launchBrowser({ port: STACK.cdpPort });
+    cspBrowser = await launchBrowser({
+      port: STACK.cdpPort + 1,
+      ignoreCertErrors: true,
+      baseDomain: BASE_DOMAIN,
+    });
   } catch (e) {
     return skip("SPA renders in a real browser", e.message);
   }
@@ -706,8 +727,46 @@ async function checkBrowser() {
         return join(OUT, `${name}.png`);
       });
     }
+
+    await check("Report-Only CSP violation is recorded for smoke-csp", async () => {
+      const authOrigin = `https://auth.${BASE_DOMAIN}:${STACK.ports.edge}`;
+      cspBrowser.reset();
+      await cspBrowser.navigate(EDGE("smoke-csp"));
+      const inlineW = await cspBrowser.evaluate(
+        "document.querySelector('#inline')?.naturalWidth ?? 0",
+      );
+      assert(inlineW === 1, `inline data: image naturalWidth expected 1, got ${inlineW}`);
+      await sleep(3000);
+      const reportPostData = cspBrowser.cspReportPosts.at(-1) ?? null;
+
+      const { body: violations } = await jget(`${PORTAL}/api/v1/csp/violations`, {
+        headers: auth,
+      });
+      const hit = (violations.violations ?? []).find(
+        (v) =>
+          v.appSlug === "smoke-csp" &&
+          v.directive?.includes("img-src") &&
+          String(v.blockedUri ?? "").startsWith(authOrigin),
+      );
+      assert(hit, `no img-src violation for smoke-csp against ${authOrigin}`);
+      let dispositionNote = "no /_csp-report POST captured";
+      if (reportPostData) {
+        try {
+          const parsed = JSON.parse(reportPostData);
+          const inner = parsed["csp-report"] ?? {};
+          dispositionNote =
+            inner.disposition === undefined
+              ? "disposition absent (unknown)"
+              : `disposition=${JSON.stringify(inner.disposition)}`;
+        } catch {
+          dispositionNote = "could not parse report POST body";
+        }
+      }
+      return `${hit.count} report(s); ${dispositionNote}`;
+    });
   } finally {
     browser.close();
+    cspBrowser?.close();
   }
 }
 

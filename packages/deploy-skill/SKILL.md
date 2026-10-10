@@ -58,6 +58,10 @@ report-uri /_csp-report
 `cdn.tailwindcss.com` — those load without a grant. Approved origins are appended
 to `img-src` and `connect-src`.
 
+Remote images will need an approved origin once the tightened policy is enforced.
+Until then, inline images as `data:` URIs or ship them in the bundle; the edge
+already reports remote-image violations through the Report-Only policy.
+
 **Other serving rules.** Do not ship a service worker — one you register is
 refused (`403` on a `Service-Worker: script` request). Plain web workers are
 fine. If the app needs to work with no network, ask for the **offline**

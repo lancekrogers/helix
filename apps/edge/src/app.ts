@@ -46,7 +46,7 @@ import { makeConnectionStatusHandler } from "./routing/connectionStatus.js";
 import type { PortalProvider } from "./routing/portalProvider.js";
 import { deriveInternalKey } from "./internalJwt.js";
 import { makeCspReportHandler, type CspReportStore } from "./serving/cspReport.js";
-import { CSP_REPORT_PATH, buildAppCsp } from "./serving/csp.js";
+import { CSP_REPORT_PATH, applyAppCsp } from "./serving/csp.js";
 import {
   SW_PATH,
   SW_SCOPE_PARAM,
@@ -806,7 +806,7 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
       // own execution context — served bare, its fetch() would be unbounded by
       // `connect-src 'self'`. This keeps the worker inside the same data-flow
       // containment as the page it serves.
-      reply.header("content-security-policy", buildAppCsp(entry.externalOrigins));
+      applyAppCsp(reply, entry.externalOrigins, config);
       // The one route on the platform that emits this. The script lives at
       // `/_helix/`, so its default max scope is `/_helix/` — controlling the
       // app's prefix requires widening it explicitly. Here the value is the

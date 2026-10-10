@@ -212,6 +212,7 @@ build-time configuration at all):
 | `EDGE_LLM_MAX_USER_IN_FLIGHT` | `llmMaxUserInFlight` | Cross-replica concurrent LLM calls per authenticated user per app; `0` disables |
 | `EDGE_LLM_MAX_IN_FLIGHT` | `llmMaxInFlight` | Per-replica concurrent LLM cap; `0` disables |
 | `EDGE_LLM_MAX_CALL_MS` | `llmMaxCallMs` | Wall-clock LLM call deadline in ms |
+| `EDGE_IMG_SRC_EXTRA` | `imgSrcExtra` (default empty) | Comma-separated `https` origins widened into every app's Report-Only `img-src` only. Never list an image proxy that fetches attacker-chosen URLs |
 
 The OAuth connections feature adds three more template-derived URLs —
 each is the target app's ingress FQDN, so there is nothing to configure:

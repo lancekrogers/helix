@@ -334,3 +334,42 @@ describe("the connection-status route is a fresh root too (ADR-0031 as amended)"
     expect(dump).not.toContain("vendor=app-chosen");
   });
 });
+
+describe("POST /_csp-report", () => {
+  it("never continues an inbound traceparent", async () => {
+    recording.reset();
+    const app: FastifyInstance = buildApp({
+      config: testEdgeConfig({ allowUnauthenticated: true }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: "22222222-2222-4222-8222-222222222222",
+          slug: "demo",
+          blobPrefix: "apps/a/1/",
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+    });
+    await app.inject({
+      method: "POST",
+      url: "/_csp-report",
+      headers: {
+        host: "demo.local.helix.azxlabs.io",
+        traceparent: APP_TRACEPARENT,
+        tracestate: "vendor=app-chosen",
+        "content-type": "application/csp-report",
+      },
+      payload: JSON.stringify({
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": "https://x.example/p.png",
+        },
+      }),
+    });
+    await app.close();
+    for (const span of recording.spans()) {
+      expect(span.spanContext().traceId).not.toBe(APP_TRACE_ID);
+    }
+    const dump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    expect(dump).not.toContain(APP_TRACE_ID);
+  });
+});

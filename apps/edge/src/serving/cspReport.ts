@@ -1,8 +1,17 @@
 import { type Pool } from "pg";
 import type { FastifyReply, FastifyRequest } from "fastify";
+import {
+  ATTR_APP_ID,
+  ATTR_CSP_DIRECTIVE,
+  ATTR_CSP_DISPOSITION,
+  CSP_REPORT_DIRECTIVES,
+  type CspReportDirective,
+  type CspReportDisposition,
+} from "@azx-pbc/shared/telemetry";
 import { createEdgePool, type EdgePoolOpts } from "../db/pool.js";
 import type { RegistryReader } from "../registry/projection.js";
 import { sendNotFound } from "../errors.js";
+import { instruments } from "../telemetry.js";
 
 /**
  * CSP-violation report sink (docs/design/approvals.md §6.2). The app's CSP
@@ -56,15 +65,23 @@ function clamp(v: unknown, max = 2048): string {
   return typeof v === "string" ? v.slice(0, max) : "";
 }
 
+function foldDisposition(raw: unknown): CspReportDisposition {
+  if (raw === "enforce" || raw === "report") return raw;
+  return "unknown";
+}
+
 /**
  * Pull the violated directive + blocked URL out of either report shape: the
  * legacy `report-uri` body (`{ "csp-report": {...} }`) or the Reporting-API
  * `report-to` body (an array of `{ type, body }`). Returns null if neither
  * yields a blocked URL (nothing worth storing).
  */
-export function extractReport(
-  body: unknown,
-): { directive: string; blockedUri: string; documentUri: string | null } | null {
+export function extractReport(body: unknown): {
+  directive: string;
+  blockedUri: string;
+  documentUri: string | null;
+  disposition: CspReportDisposition;
+} | null {
   // Reporting-API: array of reports.
   if (Array.isArray(body)) {
     const r = body.find(
@@ -79,6 +96,7 @@ export function extractReport(
         directive: clamp(b.effectiveDirective ?? b.violatedDirective, 128) || "unknown",
         blockedUri,
         documentUri: clamp(b.documentURL) || null,
+        disposition: foldDisposition(b.disposition),
       };
     }
     return null;
@@ -94,10 +112,22 @@ export function extractReport(
         directive: clamp(o["effective-directive"] ?? o["violated-directive"], 128) || "unknown",
         blockedUri,
         documentUri: clamp(o["document-uri"]) || null,
+        disposition: foldDisposition(o["disposition"]),
       };
     }
   }
   return null;
+}
+
+/** Fold a raw violated-directive string to the bounded metric dimension set. */
+export function foldDirective(raw: string): CspReportDirective {
+  const token = raw.trim().toLowerCase().split(/\s+/)[0] ?? "";
+  if ((CSP_REPORT_DIRECTIVES as readonly string[]).includes(token)) {
+    return token as CspReportDirective;
+  }
+  if (token === "script-src-elem" || token === "script-src-attr") return "script-src";
+  if (token === "style-src-elem" || token === "style-src-attr") return "style-src";
+  return "other";
 }
 
 export interface CspReportRuntime {
@@ -123,11 +153,19 @@ export function makeCspReportHandler(rt: CspReportRuntime) {
       return;
     }
     const parsed = extractReport(req.body);
-    if (parsed && rt.store) {
-      try {
-        await rt.store.record({ appId: entry.appId, ...parsed });
-      } catch (err) {
-        req.log.warn({ err }, "failed to record CSP report");
+    if (parsed) {
+      const { disposition, ...record } = parsed;
+      instruments().cspReports.add(1, {
+        [ATTR_APP_ID]: entry.appId,
+        [ATTR_CSP_DIRECTIVE]: foldDirective(record.directive),
+        [ATTR_CSP_DISPOSITION]: disposition,
+      });
+      if (rt.store) {
+        try {
+          await rt.store.record({ appId: entry.appId, ...record });
+        } catch (err) {
+          req.log.warn({ err }, "failed to record CSP report");
+        }
       }
     }
     reply.status(204).send();

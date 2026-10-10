@@ -61,12 +61,14 @@ const ENTRIES: Record<string, CapabilityHelp> = {
   externalOrigins: {
     title: "Direct browser calls",
     grants:
-      "Allows the app's own JavaScript — running in each visitor's browser — to call the named host directly, by widening the page's Content-Security-Policy.",
+      "Allows the app's own JavaScript, running in each visitor's browser, to call the named host directly and to load images from it, by widening the page's Content-Security-Policy.",
     risks: [
       "Requests leave the visitor's browser, so any credential the app attaches is visible to the page and to the destination host.",
       "The destination host sees your colleagues' IPs and browsers, not the platform's.",
+      "An approved host can receive anything the page can read, one request at a time, including through image URLs.",
     ],
-    riskWhy: "A new browser-callable host is also a new place the page can send data.",
+    riskWhy:
+      "A new browser-callable host is also a new place the page can send data, as a request or as an image.",
   },
 
   "llm.models": {

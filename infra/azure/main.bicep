@@ -475,6 +475,9 @@ param allowPublicApps bool = false
 @description('Permit `password` (shared-passphrase) apps on this install. Sets the matched pair EDGE_ALLOW_PASSWORD_APPS + PORTAL_ALLOW_PASSWORD_APPS — same paired-planes reasoning as allowPublicApps; when false the edge 403s the assets and the /_auth/login challenge 404s. Default false (deny).')
 param allowPasswordApps bool = false
 
+@description('Comma-separated https origins appended to every app\'s Report-Only img-src (EDGE_IMG_SRC_EXTRA). Operator-trusted image hosts only — never list an image proxy that fetches attacker-chosen URLs. Empty sets the variable to an empty string, which the edge reads as no extra origins (that Container Apps passes an empty value through is unverified in Azure).')
+param imgSrcExtra string = ''
+
 @description('Fastify trustProxy for the edge (EDGE_TRUST_PROXY) — the ADDRESS of the trusted ingress, as a CIDR/IP list or a proxy-addr preset ("uniquelocal"). Behind ACA Envoy ingress req.ip is the ingress hop unless this names it, collapsing per-IP rate limits + the login throttle into one bucket (issue #13). "auto" (the default) resolves to 100.64.0.0/10 — the RFC 6598 shared address space ACA draws its ingress pod addresses from on a workload-profile environment (100.100.0.0/17 + the three /19s), measured against a live deployment 2026-09-03. It is NOT the apps subnet: that is where the containers get their addresses, not the ingress that connects to them, and trusting it trusted nothing; EMPTY, "false" or a stale "0" trusts nothing (the socket peer is the client), matching the code default; anything else passes to the edge validator, which additionally refuses a /0 range ("0.0.0.0/0" trusts every peer — the GHSA-3m5p-2c4r-xxw2 shape) and the dotted-netmask form ("10.0.2.0/255.255.254.0" — spell the prefix length, "10.0.2.0/23"). A hop COUNT is refused at deploy: fastify 5.12.1 removed the form (GHSA-3m5p-2c4r-xxw2), the edge refuses to boot on one, and this template rejects it before it deploys. "true" is refused with it — it trusts every peer, so anyone reaching the edge directly sets its own req.ip. Re-verify if anything else fronts the edge (CDN, WAF, second proxy): too narrow collapses every client into one bucket, too broad makes X-Forwarded-For spoofable.')
 param edgeTrustProxy string = 'auto'
 
@@ -1425,6 +1428,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       // EDGE_ALLOW_DEV_MODE below is a literal.
       { name: 'EDGE_ALLOW_PUBLIC_APPS', value: allowPublicApps ? 'true' : 'false' }
       { name: 'EDGE_ALLOW_PASSWORD_APPS', value: allowPasswordApps ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_EXTRA', value: imgSrcExtra }
       // LLM upstreams (ADR-0046): first-party by default, the Foundry account
       // when deployFoundry is set, or a BYO endpoint via the llm* params.
       { name: 'EDGE_LLM_ENDPOINT', value: llm.anthropicEndpoint }

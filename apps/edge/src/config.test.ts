@@ -246,6 +246,42 @@ describe("loadConfig", () => {
   // login throttle and the audit hash — to the ingress address while everything
   // still read green. Fail the boot instead, the same posture the reconcile
   // interval takes above.
+  it("parses EDGE_IMG_SRC_EXTRA", () => {
+    expect(loadConfig({ ...ENV }).imgSrcExtra).toEqual([]);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "" }).imgSrcExtra).toEqual([]);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "   " }).imgSrcExtra).toEqual([]);
+    expect(
+      loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "https://a.example, https://b.example:8443" })
+        .imgSrcExtra,
+    ).toEqual(["https://a.example", "https://b.example:8443"]);
+    expect(
+      loadConfig({
+        ...ENV,
+        EDGE_IMG_SRC_EXTRA: "https://a.example,https://a.example",
+      }).imgSrcExtra,
+    ).toEqual(["https://a.example"]);
+    for (const bad of [
+      "http://a.example",
+      "https:",
+      "*",
+      "https://*.a.example",
+      "https://a.example/path",
+      "https://a.example?x=1",
+      "https://u:p@a.example",
+      "not a url",
+    ]) {
+      expect(() => loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: bad })).toThrow(
+        /EDGE_IMG_SRC_EXTRA is not a list of https origins/,
+      );
+    }
+    expect(() =>
+      loadConfig({
+        ...ENV,
+        EDGE_IMG_SRC_EXTRA: "https://good.example,https://a.example/path",
+      }),
+    ).toThrow(/EDGE_IMG_SRC_EXTRA is not a list of https origins/);
+  });
+
   it("refuses a hop count for EDGE_TRUST_PROXY instead of silently trusting nothing", () => {
     for (const hops of ["1", "2", " 3 "]) {
       expect(() => loadConfig({ ...ENV, EDGE_TRUST_PROXY: hops })).toThrow(

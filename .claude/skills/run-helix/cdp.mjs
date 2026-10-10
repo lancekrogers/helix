@@ -34,25 +34,29 @@ export function findChrome() {
  * Launch headless Chromium and attach one page session.
  * Returns a handle with navigate/evaluate/screenshot plus captured page errors.
  */
-export async function launchBrowser({ port = 9411 } = {}) {
+export async function launchBrowser({ port = 9411, ignoreCertErrors = false, baseDomain } = {}) {
   const bin = findChrome();
   if (!bin) throw new Error("no cached Chromium found (set HELIX_SMOKE_CHROME)");
 
-  const child = spawn(
-    bin,
-    [
-      "--headless=new",
-      "--no-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-      "--hide-scrollbars",
-      "--window-size=1280,720",
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${mkdtempSync(join(tmpdir(), "helix-smoke-"))}`,
-      "about:blank",
-    ],
-    { stdio: "ignore" },
-  );
+  const chromeArgs = [
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--hide-scrollbars",
+    "--window-size=1280,720",
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${mkdtempSync(join(tmpdir(), "helix-smoke-"))}`,
+    "about:blank",
+  ];
+  if (ignoreCertErrors) {
+    chromeArgs.push("--ignore-certificate-errors");
+    if (baseDomain) {
+      chromeArgs.push(`--host-resolver-rules=MAP *.${baseDomain} 127.0.0.1`);
+    }
+  }
+
+  const child = spawn(bin, chromeArgs, { stdio: "ignore" });
 
   let version;
   for (let i = 0; i < 80; i++) {
@@ -113,9 +117,15 @@ export async function launchBrowser({ port = 9411 } = {}) {
   // Collected per-navigation; the caller clears between routes.
   const errors = [];
   const failedRequests = [];
+  const cspReportPosts = [];
   listeners.add((msg) => {
     if (msg.sessionId !== sessionId) return;
-    if (msg.method === "Runtime.exceptionThrown") {
+    if (msg.method === "Network.requestWillBeSent") {
+      const url = msg.params?.request?.url ?? "";
+      if (url.includes("/_csp-report") && msg.params.request.postData) {
+        cspReportPosts.push(msg.params.request.postData);
+      }
+    } else if (msg.method === "Runtime.exceptionThrown") {
       const d = msg.params.exceptionDetails;
       errors.push(d.exception?.description ?? d.text);
     } else if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
@@ -147,9 +157,11 @@ export async function launchBrowser({ port = 9411 } = {}) {
   return {
     errors,
     failedRequests,
+    cspReportPosts,
     reset() {
       errors.length = 0;
       failedRequests.length = 0;
+      cspReportPosts.length = 0;
     },
     async navigate(url, settleMs = 2000) {
       const loaded = waitForLoad();

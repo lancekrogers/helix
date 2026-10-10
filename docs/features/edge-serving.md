@@ -140,6 +140,12 @@ write-gate) extend both `connect-src` and `img-src`. Origins are reduced to bare
 (`new URL().origin` — scheme+host+port, path stripped) and invalid entries are dropped
 fail-closed. A same-origin `report-uri /_csp-report` funnels violations to the edge sink.
 
+During the measurement phase before `img-src` is tightened on the enforced
+header, every app response also carries `Content-Security-Policy-Report-Only`
+with the future policy (`img-src 'self' data: blob:` plus approved origins,
+plus operator `EDGE_IMG_SRC_EXTRA`). Violations from that header reach the same
+`/_csp-report` sink as enforced-policy reports.
+
 ### Transparent fetch shim (serve-time HTML inlining)
 
 The fetch-proxy contract is a path prefix: app code calls `fetch('/_api/fetch/https://…')`,

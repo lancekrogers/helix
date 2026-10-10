@@ -90,6 +90,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
     },
     // Off by default in unit tests; suites that exercise it pass a low `max`.
     anonRateLimit: { max: 0, windowMs: 60_000 },
+    imgSrcExtra: [],
     // Default: trust nothing (the socket peer is the client), as in prod until
     // EDGE_TRUST_PROXY names the ingress address.
     trustProxy: false,

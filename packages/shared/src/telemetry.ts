@@ -39,6 +39,7 @@ export const INSTR_EGRESS_RENEWALS = "helix.egress.renewals";
 export const INSTR_EGRESS_RETIREMENTS = "helix.egress.retirements";
 export const INSTR_EGRESS_UPSTREAM_ABORTS = "helix.egress.upstream_aborts";
 export const INSTR_APP_VISITS = "helix.app.visits";
+export const INSTR_CSP_REPORTS = "helix.edge.csp_reports";
 export const INSTR_GATEWAY_CUT_CHARGES = "helix.gateway.cut_charges";
 export const INSTR_GATEWAY_ADMISSION_DENIED = "helix.gateway.admission_denied";
 export const INSTR_GATEWAY_PLATFORM_SPEND_RATIO = "helix.gateway.platform_spend_ratio";
@@ -114,6 +115,10 @@ export const ATTR_PROVIDER_REF = "helix.provider_ref";
 export const ATTR_CONSENT_SWEEP_REMOVED = "helix.consent.sweep_removed";
 /** How many pending consent attempts a disconnect killed. */
 export const ATTR_ATTEMPTS_KILLED = "helix.attempts_killed";
+/** Violated directive on a CSP report, folded to CSP_REPORT_DIRECTIVES. */
+export const ATTR_CSP_DIRECTIVE = "helix.csp.directive";
+/** Whether the report came from an enforced or a Report-Only policy. */
+export const ATTR_CSP_DISPOSITION = "helix.csp.disposition";
 
 /**
  * Span names. Like the instrument names these are queried by humans and by
@@ -265,6 +270,19 @@ export type RegistryLoadOutcome = (typeof REGISTRY_LOAD_OUTCOMES)[number];
  */
 export const VISIT_RECORD_OUTCOMES = ["recorded", "failed", "dropped", "deduplicated"] as const;
 export type VisitRecordOutcome = (typeof VISIT_RECORD_OUTCOMES)[number];
+
+export const CSP_REPORT_DIRECTIVES = [
+  "img-src",
+  "connect-src",
+  "script-src",
+  "style-src",
+  "font-src",
+  "object-src",
+  "other",
+] as const;
+export type CspReportDirective = (typeof CSP_REPORT_DIRECTIVES)[number];
+export const CSP_REPORT_DISPOSITIONS = ["enforce", "report", "unknown"] as const;
+export type CspReportDisposition = (typeof CSP_REPORT_DISPOSITIONS)[number];
 
 /**
  * Why a provider-cache reconcile was counted — the `helix.providers.reconciles`

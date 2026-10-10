@@ -334,6 +334,12 @@ export interface EdgeConfig extends GatewayConfig {
    * budgets). `max: 0` disables the limiter.
    */
   anonRateLimit: { max: number; windowMs: number };
+  /**
+   * Origins appended to every app's img-src (EDGE_IMG_SRC_EXTRA). Operator-trusted
+   * image hosts, so owners need no per-app approval for them. Never connect-src.
+   * Do not list a host that fetches attacker-chosen URLs: that is a sink.
+   */
+  imgSrcExtra: string[];
 }
 
 /**
@@ -646,6 +652,50 @@ const isDottedNetmaskCidr = (part: string): boolean =>
  * (GHSA-3m5p-2c4r-xxw2); accept 0 only as false. `auto` belongs to the Azure
  * template and must be resolved before reaching this parser.
  */
+/**
+ * Parse EDGE_IMG_SRC_EXTRA: comma-separated https origins widened into every
+ * app's Report-Only `img-src` only. Refuse boot on any part that is not a bare
+ * origin — paths, queries, credentials, wildcards, and http: are all errors.
+ */
+export function parseImgSrcExtra(raw: string | undefined): string[] {
+  const v = (raw ?? "").trim();
+  if (!v) return [];
+  const out: string[] = [];
+  for (const part of v.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    let url: URL;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      throw new Error(
+        `EDGE_IMG_SRC_EXTRA is not a list of https origins (bad: ${JSON.stringify(trimmed)}). ` +
+          `Each comma-separated part must look like "https://images.example.com" or ` +
+          `"https://images.example.com:8443": no path, query, credentials or wildcard.`,
+      );
+    }
+    const normalized = trimmed.replace(/\/$/, "");
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.hostname.includes("*") ||
+      url.search !== "" ||
+      url.hash !== "" ||
+      url.pathname !== "/" ||
+      normalized !== url.origin
+    ) {
+      throw new Error(
+        `EDGE_IMG_SRC_EXTRA is not a list of https origins (bad: ${JSON.stringify(trimmed)}). ` +
+          `Each comma-separated part must look like "https://images.example.com" or ` +
+          `"https://images.example.com:8443": no path, query, credentials or wildcard.`,
+      );
+    }
+    if (!out.includes(url.origin)) out.push(url.origin);
+  }
+  return out;
+}
+
 function parseTrustProxy(raw: string | undefined): boolean | string {
   const v = (raw ?? "").trim();
   if (!v) return false;
@@ -934,6 +984,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
       max: Number(env.EDGE_ANON_RATE_LIMIT ?? 60),
       windowMs: Number(env.EDGE_ANON_RATE_WINDOW_MS ?? 60_000),
     },
+    imgSrcExtra: parseImgSrcExtra(env.EDGE_IMG_SRC_EXTRA),
   };
 }
 

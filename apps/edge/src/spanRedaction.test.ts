@@ -1142,3 +1142,54 @@ describe("cut and failed LLM gateway calls", () => {
     expect(CUT_CHARGE_BASES).toContain(llmSpan?.attributes[ATTR_USAGE_BASIS]);
   });
 });
+
+describe("POST /_csp-report", () => {
+  const PLANTED_CSP_SECRET = "PLANTED-CSP-SECRET";
+  const PLANTED_DOC = "PLANTED-CSP-DOC-URI";
+  const APP_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+  it("never records blocked or document URIs on spans or metrics", async () => {
+    recording.reset();
+    const app = buildApp({
+      config: testEdgeConfig({ allowUnauthenticated: true }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "csp",
+          blobPrefix: "apps/csp/1/",
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+    });
+    await app.inject({
+      method: "POST",
+      url: "/_csp-report",
+      headers: { host: "csp.local.helix.azxlabs.io", "content-type": "application/csp-report" },
+      payload: JSON.stringify({
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": `https://x.example/?token=${PLANTED_CSP_SECRET}`,
+          "document-uri": `https://csp.local.helix.azxlabs.io/?doc=${PLANTED_DOC}`,
+        },
+      }),
+    });
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_CSP_SECRET);
+      expect(dump).not.toContain(PLANTED_DOC);
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    for (const point of await recording.metrics()) {
+      for (const key of Object.keys(point.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+  });
+});
