@@ -24,16 +24,17 @@ param appsRouteTableId string
 param egressRouteTableId string
 
 @description('Address space for the VNet.')
-param vnetAddressPrefix string = '10.0.0.0/16'
+param vnetAddressPrefix string
 
-// Subnet prefixes. AzureFirewallSubnet must be /26 or larger and must carry
-// exactly that name. The two ACA subnets must be /23 or larger for workload-
-// profile environments; /23 is the documented minimum, we give each a /23.
-var firewallSubnetPrefix = '10.0.0.0/26'
-var appsSubnetPrefix = '10.0.2.0/23'
-var egressSubnetPrefix = '10.0.4.0/23'
-var postgresSubnetPrefix = '10.0.6.0/24'
-var privateEndpointSubnetPrefix = '10.0.7.0/24'
+@description('AzureFirewallSubnet prefix. Must be /26 or larger.')
+param firewallSubnetPrefix string
+
+@description('snet-apps prefix (/23 minimum for a workload-profile environment).')
+param appsSubnetPrefix string
+
+param egressSubnetPrefix string
+param postgresSubnetPrefix string
+param privateEndpointSubnetPrefix string
 
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: '${namePrefix}-vnet'
@@ -106,7 +107,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
         }
       }
       {
-        // Private endpoints for blob, both key vaults, and ACR.
+        // Private endpoints for blob and the three Key Vaults.
         name: 'snet-pe'
         properties: {
           addressPrefix: privateEndpointSubnetPrefix
@@ -149,3 +150,5 @@ output postgresSubnetId string = postgresSubnet.id
 output privateEndpointSubnetId string = peSubnet.id
 output appsSubnetPrefix string = appsSubnetPrefix
 output egressSubnetPrefix string = egressSubnetPrefix
+output privateEndpointSubnetPrefix string = privateEndpointSubnetPrefix
+output vnetAddressPrefix string = vnetAddressPrefix

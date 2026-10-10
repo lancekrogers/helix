@@ -113,6 +113,8 @@ param allowPasswordApps = false
 //    (+ llmAnthropicPath/llmOpenAiPath and the connection names) — see README
 //    "Azure AI Foundry".
 param deployFoundry = false
+// param pinPrivateEndpointAddresses = true  // new installs: static snet-pe IPs for egress NSG rules; existing installs leave false until live addresses are listed
+// param privateEndpointAddresses = { kvConnections: '10.0.7.20' }  // optional overrides when pinning; defaults are .4-.7 of snet-pe
 // param foundryAccountName = ''            // default ${namePrefix}-foundry; must be globally unique
 // param foundryResourceGroupName = ''      // default ${namePrefix}-foundry-rg — the account's OWN group: the split that keeps LLM spend out of the platform budget (README "Azure AI Foundry")
 // param foundryLocation = 'eastus2'

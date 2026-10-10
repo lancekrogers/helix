@@ -54,6 +54,15 @@ param postgresStorageSizeGB int = 32
 @description('Public apps domain, e.g. azx.helix.azxlabs.io.')
 param appsDomain string = 'azx.helix.azxlabs.io'
 
+@description('Address space of the VNet. The subnet prefixes below are fixed inside the 10.0.0.0/16 default; changing this to a range that does not contain them fails the deployment.')
+param vnetAddressPrefix string = '10.0.0.0/16'
+
+@description('When pinPrivateEndpointAddresses is true, override the fixed addresses of the four private endpoints in snet-pe. Keys: kvPlatform, kvConnections, kvDelegated, blob. Omitted keys use the defaults (.4–.7 of the endpoint subnet). On an existing install that already has dynamic addresses, leave pinPrivateEndpointAddresses false unless you have listed current endpoint IPs (az network private-endpoint list), chosen non-clashing values, and accept that Azure may require recreating the endpoints to change an address (unverified). Static ipConfigurations on private endpoints are unverified in Azure for API version 2024-05-01.')
+param privateEndpointAddresses object = {}
+
+@description('Emit static ipConfigurations on the four snet-pe private endpoints. Default false keeps Azure-assigned dynamic addresses (safe for existing installs). New installs should set true so an egress NSG can name the Key Vault and Blob destinations; existing installs should enable only after reading live addresses and picking non-clashing pins.')
+param pinPrivateEndpointAddresses bool = false
+
 @description('Display-only month-to-date platform spend watch line in USD, surfaced on the admin Activity page via GET /api/v1/config. Defaults to 1000 so an install gets a budget signal without being configured for one; set 0 to show no ceiling. When llmPlatformDollarsPerDay is -1, the enforced daily LLM ceiling derives from one tenth of this value with a floor of three times llmDefaultDollarsPerDay.')
 param platformMonthlyUsdCap int = 1000
 
@@ -431,6 +440,49 @@ param edgeTrustProxy string = 'auto'
 @description('ACA custom-domain verification id (asuid TXT). Empty = skip.')
 param domainVerificationId string = ''
 
+var firewallSubnetPrefix = '10.0.0.0/26'
+var appsSubnetPrefix = '10.0.2.0/23'
+var egressSubnetPrefix = '10.0.4.0/23'
+var postgresSubnetPrefix = '10.0.6.0/24'
+var privateEndpointSubnetPrefix = '10.0.7.0/24'
+
+var peDefaults = {
+  kvPlatform: cidrHost(privateEndpointSubnetPrefix, 3)
+  kvConnections: cidrHost(privateEndpointSubnetPrefix, 4)
+  kvDelegated: cidrHost(privateEndpointSubnetPrefix, 5)
+  blob: cidrHost(privateEndpointSubnetPrefix, 6)
+}
+var pinnedPeIps = union(peDefaults, privateEndpointAddresses)
+
+var peSubnetClassPrefix = join(take(split(privateEndpointSubnetPrefix, '.'), 3), '.')
+var peKvPlatformHost = int(last(split(pinnedPeIps.kvPlatform, '.')))
+var peKvConnectionsHost = int(last(split(pinnedPeIps.kvConnections, '.')))
+var peKvDelegatedHost = int(last(split(pinnedPeIps.kvDelegated, '.')))
+var peBlobHost = int(last(split(pinnedPeIps.blob, '.')))
+var peKvPlatformOk = startsWith(pinnedPeIps.kvPlatform, '${peSubnetClassPrefix}.') && peKvPlatformHost >= 4 && peKvPlatformHost <= 254
+var peKvConnectionsOk = startsWith(pinnedPeIps.kvConnections, '${peSubnetClassPrefix}.') && peKvConnectionsHost >= 4 && peKvConnectionsHost <= 254
+var peKvDelegatedOk = startsWith(pinnedPeIps.kvDelegated, '${peSubnetClassPrefix}.') && peKvDelegatedHost >= 4 && peKvDelegatedHost <= 254
+var peBlobOk = startsWith(pinnedPeIps.blob, '${peSubnetClassPrefix}.') && peBlobHost >= 4 && peBlobHost <= 254
+var peIpsDistinct = length(union([pinnedPeIps.kvPlatform], [pinnedPeIps.kvConnections], [pinnedPeIps.kvDelegated], [pinnedPeIps.blob])) == 4
+var pinnedPeValidation = !pinPrivateEndpointAddresses
+  ? true
+  : !peIpsDistinct
+      ? fail('privateEndpointAddresses: kvPlatform, kvConnections, kvDelegated, and blob must each be a distinct IPv4 address')
+      : !peKvPlatformOk
+          ? fail('privateEndpointAddresses.kvPlatform must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+          : !peKvConnectionsOk
+              ? fail('privateEndpointAddresses.kvConnections must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+              : !peKvDelegatedOk
+                  ? fail('privateEndpointAddresses.kvDelegated must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+                  : !peBlobOk
+                      ? fail('privateEndpointAddresses.blob must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+                      : true
+
+var peBlobIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.blob : ''
+var peKvPlatformIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvPlatform : ''
+var peKvConnectionsIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvConnections : ''
+var peKvDelegatedIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvDelegated : ''
+
 var oidcIssuer = '${az.environment().authentication.loginEndpoint}${entraTenantId}/v2.0'
 
 // ---------------------------------------------------------------------------
@@ -452,6 +504,12 @@ module network 'modules/network.bicep' = {
     namePrefix: namePrefix
     appsRouteTableId: routing.outputs.appsRouteTableId
     egressRouteTableId: routing.outputs.egressRouteTableId
+    vnetAddressPrefix: vnetAddressPrefix
+    firewallSubnetPrefix: firewallSubnetPrefix
+    appsSubnetPrefix: appsSubnetPrefix
+    egressSubnetPrefix: egressSubnetPrefix
+    postgresSubnetPrefix: postgresSubnetPrefix
+    privateEndpointSubnetPrefix: privateEndpointSubnetPrefix
   }
 }
 
@@ -566,6 +624,7 @@ module storage 'modules/storage.bicep' = {
     containerName: blobContainerName
     privateEndpointSubnetId: network.outputs.privateEndpointSubnetId
     blobPrivateDnsZoneId: privateDns.outputs.blobZoneId
+    privateIpAddress: peBlobIp
   }
 }
 
@@ -578,6 +637,9 @@ module keyvault 'modules/keyvault.bicep' = {
     delegatedVaultName: delegatedVaultName
     privateEndpointSubnetId: network.outputs.privateEndpointSubnetId
     keyVaultPrivateDnsZoneId: privateDns.outputs.keyVaultZoneId
+    platformPrivateIp: peKvPlatformIp
+    connectionsPrivateIp: peKvConnectionsIp
+    delegatedPrivateIp: peKvDelegatedIp
   }
 }
 
@@ -1587,6 +1649,16 @@ module migrateJob 'modules/migrate-job.bicep' = if (deployApps) {
 // ---------------------------------------------------------------------------
 
 output appsEnvStaticIp string = appsEnv.outputs.staticIp
+
+@description('True when the four snet-pe private endpoints use static ipConfigurations. When false, NSG rules should target privateEndpointSubnetPrefix instead of naming individual endpoint IPs.')
+output pinPrivateEndpointAddresses bool = pinPrivateEndpointAddresses
+
+@description('IPv4 addresses of the four snet-pe private endpoints (kvPlatform, kvConnections, kvDelegated, blob) when pinPrivateEndpointAddresses is true; empty object when endpoints keep dynamic addresses.')
+output privateEndpointIps object = pinPrivateEndpointAddresses ? pinnedPeIps : {}
+
+@description('CIDR of snet-pe. When pinPrivateEndpointAddresses is false, egress NSG allow rules target this prefix for private-link destinations.')
+output privateEndpointSubnetPrefix string = privateEndpointSubnetPrefix
+
 output postgresServerFqdn string = postgres.outputs.serverFqdn
 output migrateJobName string = migrateJob.?outputs.jobName ?? ''
 output connectionsVaultUri string = connectionsVaultUri
