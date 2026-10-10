@@ -46,8 +46,9 @@ default-src 'self';
 script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' <CDNs>;
 style-src  'self' 'unsafe-inline' https://fonts.googleapis.com <CDNs>;
 font-src   'self' data: https://fonts.gstatic.com <CDNs>;
-img-src    https: data: blob:;
+img-src    'self' data: blob:;
 media-src  'self' data: blob:;
+object-src 'none';
 connect-src 'self';
 worker-src 'self' blob:;
 form-action 'self'; frame-ancestors 'none'; base-uri 'self';
@@ -58,9 +59,9 @@ report-uri /_csp-report
 `cdn.tailwindcss.com` — those load without a grant. Approved origins are appended
 to `img-src` and `connect-src`.
 
-Remote images will need an approved origin once the tightened policy is enforced.
-Until then, inline images as `data:` URIs or ship them in the bundle; the edge
-already reports remote-image violations through the Report-Only policy.
+Inline images as `data:` URIs or ship them in the bundle. A remote image needs
+its origin in `externalOrigins`, approved by an admin (an approved origin also
+widens `connect-src` for direct browser calls).
 
 **Other serving rules.** Do not ship a service worker — one you register is
 refused (`403` on a `Service-Worker: script` request). Plain web workers are

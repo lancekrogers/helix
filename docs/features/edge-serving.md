@@ -132,19 +132,22 @@ XML can execute script). The split:
   `/_api/*`), `form-action 'self'`, `frame-ancestors 'none'`, `base-uri 'self'`.
 - **Relaxed / code-provenance** (vibe-coded apps inline/eval freely): `script-src`/`style-src`
   with `'unsafe-inline' 'unsafe-eval'` + a curated CDN allowlist (cdnjs, jsDelivr, unpkg, esm.sh,
-  tailwind, Google Fonts). `img-src https: data: blob:` stays open — an acknowledged exfil-via-
-  navigation trade-off (§4.4).
+  tailwind, Google Fonts).
+- **Image / plugin containment:** enforced `img-src 'self' data: blob:` plus approved origins and
+  operator `EDGE_IMG_SRC_EXTRA`; `object-src 'none'`. Top-level navigation, popups/`window.open`,
+  approved origins, WebRTC, and DNS prefetch/preconnect hints remain open (WebRTC and DNS-hint behavior
+  under this policy is untested). The platform does not claim confidentiality against a hostile app
+  author.
 
 An app's approved `externalOrigins` (from its manifest, gated through the approvals
 write-gate) extend both `connect-src` and `img-src`. Origins are reduced to bare CSP sources
 (`new URL().origin` — scheme+host+port, path stripped) and invalid entries are dropped
 fail-closed. A same-origin `report-uri /_csp-report` funnels violations to the edge sink.
 
-During the measurement phase before `img-src` is tightened on the enforced
-header, every app response also carries `Content-Security-Policy-Report-Only`
-with the future policy (`img-src 'self' data: blob:` plus approved origins,
-plus operator `EDGE_IMG_SRC_EXTRA`). Violations from that header reach the same
-`/_csp-report` sink as enforced-policy reports.
+Per-install settings: `EDGE_IMG_SRC_EXTRA` (operator-trusted image hosts, never an image proxy),
+`EDGE_IMG_SRC_ALLOW_ALL` (restores `img-src https: data: blob:` on the enforced header while keeping
+`object-src 'none'`), and `EDGE_IMG_SRC_REPORT_ONLY` (measurement window: the previous open policy
+enforced and the tightened one as Report-Only, until the operator enforces).
 
 ### Transparent fetch shim (serve-time HTML inlining)
 

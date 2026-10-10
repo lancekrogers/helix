@@ -197,8 +197,10 @@ patterns for compatibility. This policy does not try to establish trust in app c
   and Tailwind CDN. These can serve third-party code; the policy does not establish
   trust in that code.
 
-- `img-src https: data: blob:` allows remote images. Image requests and
-  navigation can transmit data, so CSP does not prevent all exfiltration.
+- `img-src 'self' data: blob:` plus approved origins (and operator `EDGE_IMG_SRC_EXTRA`);
+  `object-src 'none'`. Inline/`data:`/blob images and granted hosts load; other remote images do
+  not. Navigation, popups, WebRTC, and DNS hints can still transmit data (untested for WebRTC/DNS
+  under CSP), so the platform does not deliver confidentiality against a hostile app author.
 - `wasm-unsafe-eval` and `worker-src 'self' blob:` allow WebAssembly and ordinary
   workers. Service workers cannot register from blob URLs. The edge rejects
   app-supplied service-worker registration requests because a root-scoped worker
@@ -363,7 +365,7 @@ Portability rule: **Azure services may appear only behind internal interfaces** 
 
 | Threat | Mitigation |
 |--------|-----------|
-| Malicious/compromised app code exfiltrates data | CSP `connect-src 'self'` raises the bar (navigation-based exfil, open `img-src`, and granted channels remain — see residual risk); capability grants are explicit and audited; violation reports surface attempts |
+| Malicious/compromised app code exfiltrates data | CSP `connect-src 'self'` and tightened `img-src`/`object-src` raise the bar (navigation, popups, granted channels, WebRTC, and DNS hints remain — see residual risk); capability grants are explicit and audited; violation reports surface attempts |
 | App steals or rides another app's session/data | Per-subdomain origins; `__Host-` host-only cookies (theft + tossing); Origin validation at gateway + `form-action 'self'` (CSRF riding); PSL listing; gateway scopes data by app ID |
 | App abuses LLM budget / runs up cost | Per-app quotas, metering, kill switch (disable app) |
 | Supply-chain attack in app dependencies | v1: builds happen on the author's machine/CI, so the platform never executes them; uploaded output is static and can only run client-side under CSP. When hosted builds land: ephemeral credential-free builders (primary), registry egress allowlist (leaky, secondary) |

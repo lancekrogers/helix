@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { APP_CSP, buildAppCsp, buildAppCspReportOnly } from "./csp.js";
+import {
+  APP_CSP,
+  buildAppCsp,
+  buildLegacyEnforcedAppCsp,
+  buildMeasurementReportOnlyCsp,
+} from "./csp.js";
 
 function parse(csp: string): Map<string, string> {
   return new Map(
@@ -31,6 +36,14 @@ describe("APP_CSP strict data-flow directives", () => {
   it("pins base-uri to 'self' exactly", () => {
     expect(directives.get("base-uri")).toBe("'self'");
   });
+
+  it("pins img-src to 'self' data: blob: exactly", () => {
+    expect(directives.get("img-src")).toBe("'self' data: blob:");
+  });
+
+  it("pins object-src to 'none' exactly", () => {
+    expect(directives.get("object-src")).toBe("'none'");
+  });
 });
 
 describe("APP_CSP relaxed code-provenance directives", () => {
@@ -40,17 +53,13 @@ describe("APP_CSP relaxed code-provenance directives", () => {
     expect(script).toContain("'unsafe-eval'");
     expect(script).toContain("'wasm-unsafe-eval'");
   });
-
-  it("keeps img-src open (honest trade-off, §4.4)", () => {
-    expect(directives.get("img-src")).toBe("https: data: blob:");
-  });
 });
 
 describe("buildAppCsp — per-app external origins (§6.2)", () => {
   it("widens connect-src and img-src with approved origins", () => {
     const d = parse(buildAppCsp(["https://api.foo.com", "https://b.example.com"]));
     expect(d.get("connect-src")).toBe("'self' https://api.foo.com https://b.example.com");
-    expect(d.get("img-src")).toBe("https: data: blob: https://api.foo.com https://b.example.com");
+    expect(d.get("img-src")).toBe("'self' data: blob: https://api.foo.com https://b.example.com");
   });
 
   it("normalizes a URL with a path down to its origin and dedupes", () => {
@@ -66,19 +75,55 @@ describe("buildAppCsp — per-app external origins (§6.2)", () => {
   it("with no origins equals the strict baseline", () => {
     const d = parse(buildAppCsp());
     expect(d.get("connect-src")).toBe("'self'");
-    expect(d.get("img-src")).toBe("https: data: blob:");
+    expect(d.get("img-src")).toBe("'self' data: blob:");
+    expect(d.get("object-src")).toBe("'none'");
   });
 
   it("always points report-uri at the same-origin sink", () => {
     expect(parse(buildAppCsp()).get("report-uri")).toBe("/_csp-report");
     expect(parse(buildAppCsp(["https://api.foo.com"])).get("report-uri")).toBe("/_csp-report");
   });
+
+  it("widens img-src only with imgSrcExtra (not connect-src) and dedupes", () => {
+    const d = parse(
+      buildAppCsp(["https://api.foo.com"], { imgSrcExtra: ["https://images.example.com"] }),
+    );
+    expect(d.get("connect-src")).toBe("'self' https://api.foo.com");
+    expect(d.get("img-src")).toBe(
+      "'self' data: blob: https://api.foo.com https://images.example.com",
+    );
+    const deduped = parse(
+      buildAppCsp(["https://api.foo.com"], { imgSrcExtra: ["https://api.foo.com"] }),
+    );
+    expect(deduped.get("img-src")).toBe("'self' data: blob: https://api.foo.com");
+  });
+
+  it("restores https: in img-src when imgSrcAllowAll is true", () => {
+    const d = parse(buildAppCsp(["https://api.foo.com"], { imgSrcAllowAll: true }));
+    expect(d.get("img-src")).toBe("https: data: blob: https://api.foo.com");
+    expect(d.get("object-src")).toBe("'none'");
+  });
+
+  it("never puts https:, http:, or * in default img-src for hostile inputs", () => {
+    const d = parse(
+      buildAppCsp(["*", "https:", "http://a.example", "https://*.a.example", "not a url", ""]),
+    );
+    const tokens = (d.get("img-src") ?? "").split(" ");
+    expect(tokens).not.toContain("https:");
+    expect(tokens).not.toContain("http:");
+    expect(tokens.some((t) => t.includes("*"))).toBe(false);
+  });
+
+  it("drops a malformed extra origin like external origins", () => {
+    const d = parse(buildAppCsp([], { imgSrcExtra: ["not a url"] }));
+    expect(d.get("img-src")).toBe("'self' data: blob:");
+  });
 });
 
-describe("buildAppCspReportOnly", () => {
-  it("tightens img-src and adds object-src only", () => {
-    const enforced = parse(buildAppCsp());
-    const reportOnly = parse(buildAppCspReportOnly());
+describe("measurement mode (EDGE_IMG_SRC_REPORT_ONLY)", () => {
+  it("tightens img-src and adds object-src only on Report-Only", () => {
+    const enforced = parse(buildLegacyEnforcedAppCsp());
+    const reportOnly = parse(buildMeasurementReportOnlyCsp());
     expect(reportOnly.get("img-src")).toBe("'self' data: blob:");
     expect(reportOnly.get("object-src")).toBe("'none'");
     expect(enforced.get("object-src")).toBeUndefined();
@@ -90,24 +135,28 @@ describe("buildAppCspReportOnly", () => {
   });
 
   it("puts approved origins in img-src and connect-src; imgSrcExtra only in img-src", () => {
-    const d = parse(buildAppCspReportOnly(["https://api.foo.com"], ["https://images.example.com"]));
+    const d = parse(
+      buildMeasurementReportOnlyCsp(["https://api.foo.com"], ["https://images.example.com"]),
+    );
     expect(d.get("connect-src")).toBe("'self' https://api.foo.com");
     expect(d.get("img-src")).toBe(
       "'self' data: blob: https://api.foo.com https://images.example.com",
     );
-    const enforced = parse(buildAppCsp(["https://api.foo.com"]));
+    const enforced = parse(buildLegacyEnforcedAppCsp(["https://api.foo.com"]));
     expect(enforced.get("connect-src")).toBe("'self' https://api.foo.com");
     expect(enforced.get("img-src")).toBe("https: data: blob: https://api.foo.com");
     expect(enforced.get("img-src")).not.toContain("images.example.com");
   });
 
   it("dedupes origins shared between externalOrigins and imgSrcExtra", () => {
-    const d = parse(buildAppCspReportOnly(["https://api.foo.com"], ["https://api.foo.com"]));
+    const d = parse(
+      buildMeasurementReportOnlyCsp(["https://api.foo.com"], ["https://api.foo.com"]),
+    );
     expect(d.get("img-src")).toBe("'self' data: blob: https://api.foo.com");
   });
 
-  it("never puts https:, http:, or * in img-src", () => {
-    const d = parse(buildAppCspReportOnly(["https://api.foo.com"]));
+  it("never puts https:, http:, or * in Report-Only img-src", () => {
+    const d = parse(buildMeasurementReportOnlyCsp(["https://api.foo.com"]));
     const tokens = (d.get("img-src") ?? "").split(" ");
     expect(tokens).not.toContain("https:");
     expect(tokens).not.toContain("http:");
@@ -115,7 +164,7 @@ describe("buildAppCspReportOnly", () => {
   });
 
   it("drops a malformed extra origin like external origins", () => {
-    const d = parse(buildAppCspReportOnly([], ["not a url"]));
+    const d = parse(buildMeasurementReportOnlyCsp([], ["not a url"]));
     expect(d.get("img-src")).toBe("'self' data: blob:");
   });
 });

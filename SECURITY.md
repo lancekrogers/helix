@@ -93,9 +93,11 @@ These are where the security model lives (see `docs/platform-architecture.md` §
   platform already assumes.
 - **Relaxed CSP directives** — inline scripts/styles, event handlers, `eval`, and the curated
   CDN allowlist are deliberate (ADR-0009); containment lives in the data-flow directives
-  (`connect-src`, `form-action`, `frame-ancestors`). An open `img-src` and navigation-based
-  exfiltration are documented residual risks (architecture §10), as is misuse of a capability
-  _within_ its granted scope.
+  (`connect-src`, `form-action`, `frame-ancestors`, tightened `img-src`, `object-src 'none'`).
+  Navigation, popups, approved origins, WebRTC, and DNS hints remain exfil channels (architecture
+  §10; WebRTC and DNS-hint behavior under CSP is untested). App code can still send out what its
+  viewer can read — the platform does not claim confidentiality against a hostile app author. Misuse
+  of a capability _within_ its granted scope is also a residual risk.
 - **Dev-only stand-ins** — `apps/dev-idp` (the local OIDC issuer) and the dev AES-GCM secret
   envelope are never deployed. Only report these if the same flaw applies to the production
   path (Entra ID, Key Vault).

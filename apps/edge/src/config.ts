@@ -340,6 +340,18 @@ export interface EdgeConfig extends GatewayConfig {
    * Do not list a host that fetches attacker-chosen URLs: that is a sink.
    */
   imgSrcExtra: string[];
+  /**
+   * EDGE_IMG_SRC_REPORT_ONLY: the measurement window before the default takes
+   * effect (the previous open `img-src` enforced, the tightened policy Report-Only).
+   * Parsed with `=== "true"`.
+   */
+  imgSrcReportOnly: boolean;
+  /**
+   * EDGE_IMG_SRC_ALLOW_ALL: put `https:` back in every app's img-src. For
+   * installs on the one-org model that accept the open image channel. Default
+   * false (tight); object-src stays 'none' either way.
+   */
+  imgSrcAllowAll: boolean;
 }
 
 /**
@@ -654,7 +666,8 @@ const isDottedNetmaskCidr = (part: string): boolean =>
  */
 /**
  * Parse EDGE_IMG_SRC_EXTRA: comma-separated https origins widened into every
- * app's Report-Only `img-src` only. Refuse boot on any part that is not a bare
+ * every app's `img-src` (enforced by default; Report-Only only during measurement).
+ * Refuse boot on any part that is not a bare
  * origin — paths, queries, credentials, wildcards, and http: are all errors.
  */
 export function parseImgSrcExtra(raw: string | undefined): string[] {
@@ -969,6 +982,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     throw new Error("EDGE_DEV_ALLOW_UNAUTHENTICATED is a dev bypass and is refused in production");
   }
 
+  const imgSrcReportOnly = env.EDGE_IMG_SRC_REPORT_ONLY === "true";
+  const imgSrcAllowAll = env.EDGE_IMG_SRC_ALLOW_ALL === "true";
+  if (imgSrcReportOnly && imgSrcAllowAll) {
+    throw new Error(
+      "EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL cannot both be true: report-only is the " +
+        "measurement window before enforcing the tightened img-src, while allow-all restores the open " +
+        "channel — pick one posture per install.",
+    );
+  }
+
   return {
     ...loadGatewayConfig(env),
     databaseUrl,
@@ -985,6 +1008,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
       windowMs: Number(env.EDGE_ANON_RATE_WINDOW_MS ?? 60_000),
     },
     imgSrcExtra: parseImgSrcExtra(env.EDGE_IMG_SRC_EXTRA),
+    imgSrcReportOnly,
+    imgSrcAllowAll,
   };
 }
 

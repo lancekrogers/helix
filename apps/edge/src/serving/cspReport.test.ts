@@ -57,6 +57,8 @@ function testConfig(): EdgeConfig {
     },
     anonRateLimit: { max: 0, windowMs: 60_000 },
     imgSrcExtra: [],
+    imgSrcReportOnly: false,
+    imgSrcAllowAll: false,
     trustProxy: false,
     fetch: {
       egressUrl: null,

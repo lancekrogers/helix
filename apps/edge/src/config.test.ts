@@ -246,6 +246,32 @@ describe("loadConfig", () => {
   // login throttle and the audit hash — to the ingress address while everything
   // still read green. Fail the boot instead, the same posture the reconcile
   // interval takes above.
+  it("parses EDGE_IMG_SRC_ALLOW_ALL with allow polarity", () => {
+    expect(loadConfig({ ...ENV }).imgSrcAllowAll).toBe(false);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_ALLOW_ALL: "true" }).imgSrcAllowAll).toBe(true);
+    for (const bad of ["True", "1", "yes", " true"]) {
+      expect(loadConfig({ ...ENV, EDGE_IMG_SRC_ALLOW_ALL: bad }).imgSrcAllowAll).toBe(false);
+    }
+  });
+
+  it("parses EDGE_IMG_SRC_REPORT_ONLY with allow polarity", () => {
+    expect(loadConfig({ ...ENV }).imgSrcReportOnly).toBe(false);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_REPORT_ONLY: "true" }).imgSrcReportOnly).toBe(true);
+    for (const bad of ["True", "1", "yes", " true"]) {
+      expect(loadConfig({ ...ENV, EDGE_IMG_SRC_REPORT_ONLY: bad }).imgSrcReportOnly).toBe(false);
+    }
+  });
+
+  it("refuses boot when EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL are both true", () => {
+    expect(() =>
+      loadConfig({
+        ...ENV,
+        EDGE_IMG_SRC_REPORT_ONLY: "true",
+        EDGE_IMG_SRC_ALLOW_ALL: "true",
+      }),
+    ).toThrow(/EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL cannot both be true/);
+  });
+
   it("parses EDGE_IMG_SRC_EXTRA", () => {
     expect(loadConfig({ ...ENV }).imgSrcExtra).toEqual([]);
     expect(loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "" }).imgSrcExtra).toEqual([]);

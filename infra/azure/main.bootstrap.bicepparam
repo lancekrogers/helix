@@ -103,6 +103,9 @@ param portalExternal = false
 // ADR-0010 (anonymous shared writes) before enabling public apps.
 param allowPublicApps = false
 param allowPasswordApps = false
+// param imgSrcExtra = 'https://images.example.com'  // EDGE_IMG_SRC_EXTRA — operator-trusted image origins; never an image proxy
+// param imgSrcReportOnly = true  // existing installs: measurement window before enforcing; remove after reading the Violations screen
+// param imgSrcAllowAll = true  // one-org installs that accept the open https: image channel
 
 // Azure AI Foundry (ADR-0046) — LLM inference in this subscription instead of
 // first-party Anthropic/OpenAI. false (default) keeps the first-party vendors

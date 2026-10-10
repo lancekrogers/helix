@@ -290,6 +290,20 @@ repository. Nothing here runs automatically.
 parameter file sets `allowlist`; `threatIntelMode=Deny` can ship on apply. Flipping to `allowlist`
 requires maintaining `egressAllowedFqdns` (use `just infra egress-hosts`).
 
+## Upgrading to the tightened image policy
+
+Before rolling the edge image on an **existing** install, set `imgSrcReportOnly = true` in the
+parameter file (or `EDGE_IMG_SRC_REPORT_ONLY=true` on the edge Container App). That restores the
+measurement window: open enforced `img-src` plus a Report-Only tightened policy. Read the Violations
+screen and the `helix.edge.csp_reports` counter for the window (`disposition=report` while the flag
+is on). Pre-grant legitimate image hosts per app, or list operator-trusted hosts in
+`EDGE_IMG_SRC_EXTRA` — never an image proxy. Tell app owners to inline images or ship them in the
+bundle. Then remove the flag and roll the image to enforce `img-src 'self' data: blob:` and
+`object-src 'none'`. One-org installs that accept the open image channel set
+`EDGE_IMG_SRC_ALLOW_ALL=true` instead of enforcing the tight default.
+
+Passing these parameters through Container Apps on a live install is **unverified in Azure**.
+
 ## What a rollout actually does
 
 These behaviours were measured on a live install, polling an app every ~2 s

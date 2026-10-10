@@ -158,7 +158,9 @@ describe("GET /_helix/sw.js", () => {
     // For a worker the CSP on the SCRIPT governs the worker's own context —
     // served bare, its fetch() would escape `connect-src 'self'`.
     expect(res.headers["content-security-policy"]).toContain("connect-src 'self'");
-    expect(res.headers["content-security-policy-report-only"]).toContain("object-src 'none'");
+    expect(res.headers["content-security-policy"]).toContain("img-src 'self' data: blob:");
+    expect(res.headers["content-security-policy"]).toContain("object-src 'none'");
+    expect(res.headers["content-security-policy-report-only"]).toBeUndefined();
     // Always revalidated, so a withdrawn grant converges on the next check.
     expect(res.headers["cache-control"]).toBe("no-cache");
     expect(res.body).toContain("helix:apps/offline/1/");
