@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
@@ -12,6 +13,7 @@ import {
   FORBIDDEN_URL_ATTRS,
   SPAN_CONSENT_STATUS_DEV,
   SPAN_CONSENT_STATUS_EDGE,
+  SPAN_FETCH,
   SPAN_LLM,
 } from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "./telemetry.js";
@@ -21,6 +23,7 @@ import type { DevTokenStore } from "./devGateway/devTokenStore.js";
 import { SESSION_COOKIE } from "./auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "./auth/sessions.js";
 import { testAuthConfig, testDevGatewayConfig, testEdgeConfig } from "./test/config.js";
+import { until } from "./test/socket.js";
 import {
   FakeAppDataStore,
   FakeBlobReader,
@@ -34,6 +37,8 @@ import {
 } from "./test/fakes.js";
 import { LlmProviderError } from "./gateway/provider.js";
 import { InMemoryLeaseStore } from "./gateway/leaseStore.js";
+import { deriveInstructionKey } from "./gateway/instruction.js";
+import type { EgressProvider, EgressResponse } from "./gateway/egressProvider.js";
 
 /**
  * ADR-0037 decision 10's redaction case — the direct sibling of
@@ -937,6 +942,118 @@ describe("LLM admission denials", () => {
     }
     const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
     expect(llmSpan?.attributes[ATTR_REASON]).toBe("concurrency_app");
+  });
+});
+
+describe("fetch admission denials", () => {
+  const APP_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const HOST = "demo.local.helix.azxlabs.io";
+  const ORIGIN = `https://${HOST}:8080`;
+  const PLANTED_PATH = "PLANTED-FETCH-PATH-SEGMENT";
+  const PLANTED_OID = "oid-planted-fetch-deny";
+  const FETCH_URL = `/_api/fetch/https://api.github.com/${PLANTED_PATH}`;
+
+  class SlowEgress implements EgressProvider {
+    calls = 0;
+    delayMs = 300;
+    async proxy(): Promise<EgressResponse> {
+      this.calls += 1;
+      await new Promise((r) => setTimeout(r, this.delayMs));
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Readable.from([Buffer.from("{}")]),
+        outcome: "ok",
+      };
+    }
+    async close(): Promise<void> {}
+  }
+
+  it("never leaks oid, scope, or path content on a concurrency cap refusal", async () => {
+    const sessions = new FakeSessionStore();
+    const leases = new InMemoryLeaseStore();
+    const egress = new SlowEgress();
+    const instructionKey = deriveInstructionKey(randomBytes(32));
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({
+        auth: testAuthConfig(),
+        allowUnauthenticated: false,
+        fetch: {
+          egressUrl: "http://egress.test",
+          instructionSecret: randomBytes(32),
+          timeoutMs: 30_000,
+          maxBodyBytes: 10 * 1024 * 1024,
+          maxAppInFlight: 1,
+        },
+      }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "demo",
+          blobPrefix: "apps/f/1/",
+          visibilityMode: "public",
+          fetch: {
+            connections: new Map([["https://api.github.com", { kind: "keyless" }]]),
+            requestsPerDay: null,
+            shim: false,
+          },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      usage: new FakeUsageStore(),
+      egress,
+      instructionKey,
+      leases,
+    });
+
+    const headers = {
+      host: HOST,
+      "sec-fetch-mode": "cors",
+      origin: ORIGIN,
+      cookie: `${SESSION_COOKIE}=${token}`,
+    };
+    const first = app.inject({ method: "GET", url: FETCH_URL, headers });
+    await new Promise((r) => setTimeout(r, 50));
+    await until(() => egress.calls === 1, "first fetch in flight");
+    const res = await app.inject({ method: "GET", url: FETCH_URL, headers });
+    expect(res.statusCode).toBe(429);
+    await first;
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_OID);
+      expect(dump).not.toContain("fetch:app:");
+      expect(dump).not.toContain("?");
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    const fetchSpan = recording.spans().find((s) => s.name === SPAN_FETCH);
+    expect(fetchSpan?.attributes[ATTR_REASON]).toBe("concurrency_app");
   });
 });
 

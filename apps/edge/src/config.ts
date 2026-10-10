@@ -249,6 +249,13 @@ export interface GatewayConfig {
      * Mirrors egress's `EGRESS_MAX_BODY_BYTES` so both hops cap independently.
      */
     maxBodyBytes: number;
+    /**
+     * Max concurrent fetch-proxy calls per app across all edge replicas
+     * (`EDGE_FETCH_MAX_APP_IN_FLIGHT`). `0` disables — no lease is taken. Lease TTL
+     * is ten minutes; a call that outlives it stops counting (at most one residual
+     * slot per such call).
+     */
+    maxAppInFlight: number;
   };
   /**
    * The edge↔portal internal-JWT key (HELIX_INTERNAL_SECRET):
@@ -845,6 +852,11 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
       // was the failure that surfaced, not the vendor's own speed.
       timeoutMs: Number(env.EDGE_FETCH_TIMEOUT_MS ?? 120_000),
       maxBodyBytes: Number(env.EDGE_FETCH_MAX_BODY_BYTES ?? 10 * 1024 * 1024),
+      maxAppInFlight: requireNonNegativeInt(
+        env.EDGE_FETCH_MAX_APP_IN_FLIGHT,
+        0,
+        "EDGE_FETCH_MAX_APP_IN_FLIGHT",
+      ),
     },
     internalSecret: loadInternalSecret(env),
     portalUrl: env.EDGE_PORTAL_URL || null,

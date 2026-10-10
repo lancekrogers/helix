@@ -56,6 +56,7 @@ function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
       instructionSecret: null,
       timeoutMs: 30_000,
       maxBodyBytes: 10 * 1024 * 1024,
+      maxAppInFlight: 0,
     },
     internalSecret: null,
     portalUrl: null,

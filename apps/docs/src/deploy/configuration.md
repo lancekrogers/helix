@@ -128,6 +128,7 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `deployMaxFileMb` | `50` | Max uncompressed size of any single file in a deployed bundle |
 | `deployMaxBundleMb` | `250` | Max uncompressed size of the whole bundle (and the compressed upload). Raising it a lot wants more CPU/memory on the portal container |
 | `fetchMaxBodyMb` | `25` | Max size of each direction of a `/_api/fetch` call (the request body and the response body). Sets `EDGE_FETCH_MAX_BODY_BYTES` on the edge and dev gateway and `EGRESS_MAX_BODY_BYTES` on egress; each hop enforces it, and a call over it gets a 413 |
+| `fetchMaxAppInFlight` | `0` | Max concurrent fetch-proxy calls per app across all edge replicas (`EDGE_FETCH_MAX_APP_IN_FLIGHT`). `0` disables. Lease TTL is ten minutes; a call that outlives it stops counting against the cap |
 | `imageRegistry` / `imageTag` | `ghcr.io/azx-pbc-oss` / `latest` | Where the three service images come from |
 | `logLevel` | `info` | Log level for all four services. `debug` on the edge puts app-request detail in Log Analytics (30-day retention) — treat it as a data decision, not a volume one |
 
@@ -218,6 +219,7 @@ parameter:
 | Variable | App(s) | Set from | If absent |
 | --- | --- | --- | --- |
 | `EDGE_FETCH_MAX_BODY_BYTES` | edge, dev-gateway | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
+| `EDGE_FETCH_MAX_APP_IN_FLIGHT` | edge, dev-gateway | `fetchMaxAppInFlight` | `0` (off). Lease TTL is ten minutes; a call that outlives it stops counting |
 | `EGRESS_MAX_BODY_BYTES` | egress | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
 
 LLM concurrency and the call deadline:

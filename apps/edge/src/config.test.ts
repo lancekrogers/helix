@@ -216,6 +216,23 @@ describe("loadConfig", () => {
     ).toThrow(/EDGE_LLM_MAX_IN_FLIGHT must be a non-negative integer/);
   });
 
+  it("parses fetch per-app concurrency cap", () => {
+    expect(loadConfig({ ...ENV }).fetch.maxAppInFlight).toBe(0);
+    expect(loadConfig({ ...ENV, EDGE_FETCH_MAX_APP_IN_FLIGHT: "5" }).fetch.maxAppInFlight).toBe(5);
+    for (const bad of ["-1", "2.5", "abc", "NaN", "Infinity"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_FETCH_MAX_APP_IN_FLIGHT: bad })).toThrow(
+        /EDGE_FETCH_MAX_APP_IN_FLIGHT must be a non-negative integer/,
+      );
+    }
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_FETCH_MAX_APP_IN_FLIGHT: "abc",
+      }),
+    ).toThrow(/EDGE_FETCH_MAX_APP_IN_FLIGHT must be a non-negative integer/);
+  });
+
   // A hop count trusts by position, so it structurally ignores the peer address
   // and lets anyone reaching the origin directly spoof X-Forwarded-*
   // (GHSA-3m5p-2c4r-xxw2). Fastify 5.12.1 compiles a number to "trust nothing"

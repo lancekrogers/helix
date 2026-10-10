@@ -100,6 +100,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
       instructionSecret: null,
       timeoutMs: 30_000,
       maxBodyBytes: 10 * 1024 * 1024,
+      maxAppInFlight: 0,
     },
     // Edge→portal mint key unset by default; the consult suites set it.
     internalSecret: null,
@@ -149,6 +150,7 @@ export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}):
       instructionSecret: null,
       timeoutMs: 30_000,
       maxBodyBytes: 10 * 1024 * 1024,
+      maxAppInFlight: 0,
     },
     internalSecret: null,
     portalUrl: null,

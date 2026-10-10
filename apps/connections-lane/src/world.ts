@@ -573,6 +573,7 @@ export class LaneWorld {
           instructionSecret: this.instructionSecret,
           timeoutMs: 10_000,
           maxBodyBytes: 1024 * 1024,
+          maxAppInFlight: 0,
         },
         internalSecret: internalSecret(),
         portalUrl: `http://127.0.0.1:${this.#portalPort}`,

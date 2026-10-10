@@ -316,6 +316,10 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
           egress: deps.egress ?? null,
           usage: deps.usage ?? null,
           instructionKey: deps.instructionKey ?? null,
+          concurrency: {
+            leases: deps.leases ?? fallbackLeases,
+            maxAppInFlight: config.fetch.maxAppInFlight,
+          },
         })
       : null;
   // The CSP report sink is unauthenticated (browsers send no credentials with

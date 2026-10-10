@@ -91,6 +91,10 @@ param deployMaxBundleMb int = 250
 @minValue(1)
 param fetchMaxBodyMb int = 25
 
+@description('Max concurrent fetch-proxy calls per app across all edge replicas (EDGE_FETCH_MAX_APP_IN_FLIGHT on the edge and dev gateway). 0 disables. Lease TTL is ten minutes; a call that outlives it stops counting against the cap.')
+@minValue(0)
+param fetchMaxAppInFlight int = 0
+
 @description('Blob container for app bundles.')
 param blobContainerName string = 'app-bundles'
 
@@ -1266,6 +1270,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_TRUST_PROXY', value: effectiveEdgeTrustProxy }
       { name: 'EDGE_EGRESS_URL', value: egressBaseUrl }
       { name: 'EDGE_FETCH_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
+      { name: 'EDGE_FETCH_MAX_APP_IN_FLIGHT', value: string(fetchMaxAppInFlight) }
       // The /connections/* proxy and both consent surfaces
       // consult the portal over this base; unset they answer fail-closed 503.
       { name: 'EDGE_PORTAL_URL', value: portalBaseUrl }
@@ -1476,6 +1481,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_LLM_MAX_CALL_MS', value: string(llmMaxCallMs) }
       { name: 'EDGE_EGRESS_URL', value: egressBaseUrl }
       { name: 'EDGE_FETCH_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
+      { name: 'EDGE_FETCH_MAX_APP_IN_FLIGHT', value: string(fetchMaxAppInFlight) }
       // The dev-gateway's consent surface consults the portal
       // over this base, same as the edge.
       { name: 'EDGE_PORTAL_URL', value: portalBaseUrl }

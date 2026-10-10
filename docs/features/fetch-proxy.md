@@ -35,7 +35,13 @@ decides *whether* the call may happen and to *where*; egress actually makes it.
    (`externalOrigins`) are a separate list and are *not* proxied.
 4. **Quota.** A per-app `requestsPerDay` budget (block-new/finish-in-flight),
    counted from `gateway_calls`.
-5. **Attest + forward.** The edge mints a short-lived signed instruction
+5. **Concurrency cap (optional).** When `EDGE_FETCH_MAX_APP_IN_FLIGHT` is
+   positive, the edge holds a Postgres lease on `fetch:app:<appId>` for the
+   whole response (including a streamed body) and refuses over-cap calls with
+   `429 rate_limited` before minting an instruction. `0` disables — no extra
+   database round trip. Lease TTL is ten minutes; a call that outlives it stops
+   counting (at most one residual slot per such call).
+6. **Attest + forward.** The edge mints a short-lived signed instruction
    `(app, user, capability, origin, connection?, request-id)` and forwards the
    request + instruction to egress over the `EgressProvider` HTTP seam. The edge
    has **no grant on `app_secrets`** (it cannot read an app's connection secret)

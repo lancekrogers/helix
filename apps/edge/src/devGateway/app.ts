@@ -180,6 +180,7 @@ export function buildDevGateway(deps: DevGatewayDeps): FastifyInstance {
     egress: deps.egress,
     usage: deps.usage,
     instructionKey: deps.instructionKey,
+    concurrency: { leases: llmLeases, maxAppInFlight: config.fetch.maxAppInFlight },
   });
 
   // The dev tier's consent entry — the bearer POST that returns
