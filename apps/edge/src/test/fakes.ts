@@ -166,6 +166,11 @@ export class FakeLlmProvider implements LlmProvider {
   errorAfterDeltas: Error | null = null;
   /** When set, stream() throws before yielding anything. */
   error: Error | null = null;
+  /**
+   * When set, blocks until the handler aborts the call, then throws this error
+   * (simulates a silent upstream past request dispatch).
+   */
+  hangUntilAbort: Error | null = null;
   /** Awaited before each delta — a hook for interleaving/observation. */
   onDelta?: (index: number) => Promise<void> | void;
   /** Set when the handler's abort signal fired while the stream was open. */
@@ -174,6 +179,15 @@ export class FakeLlmProvider implements LlmProvider {
   async *stream(req: LlmChatRequest, opts: { signal: AbortSignal }): AsyncIterable<LlmStreamEvent> {
     this.calls.push(req);
     if (this.error) throw this.error;
+    if (this.hangUntilAbort) {
+      await new Promise<void>((_resolve, reject) => {
+        if (opts.signal.aborted) {
+          reject(this.hangUntilAbort);
+          return;
+        }
+        opts.signal.addEventListener("abort", () => reject(this.hangUntilAbort!), { once: true });
+      });
+    }
     if (opts.signal.aborted) this.sawAbort = true;
     else {
       opts.signal.addEventListener(

@@ -306,6 +306,9 @@ export const CACHE_READ_MULTIPLIER = 0.1;
 /** Cache-write tokens bill at 1.25x the base input rate (5-minute TTL — our default). */
 export const CACHE_WRITE_MULTIPLIER = 1.25;
 
+/** Default floor for reasoning models' `max_completion_tokens` (see `openAiRequestBody`). */
+export const REASONING_MIN_COMPLETION_TOKENS_DEFAULT = 25_000;
+
 /** Look up the rate for a model; undefined when unpriced (UI flags rather than showing $0). */
 export function priceForModel(model: string): ModelPrice | undefined {
   return MODEL_PRICING[model];
@@ -331,6 +334,11 @@ export function outputTokenCapForEstimate(model: string, maxTokens?: number): nu
   const price = priceForModel(model);
   if (!price) return maxTokens ?? 0;
   const limits = limitsForModel(model)!;
+  if (price.reasoning) {
+    const floor = price.minCompletionTokens ?? REASONING_MIN_COMPLETION_TOKENS_DEFAULT;
+    const authorized = Math.max(maxTokens ?? floor, floor);
+    return Math.min(authorized, limits.maxOutputTokens);
+  }
   if (maxTokens !== undefined) {
     return Math.min(maxTokens, limits.maxOutputTokens);
   }
@@ -338,7 +346,8 @@ export function outputTokenCapForEstimate(model: string, maxTokens?: number): nu
     return Math.min(ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS, limits.maxOutputTokens);
   }
   if (price.reasoning) {
-    return Math.min(price.minCompletionTokens ?? 25_000, limits.maxOutputTokens);
+    const floor = price.minCompletionTokens ?? REASONING_MIN_COMPLETION_TOKENS_DEFAULT;
+    return Math.min(floor, limits.maxOutputTokens);
   }
   return limits.maxOutputTokens;
 }

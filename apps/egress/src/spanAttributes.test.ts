@@ -223,7 +223,7 @@ describe("a recorded egress span", () => {
     const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 
     const config = {
-      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
       allowInsecureConnection: true,
     } as EgressConfig;

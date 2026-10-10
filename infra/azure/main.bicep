@@ -82,6 +82,9 @@ param llmMaxInFlight int = 200
 @maxValue(2147483647)
 param llmMaxCallMs int = 600000
 
+// Egress LLM vendor idle timeout — must exceed llmMaxCallMs (see EGRESS_LLM_TIMEOUT_MARGIN_MS).
+var egressLlmTimeoutMs = llmMaxCallMs + 120000
+
 @description('Max uncompressed size in MB of any single file in a deployed bundle.')
 param deployMaxFileMb int = 50
 
@@ -1116,6 +1119,7 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
       }
       { name: 'EGRESS_PORT', value: '8081' }
       { name: 'EGRESS_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
+      { name: 'EGRESS_LLM_TIMEOUT_MS', value: string(egressLlmTimeoutMs) }
       { name: 'HOST', value: '0.0.0.0' }
       { name: 'AZURE_KEY_VAULT_URL', value: connectionsVaultUri }
       // Delegated custody: user OAuth token material,

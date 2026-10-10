@@ -8,7 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { ATTR_REASON, INSTR_GATEWAY_ADMISSION_DENIED, SPAN_LLM } from "@azx-pbc/shared/telemetry";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
-import { BYTES_PER_TOKEN, costUsd } from "@azx-pbc/shared";
+import { BYTES_PER_TOKEN, costUsd, outputTokenCapForEstimate } from "@azx-pbc/shared";
+import { EgressProviderError } from "./egressProvider.js";
 import { buildApp } from "../app.js";
 import { SESSION_COOKIE } from "../auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "../auth/sessions.js";
@@ -1498,6 +1499,100 @@ describe("concurrency caps and the call deadline", () => {
     expect(row?.costMicroUsd).toBeGreaterThan(0);
     expect(row?.stopReason).toBeNull();
     expect(edge.leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  function undiciBodyTimeout(): Error {
+    const err = new Error("Body Timeout");
+    (err as NodeJS.ErrnoException).code = "UND_ERR_BODY_TIMEOUT";
+    return err;
+  }
+
+  it("does not charge a connect timeout: the request never left", async () => {
+    const edge = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 100 } });
+    const connectTimeout = new Error("Connect Timeout Error");
+    (connectTimeout as NodeJS.ErrnoException).code = "UND_ERR_CONNECT_TIMEOUT";
+    edge.provider.error = connectTimeout;
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, { ...ASK, stream: false });
+    const row = edge.usage.records[0];
+    expect(row?.errorDetail).not.toMatch(/^upstream_timeout/);
+    expect(row?.costMicroUsd).toBe(0);
+  });
+
+  it("charges upstream_timeout when the hop idles out before any stream byte (streaming)", async () => {
+    const edge = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 100 } });
+    edge.provider.error = new EgressProviderError("egress request failed", {
+      cause: undiciBodyTimeout(),
+    });
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+    expect(res.statusCode).toBe(502);
+    const row = edge.usage.records[0];
+    expect(row?.errorDetail).toMatch(/^upstream_timeout;usage=/);
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("charges upstream_timeout when the hop idles out before any stream byte (non-streaming)", async () => {
+    const edge = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 100 } });
+    edge.provider.error = undiciBodyTimeout();
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: false });
+    expect(res.statusCode).toBe(502);
+    expect(edge.usage.records[0]?.errorDetail).toMatch(/^upstream_timeout;usage=/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("records $0 on a vendor 429 before any byte", async () => {
+    const edge = buildLlmEdge();
+    edge.provider.error = new LlmProviderError('egress llm call failed (429): {"error":{}}', 429);
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, { ...ASK, stream: false });
+    expect(edge.usage.records[0]?.costMicroUsd).toBe(0);
+  });
+
+  it("uses deadline_exceeded when the call deadline fires before hop timeouts", async () => {
+    const edge = buildLlmEdge({ maxCallMs: 50, llm: { models: [MODEL], dollarsPerDay: 100 } });
+    const aborted = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    edge.provider.hangUntilAbort = aborted;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: false });
+    expect(res.statusCode).toBe(502);
+    expect(edge.usage.records[0]?.errorDetail).toMatch(/^deadline_exceeded;usage=/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("estimates a cut reasoning call from the relayed bytes, not from a tiny maxTokens", async () => {
+    const REASONING_MODEL = "gpt-5-nano";
+    const edge = buildLlmEdge({ llm: { models: [REASONING_MODEL], dollarsPerDay: 100 } });
+    // A long visible answer, then the stream dies with no usage block.
+    const answer = "x".repeat(3_000);
+    edge.provider.deltas = [answer];
+    edge.provider.errorAfterDeltas = new Error("upstream reset");
+    const token = await seedSession(edge.sessions);
+    const body = { model: REASONING_MODEL, messages: ASK.messages, maxTokens: 1, stream: false };
+    await chat(edge, token, body);
+    const floor = outputTokenCapForEstimate(REASONING_MODEL, 1);
+    const row = edge.usage.records[0];
+    expect(floor).toBeGreaterThan(1);
+    // Clamping to the client's maxTokens would record 1 here.
+    expect(row?.outputTokens).toBeGreaterThan(100);
+    expect(row?.outputTokens).toBeLessThanOrEqual(floor);
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("charges only the input estimate when a reasoning call times out with nothing relayed", async () => {
+    const REASONING_MODEL = "gpt-5-nano";
+    const edge = buildLlmEdge({ llm: { models: [REASONING_MODEL], dollarsPerDay: 100 } });
+    edge.provider.error = undiciBodyTimeout();
+    const token = await seedSession(edge.sessions);
+    const body = { model: REASONING_MODEL, messages: ASK.messages, maxTokens: 1, stream: false };
+    await chat(edge, token, body);
+    const row = edge.usage.records[0];
+    // A short prompt on the cheapest model rounds to zero micro-dollars, so the
+    // charge is asserted on tokens: the input estimate is recorded, no output.
+    expect(row?.errorDetail).toMatch(/^upstream_timeout;usage=/);
+    expect(row?.outputTokens).toBe(0);
+    expect(row?.inputTokens).toBeGreaterThan(0);
   });
 
   it("passes maxCallMs plus grace as the lease TTL", async () => {

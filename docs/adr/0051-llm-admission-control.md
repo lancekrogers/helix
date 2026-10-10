@@ -53,7 +53,11 @@ of that gate and the metering fixes that make abandoned and partial calls count.
 
 4. **Wall-clock call deadline.** `EDGE_LLM_MAX_CALL_MS` (default ten minutes) bounds each upstream
    LLM call via `AbortSignal` and sets lease TTL to the deadline plus a one-minute grace period.
-   There is no off value: the deadline is always on.
+   There is no off value: the deadline is always on. The edge→egress undici hop uses
+   `maxCallMs + LLM_EGRESS_HOP_TIMEOUT_MARGIN_MS` so this abort wins before the fetch idle timeout;
+   egress→vendor on `llm` instructions uses `EGRESS_LLM_TIMEOUT_MS` (derived from the same
+   `llmMaxCallMs` in Bicep, default `maxCallMs + EGRESS_LLM_TIMEOUT_MARGIN_MS`), which must stay
+   above the edge deadline. A hop timeout after dispatch is charged as a cut (`upstream_timeout`).
 
 5. **Per-install settings under ADR-0028.** Every control above is an install parameter with the
    strict value as the default so a one-organization customer-deployed install may relax or disable

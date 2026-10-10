@@ -142,7 +142,11 @@ interface AppOpts {
 
 function makeApp(opts: AppOpts = {}) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: opts.timeoutMs ?? 5_000 },
+    limits: {
+      maxBodyBytes: 1024 * 1024,
+      timeoutMs: opts.timeoutMs ?? 5_000,
+      llmTimeoutMs: 30_000,
+    },
     allowPrivate: opts.allowPrivate ?? true,
     allowInsecureConnection: opts.allowInsecureConnection ?? true,
   } as EgressConfig;
@@ -531,7 +535,7 @@ describe("POST /exchange — authorization before anything else", () => {
     await setProvider();
     // A wired exchange op with null stores — keyless egress receiving a call.
     const config = {
-      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000 },
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
       allowInsecureConnection: true,
     } as EgressConfig;

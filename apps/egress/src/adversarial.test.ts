@@ -104,7 +104,7 @@ function makeApp(
   burnStore: InstructionBurnStore | null = null,
 ) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate,
     // Loopback echo upstreams are http, so the cleartext-injection seam is open
     // for most tests; the issue #11 suite closes it to assert the prod guard.
@@ -514,7 +514,7 @@ describe("egress body-size cap (issue #8)", () => {
     capOrigin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 
     const config = {
-      limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
     } as EgressConfig;
     // Body-size cap suite: replay protection is orthogonal, so no burn store.
@@ -621,7 +621,7 @@ describe("egress body-size cap (issue #8)", () => {
       },
     });
     const config = {
-      limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
     } as EgressConfig;
     const capApp = buildApp(
@@ -671,7 +671,7 @@ describe("egress body-size cap (issue #8)", () => {
       },
     });
     const config = {
-      limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
     } as EgressConfig;
     const capApp = buildApp(

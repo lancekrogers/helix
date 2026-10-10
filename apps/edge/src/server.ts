@@ -10,6 +10,7 @@ import { PgSessionStore, startSessionSweeper } from "./auth/sessions.js";
 import { anthropicVendor, openAiVendor, type LlmProvider } from "./gateway/provider.js";
 import { EgressLlmProvider } from "./gateway/egressLlmProvider.js";
 import { RoutingLlmProvider } from "./gateway/routingLlmProvider.js";
+import { llmEgressHopTimeoutMs } from "@azx-pbc/shared";
 import { HttpEgressProvider, type EgressProvider } from "./gateway/egressProvider.js";
 import { deriveInstructionKey } from "./gateway/instruction.js";
 import { HttpPortalProvider, type PortalProvider } from "./routing/portalProvider.js";
@@ -191,6 +192,7 @@ const loginThrottle = new LoginThrottle(counterStore);
 // calls to helix-egress over the EgressProvider seam. The capability is enabled
 // only when both the egress URL and the shared instruction secret are present
 // (otherwise /_api/fetch and the egress LLM path 503 — fail-closed).
+const llmHopTimeoutMs = llmEgressHopTimeoutMs(config.llm.maxCallMs);
 const egress: EgressProvider | null = config.fetch.egressUrl
   ? new HttpEgressProvider(config.fetch.egressUrl, { timeoutMs: config.fetch.timeoutMs })
   : null;
@@ -233,8 +235,14 @@ const llmProvider: LlmProvider | null =
           }),
           egress,
           instructionKey,
+          llmHopTimeoutMs,
         ),
-        openai: new EgressLlmProvider(openAiVendor(config.llm.openai), egress, instructionKey),
+        openai: new EgressLlmProvider(
+          openAiVendor(config.llm.openai),
+          egress,
+          instructionKey,
+          llmHopTimeoutMs,
+        ),
       })
     : null;
 

@@ -124,7 +124,7 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `llmMaxAppInFlight` | `10` | Cross-replica cap on concurrent LLM calls per app (`EDGE_LLM_MAX_APP_IN_FLIGHT`). `0` disables |
 | `llmMaxUserInFlight` | `3` | Cross-replica cap per authenticated user per app (`EDGE_LLM_MAX_USER_IN_FLIGHT`). `0` disables |
 | `llmMaxInFlight` | `200` | Per-replica in-flight LLM cap (`EDGE_LLM_MAX_IN_FLIGHT`). `0` disables |
-| `llmMaxCallMs` | `600000` | Wall-clock upstream LLM deadline in ms (`EDGE_LLM_MAX_CALL_MS`) |
+| `llmMaxCallMs` | `600000` | Wall-clock upstream LLM deadline in ms (`EDGE_LLM_MAX_CALL_MS`). Also drives `EGRESS_LLM_TIMEOUT_MS` on egress (`llmMaxCallMs + 120000` in Bicep) — egress's LLM vendor bound must stay above this value |
 | `deployMaxFileMb` | `50` | Max uncompressed size of any single file in a deployed bundle |
 | `deployMaxBundleMb` | `250` | Max uncompressed size of the whole bundle (and the compressed upload). Raising it a lot wants more CPU/memory on the portal container |
 | `fetchMaxBodyMb` | `25` | Max size of each direction of a `/_api/fetch` call (the request body and the response body). Sets `EDGE_FETCH_MAX_BODY_BYTES` on the edge and dev gateway and `EGRESS_MAX_BODY_BYTES` on egress; each hop enforces it, and a call over it gets a 413 |
@@ -230,6 +230,12 @@ LLM concurrency and the call deadline:
 | `EDGE_LLM_MAX_USER_IN_FLIGHT` | edge, dev-gateway | `llmMaxUserInFlight` | 3 |
 | `EDGE_LLM_MAX_IN_FLIGHT` | edge, dev-gateway | `llmMaxInFlight` | 200 |
 | `EDGE_LLM_MAX_CALL_MS` | edge, dev-gateway | `llmMaxCallMs` | 600000 (10 minutes) |
+
+Egress vendor idle timeouts (`EGRESS_TIMEOUT_MS` stays at 120s for non-LLM fetch; LLM uses the row below):
+
+| Variable | App(s) | Set from | If absent |
+| --- | --- | --- | --- |
+| `EGRESS_LLM_TIMEOUT_MS` | egress | `llmMaxCallMs + 120000` in Bicep | `EDGE_LLM_MAX_CALL_MS + 120000` when that env is present on egress, else 720000 |
 
 The portal image also carries one setting for the app owner's Visitors view:
 

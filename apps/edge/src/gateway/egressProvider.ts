@@ -39,6 +39,11 @@ export interface EgressRequest {
    * replay bug.
    */
   correlationId: string;
+  /**
+   * Per-hop idle timeout (undici `headersTimeout` / `bodyTimeout`). LLM calls
+   * set this above the edge deadline so the deadline abort wins first.
+   */
+  hopTimeoutMs?: number;
 }
 
 export interface EgressResponse {
@@ -60,12 +65,15 @@ export class EgressProviderError extends Error {}
 export class HttpEgressProvider implements EgressProvider {
   readonly #base: string;
   readonly #dispatcher: Agent;
+  readonly #timeoutMs: number;
 
   constructor(egressUrl: string, opts: { timeoutMs?: number } = {}) {
     this.#base = egressUrl.replace(/\/+$/, "");
+    this.#timeoutMs = opts.timeoutMs ?? 30_000;
+    // Per-request `headersTimeout` / `bodyTimeout` override these defaults on each hop.
     this.#dispatcher = new Agent({
-      headersTimeout: opts.timeoutMs ?? 30_000,
-      bodyTimeout: opts.timeoutMs ?? 30_000,
+      headersTimeout: this.#timeoutMs,
+      bodyTimeout: this.#timeoutMs,
     });
   }
 
@@ -84,6 +92,7 @@ export class HttpEgressProvider implements EgressProvider {
     propagation.inject(context.active(), traceContext);
 
     try {
+      const hopTimeoutMs = req.hopTimeoutMs ?? this.#timeoutMs;
       const res = await request(`${this.#base}/proxy`, {
         method: "POST",
         // Platform headers go AFTER the spread: `req.headers` is the
@@ -100,6 +109,8 @@ export class HttpEgressProvider implements EgressProvider {
         body: req.body ?? undefined,
         signal: req.signal,
         dispatcher: this.#dispatcher,
+        headersTimeout: hopTimeoutMs,
+        bodyTimeout: hopTimeoutMs,
       });
       const outcome = res.headers[OUTCOME_HEADER];
       return {

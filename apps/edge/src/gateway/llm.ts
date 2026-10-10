@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import {
   costUsd,
   estimateCutUsage,
+  LLM_UPSTREAM_TIMEOUT_DETAIL,
   priceForModel,
   supportsStructuredOutputs,
   type ApiErrorCode,
@@ -78,6 +79,38 @@ const BURST_BUDGET_FRACTION = 1 / BURST_WINDOW_DIVISOR;
 
 /** Lease TTL is the call deadline plus this, so a live call never loses its slot. */
 const LEASE_GRACE_MS = 60_000;
+
+// Hop timeouts after the request was dispatched: the vendor may hold the
+// prompt, so these are charged as a cut. A connect timeout is not here: the
+// request never left, so it stays uncharged.
+const UNDICI_IDLE_TIMEOUT_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+
+function isUndiciIdleTimeout(err: unknown): boolean {
+  for (let cur: unknown = err, depth = 0; depth < 8 && cur instanceof Error; depth += 1) {
+    const code = (cur as Error & { code?: string }).code;
+    if (typeof code === "string" && UNDICI_IDLE_TIMEOUT_CODES.has(code)) return true;
+    cur = cur.cause;
+  }
+  return false;
+}
+
+function llmErrorCharge(
+  err: unknown,
+  eventsSeen: number,
+  deadline: AbortSignal,
+  shutdownHit: boolean,
+): { errorDetail: string; cut: boolean } {
+  if (shutdownHit) return { errorDetail: "process_shutdown", cut: true };
+  if (deadline.aborted) return { errorDetail: "deadline_exceeded", cut: true };
+  if (eventsSeen > 0) return { errorDetail: errorDetailOf(err), cut: true };
+  if (isUndiciIdleTimeout(err)) {
+    return { errorDetail: LLM_UPSTREAM_TIMEOUT_DETAIL, cut: true };
+  }
+  if (err instanceof LlmProviderError && err.egressCode === "upstream_timeout") {
+    return { errorDetail: LLM_UPSTREAM_TIMEOUT_DETAIL, cut: true };
+  }
+  return { errorDetail: errorDetailOf(err), cut: false };
+}
 
 /**
  * Ledger `errorDetail` for a call the app abandoned. `GatewayOutcome` has no
@@ -552,15 +585,9 @@ export function makeLlmHandler(
             return;
           }
           const shutdownHit = processShutdownSignal().aborted;
+          const charge = llmErrorCharge(err, eventsSeen, deadline, shutdownHit);
+          await recordOnce("error", charge);
           const deadlineHit = deadline.aborted;
-          await recordOnce("error", {
-            errorDetail: shutdownHit
-              ? "process_shutdown"
-              : deadlineHit
-                ? "deadline_exceeded"
-                : errorDetailOf(err),
-            cut: shutdownHit || deadlineHit || eventsSeen > 0,
-          });
           const { status, code, message, param, retryAfter } =
             shutdownHit || deadlineHit
               ? {
@@ -618,15 +645,9 @@ export function makeLlmHandler(
           return;
         }
         const shutdownHit = processShutdownSignal().aborted;
+        const charge = llmErrorCharge(err, eventsSeen, deadline, shutdownHit);
+        await recordOnce("error", charge);
         const deadlineHit = deadline.aborted;
-        await recordOnce("error", {
-          errorDetail: shutdownHit
-            ? "process_shutdown"
-            : deadlineHit
-              ? "deadline_exceeded"
-              : errorDetailOf(err),
-          cut: shutdownHit || deadlineHit || eventsSeen > 0,
-        });
         const { status, code, message, param, retryAfter } =
           shutdownHit || deadlineHit
             ? {

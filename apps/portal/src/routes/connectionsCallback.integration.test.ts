@@ -302,7 +302,7 @@ beforeAll(async () => {
       retireSweepIntervalMs: 60_000,
       instructionSecret: randomBytes(48),
       exchangeSecret: Buffer.from(process.env.HELIX_EXCHANGE_SECRET ?? "", "utf8"),
-      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000 },
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000, llmTimeoutMs: 30_000 },
       managedIdentityConnections: [],
       allowPrivate: true,
       allowInsecureConnection: true,

@@ -215,8 +215,9 @@ SELECT slug FROM apps
 6. **Apply the new template.** A Bicep default does not reach an install until you apply the template
    with your parameters. Set the four concurrency parameters (`llmMaxAppInFlight`,
    `llmMaxUserInFlight`, `llmMaxInFlight`, `fetchMaxAppInFlight`), the call deadline
-   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. See
-   [Configuration](/deploy/configuration).
+   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. The template
+   also sets `EGRESS_LLM_TIMEOUT_MS` from the same `llmMaxCallMs` (plus 120s) so egress's LLM vendor
+   bound cannot drift below the edge deadline. See [Configuration](/deploy/configuration).
 
 7. **Mixed replicas.** An edge revision without `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` disables the
    platform ceiling on that replica, so a rolling deploy with old and new replicas does not refuse
