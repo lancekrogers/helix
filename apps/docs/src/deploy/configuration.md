@@ -146,6 +146,9 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `deployAlerts` | `true` | Alert rules on the platform's own telemetry (registry staleness) |
 | `deployAvailabilityTests` | `true` | Outside HTTP probes on the public hosts — the only monitoring that works when the platform can't see itself. Billed per execution |
 | `deployInfraAlerts` | `true` | Azure platform-metric rules: Postgres availability/storage, restart storms, edge 5xx |
+| `deployNetprobe` | `true` | Daily (and on-demand) network probe job in the egress environment plus log alerts on its result. Requires `deployApps` |
+| `netprobeAllowedHost` | `mcr.microsoft.com` | Host the probe expects to reach on 443; must remain on the egress platform firewall list |
+| `netprobeCanaryHost` | `example.net` | Host deliberately not on any list; used when the firewall runs in `allowlist` mode |
 | `alertEmails` | `[]` | Who alerts notify. **Empty means the rules still deploy and still fire — at nobody.** Always set this, or turn alerts off |
 | `registryStalenessThresholdMs` | `1200000` | Staleness that fires the registry alert |
 | `availabilityTestFrequencySeconds` | `300` | Probe interval per location — the cost knob for availability tests |

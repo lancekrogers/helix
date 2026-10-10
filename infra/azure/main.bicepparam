@@ -110,6 +110,9 @@ param allowPasswordApps = false
 //    (+ llmAnthropicPath/llmOpenAiPath and the connection names) — see README
 //    "Azure AI Foundry".
 param deployFoundry = false
+// param deployNetprobe = true              // scheduled egress-subnet network probe job + log alerts; requires deployApps
+// param netprobeAllowedHost = 'mcr.microsoft.com'  // must stay on the egress platform firewall list
+// param netprobeCanaryHost = 'example.net' // public host not on any allow-list (firewall allow-list check)
 // param pinPrivateEndpointAddresses = true  // new installs: static snet-pe IPs for egress NSG rules; existing installs leave false until live addresses are listed
 // param privateEndpointAddresses = { kvConnections: '10.0.7.20' }  // optional overrides when pinning; defaults are .4-.7 of snet-pe
 // param foundryAccountName = ''            // default ${namePrefix}-foundry; must be globally unique

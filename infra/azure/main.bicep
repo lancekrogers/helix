@@ -433,6 +433,15 @@ param egressAllowedPorts array = [
   '443'
 ]
 
+@description('Deploy the scheduled network probe job and its log alerts in the egress environment. Requires deployApps. Turn off for an install that cannot run the job yet.')
+param deployNetprobe bool = true
+
+@description('Public host the probe expects to reach on 443 — must stay on the egress platform firewall list in every mode. Default mcr.microsoft.com.')
+param netprobeAllowedHost string = 'mcr.microsoft.com'
+
+@description('Public host deliberately not on any allow-list; used to test firewall allow-list mode.')
+param netprobeCanaryHost string = 'example.net'
+
 @description('Log verbosity for all four services (pino levels: fatal|error|warn|info|debug|trace|silent). Sets LOG_LEVEL, which every service reads unless its own <PREFIX>_LOG_LEVEL overrides it — so this one line raises the whole platform, and a per-service override raises just the noisy one. Applied per revision: changing it rolls a new ACA revision rather than taking effect on the running one. NOTE debug/trace on the edge is a data-exposure decision as much as a volume one — this stdout is retained in Log Analytics for 30 days.')
 @allowed(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
 param logLevel string = 'info'
@@ -506,6 +515,8 @@ var peBlobIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.b
 var peKvPlatformIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvPlatform : ''
 var peKvConnectionsIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvConnections : ''
 var peKvDelegatedIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvDelegated : ''
+
+var egressExtraBlockedCidrs = '${vnetAddressPrefix},100.100.0.0/17'
 
 var oidcIssuer = '${az.environment().authentication.loginEndpoint}${entraTenantId}/v2.0'
 
@@ -1100,6 +1111,16 @@ module infraAlerts 'modules/alerts-infra.bicep' = if (deployInfraAlerts && deplo
   }
 }
 
+module netprobeAlerts 'modules/alerts-netprobe.bicep' = if (deployInfraAlerts && deployApps && deployNetprobe) {
+  name: 'netprobe-alerts'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    workspaceId: egressEnv.outputs.logAnalyticsWorkspaceId
+    actionGroupId: actionGroupId
+  }
+}
+
 module firewallDiagnostics 'modules/firewall-diagnostics.bicep' = if (deployFirewall) {
   name: 'firewall-diagnostics'
   params: {
@@ -1274,7 +1295,7 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
       // install on a non-RFC 1918 range is covered, and the ACA platform-reserved range.
       // 100.64.0.0/10 is already in the built-in list; 100.100.0.0/17 documents the ACA slice.
       // 10.0.0.0/8 in the built-in list already covers the default VNet prefix.
-      { name: 'EGRESS_EXTRA_BLOCKED_CIDRS', value: '${vnetAddressPrefix},100.100.0.0/17' }
+      { name: 'EGRESS_EXTRA_BLOCKED_CIDRS', value: egressExtraBlockedCidrs }
       { name: 'EGRESS_DATABASE_URL', secretRef: 'egress-database-url' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_EXCHANGE_SECRET', secretRef: 'helix-exchange-secret' }
@@ -1725,6 +1746,42 @@ module migrateJob 'modules/migrate-job.bicep' = if (deployApps) {
   ]
 }
 
+var netprobeProbeEnvCommon = [
+  { name: 'PROBE_PE_ADDRESSES', value: pinPrivateEndpointAddresses ? 'pinned' : 'dynamic' }
+  { name: 'PROBE_EXPECT_FIREWALL', value: deployFirewall ? 'true' : 'false' }
+  { name: 'PROBE_EXPECT_FQDN_ALLOWLIST', value: deployFirewall && egressFqdnMode == 'allowlist' ? 'true' : 'false' }
+  { name: 'PROBE_EXPECT_NSG', value: egressNsgEnforce }
+  { name: 'PROBE_APPS_IP', value: appsEnv.outputs.staticIp }
+  { name: 'PROBE_POSTGRES_HOST', value: pgFqdn }
+  { name: 'PROBE_ALLOWED_HOST', value: netprobeAllowedHost }
+  { name: 'PROBE_CANARY_HOST', value: netprobeCanaryHost }
+]
+
+var netprobeProbePeEnv = pinPrivateEndpointAddresses
+  ? [
+      { name: 'PROBE_KV_PLATFORM_IP', value: peKvPlatformIp }
+      { name: 'PROBE_BLOB_PE_IP', value: peBlobIp }
+      { name: 'PROBE_KV_CONNECTIONS_IP', value: peKvConnectionsIp }
+      { name: 'PROBE_KV_DELEGATED_IP', value: peKvDelegatedIp }
+    ]
+  : []
+
+var netprobeProbeEnv = concat(netprobeProbeEnvCommon, netprobeProbePeEnv)
+
+module netprobeJob 'modules/netprobe-job.bicep' = if (deployApps && deployNetprobe) {
+  name: 'netprobe-job'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    acaEnvId: egressEnv.outputs.environmentId
+    image: '${imageRegistry}/helix-egress:${imageTag}'
+    probeEnv: netprobeProbeEnv
+  }
+  dependsOn: [
+    egressApp
+  ]
+}
+
 // ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
@@ -1764,6 +1821,27 @@ output expectedMonthlyUsd int = expectedMonthlyUsd
 
 @description('Monthly USD the Foundry LLM budget is watching on the account\'s own resource group, or 0 when none deployed (deployFoundry false, llmMonthlyBudgetUsd 0, deployCostBudget false, or alertEmails empty). Notification only — per-app daily token budgets and the deployments\' TPM capacity are the real limits.')
 output llmBudgetUsd int = llmBudget.?outputs.budgetUsd ?? 0
+
+@description('The network controls this deployment declares, in one object, so nobody restates them in prose: firewall, FQDN mode, threat intelligence, NSG mode, allowed ports, the effective allow-list, private-endpoint addresses when pinned, the extra blocked CIDRs, and the probe job with its expectations. Read it next to the last probe result (`just infra net-verify`). Declared posture, not proof: the probe is the proof.')
+output netControls object = {
+  deployFirewall: deployFirewall
+  egressFqdnMode: deployFirewall ? egressFqdnMode : 'n/a'
+  threatIntelMode: deployFirewall ? threatIntelMode : 'n/a'
+  egressNsgEnforce: egressNsgEnforce
+  egressAllowedPorts: egressAllowedPorts
+  egressAllowedFqdns: deployFirewall && egressFqdnMode == 'allowlist' ? egressProductFqdns : []
+  privateEndpointAddresses: pinPrivateEndpointAddresses ? pinnedPeIps : {}
+  extraBlockedCidrs: egressExtraBlockedCidrs
+  probe: {
+    deployed: deployApps && deployNetprobe
+    jobName: '${namePrefix}-netprobe'
+    expectFirewall: deployFirewall
+    expectFqdnAllowlist: deployFirewall && egressFqdnMode == 'allowlist'
+    expectNsg: egressNsgEnforce
+    peAddresses: pinPrivateEndpointAddresses ? 'pinned' : 'dynamic'
+  }
+}
+
 // Feeds `portalIdentityPrincipalId` on the SIBLING ../entra stack, whose second pass
 // grants this identity GroupMember.Read.All on Microsoft Graph (ADR-0040 decision 4).
 // The two stacks deploy in the order entra -> azure -> entra: this output is the only

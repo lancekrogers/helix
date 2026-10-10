@@ -6,12 +6,21 @@ import { pathToFileURL } from "node:url";
 export type Outcome = "blocked" | "reachable" | "unresolved" | "error";
 export type Expectation = Outcome | "informational";
 export type NsgMode = "off" | "deny-list-only" | "enforce";
+export type PeAddressesMode = "pinned" | "dynamic";
+
+const PE_IP_ENV_KEYS = [
+  "PROBE_KV_PLATFORM_IP",
+  "PROBE_BLOB_PE_IP",
+  "PROBE_KV_CONNECTIONS_IP",
+  "PROBE_KV_DELEGATED_IP",
+] as const;
 
 export interface ProbeConfig {
   nsg: NsgMode;
   firewall: boolean;
   fqdnAllowlist: boolean;
   fqdnProtocol: "tls" | "tcp";
+  peAddresses: PeAddressesMode;
   appsIp: string;
   kvPlatformIp: string;
   blobIp: string;
@@ -86,6 +95,19 @@ function parseHost(env: Record<string, string | undefined>, key: string): string
   return value;
 }
 
+function parsePeAddressesMode(env: Record<string, string | undefined>): PeAddressesMode {
+  const value = requireEnv(env, "PROBE_PE_ADDRESSES");
+  if (value === "pinned" || value === "dynamic") {
+    return value;
+  }
+  throw new Error('PROBE_PE_ADDRESSES must be "pinned" or "dynamic"');
+}
+
+function peIpEnvSet(env: Record<string, string | undefined>, key: string): boolean {
+  const value = env[key];
+  return value !== undefined && value !== "";
+}
+
 export function parseConfig(env: Record<string, string | undefined>): ProbeConfig {
   const nsgRaw = requireEnv(env, "PROBE_EXPECT_NSG");
   if (!NSG_VALUES.includes(nsgRaw as NsgMode)) {
@@ -111,16 +133,35 @@ export function parseConfig(env: Record<string, string | undefined>): ProbeConfi
     throw new Error("PROBE_TIMEOUT_MS must be a positive integer");
   }
 
+  const peAddresses = parsePeAddressesMode(env);
+  const anyPeIpSet = PE_IP_ENV_KEYS.some((key) => peIpEnvSet(env, key));
+
+  let kvPlatformIp = "";
+  let blobIp = "";
+  let kvConnectionsIp = "";
+  let kvDelegatedIp = "";
+  if (peAddresses === "pinned") {
+    kvPlatformIp = parseIp(env, "PROBE_KV_PLATFORM_IP");
+    blobIp = parseIp(env, "PROBE_BLOB_PE_IP");
+    kvConnectionsIp = parseIp(env, "PROBE_KV_CONNECTIONS_IP");
+    kvDelegatedIp = parseIp(env, "PROBE_KV_DELEGATED_IP");
+  } else if (anyPeIpSet) {
+    throw new Error(
+      "PROBE_PE_ADDRESSES=dynamic requires PROBE_KV_PLATFORM_IP, PROBE_BLOB_PE_IP, PROBE_KV_CONNECTIONS_IP, and PROBE_KV_DELEGATED_IP to be unset or empty",
+    );
+  }
+
   const cfg: ProbeConfig = {
     nsg,
     firewall,
     fqdnAllowlist,
     fqdnProtocol,
+    peAddresses,
     appsIp: parseIp(env, "PROBE_APPS_IP"),
-    kvPlatformIp: parseIp(env, "PROBE_KV_PLATFORM_IP"),
-    blobIp: parseIp(env, "PROBE_BLOB_PE_IP"),
-    kvConnectionsIp: parseIp(env, "PROBE_KV_CONNECTIONS_IP"),
-    kvDelegatedIp: parseIp(env, "PROBE_KV_DELEGATED_IP"),
+    kvPlatformIp,
+    blobIp,
+    kvConnectionsIp,
+    kvDelegatedIp,
     postgresHost: parseHost(env, "PROBE_POSTGRES_HOST"),
     allowedHost: parseHost(env, "PROBE_ALLOWED_HOST"),
     canaryHost: parseHost(env, "PROBE_CANARY_HOST"),
@@ -144,7 +185,7 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
   const canaryExpect: Expectation = cfg.fqdnAllowlist ? "blocked" : "reachable";
   const fqdnKind: "tcp" | "tls" = cfg.fqdnProtocol === "tls" ? "tls" : "tcp";
 
-  return [
+  const checks: CheckSpec[] = [
     { id: "wire-server-80", kind: "tcp", host: "168.63.129.16", port: 80, expect: hostNodeExpect },
     {
       id: "wire-server-32526",
@@ -155,22 +196,30 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
     },
     { id: "imds-80", kind: "tcp", host: "169.254.169.254", port: 80, expect: hostNodeExpect },
     { id: "apps-env-443", kind: "tcp", host: cfg.appsIp, port: 443, expect: "informational" },
-    { id: "kv-platform-443", kind: "tcp", host: cfg.kvPlatformIp, port: 443, expect: peExpect },
-    { id: "blob-pe-443", kind: "tcp", host: cfg.blobIp, port: 443, expect: peExpect },
-    {
-      id: "kv-connections-443",
-      kind: "tcp",
-      host: cfg.kvConnectionsIp,
-      port: 443,
-      expect: "reachable",
-    },
-    {
-      id: "kv-delegated-443",
-      kind: "tcp",
-      host: cfg.kvDelegatedIp,
-      port: 443,
-      expect: "reachable",
-    },
+  ];
+
+  if (cfg.peAddresses === "pinned") {
+    checks.push(
+      { id: "kv-platform-443", kind: "tcp", host: cfg.kvPlatformIp, port: 443, expect: peExpect },
+      { id: "blob-pe-443", kind: "tcp", host: cfg.blobIp, port: 443, expect: peExpect },
+      {
+        id: "kv-connections-443",
+        kind: "tcp",
+        host: cfg.kvConnectionsIp,
+        port: 443,
+        expect: "reachable",
+      },
+      {
+        id: "kv-delegated-443",
+        kind: "tcp",
+        host: cfg.kvDelegatedIp,
+        port: 443,
+        expect: "reachable",
+      },
+    );
+  }
+
+  checks.push(
     { id: "postgres-5432", kind: "tcp", host: cfg.postgresHost, port: 5432, expect: "reachable" },
     {
       id: "public-allowed-443",
@@ -208,7 +257,9 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
       expect: portExpect,
     },
     { id: "dns-resolve", kind: "dns", host: cfg.allowedHost, port: 0, expect: "reachable" },
-  ];
+  );
+
+  return checks;
 }
 
 export function classify(error: NodeJS.ErrnoException | undefined, timedOut: boolean): Outcome {
@@ -421,6 +472,7 @@ function formatSummaryLine(cfg: ProbeConfig, results: CheckResult[]): string {
     nsg: cfg.nsg,
     firewall: cfg.firewall,
     fqdnAllowlist: cfg.fqdnAllowlist,
+    peAddresses: cfg.peAddresses,
   });
 }
 

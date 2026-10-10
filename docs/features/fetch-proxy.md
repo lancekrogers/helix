@@ -417,6 +417,29 @@ build well:
   control's label/state and announce it (a polite live region, or focus the
   control), rather than replacing the page or stealing focus with a modal.
 
+## Network probe (`pnpm probe`)
+
+The egress image ships a standalone probe (`apps/egress/src/netprobe.ts`) used by the
+Azure `<prefix>-netprobe` job and by local net simulation. It reads only `PROBE_*`
+environment variables (no secrets):
+
+| Variable | Meaning |
+| --- | --- |
+| `PROBE_PE_ADDRESSES` | `pinned` — require the four `PROBE_*_IP` values and run private-endpoint checks; `dynamic` — those four must be unset or empty and endpoint checks are skipped |
+| `PROBE_EXPECT_NSG` | `off`, `deny-list-only`, or `enforce` |
+| `PROBE_EXPECT_FIREWALL` | `true` or `false` |
+| `PROBE_EXPECT_FQDN_ALLOWLIST` | `true` or `false` (requires firewall true) |
+| `PROBE_APPS_IP` | Apps environment static IP (informational check) |
+| `PROBE_KV_PLATFORM_IP`, `PROBE_BLOB_PE_IP`, `PROBE_KV_CONNECTIONS_IP`, `PROBE_KV_DELEGATED_IP` | Private-endpoint IPs when `PROBE_PE_ADDRESSES=pinned` |
+| `PROBE_POSTGRES_HOST` | Postgres FQDN (positive control) |
+| `PROBE_ALLOWED_HOST` | Public host expected reachable on 443 |
+| `PROBE_CANARY_HOST` | Public host expected blocked when allow-list mode is on |
+| `PROBE_FQDN_PROTOCOL` | Optional `tls` (default) or `tcp` for public host checks |
+| `PROBE_TIMEOUT_MS` | Optional connect timeout in ms (default 5000) |
+
+Stdout uses `egress.netprobe_check` per check and `egress.netprobe_result` for the
+summary; see `docs/design/logging.md`.
+
 ## Key files
 
 - `apps/edge/src/gateway/fetch.ts` — `makeFetchHandler`, the policy plane.

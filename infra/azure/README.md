@@ -27,6 +27,20 @@ passes) loaded from `nsg-egress-rules.json`. The Azure Firewall remains the opti
 costly tier (`deployFirewall`) for FQDN allow-listing on internet-bound traffic; the NSG
 works with the firewall off, which is the posture of the live installs.
 
+**Network probe.** When `deployNetprobe` is true (default), a scheduled Container Apps
+Job (`<prefix>-netprobe`) in the **egress** environment runs the egress image with
+`pnpm --filter @azx-pbc/egress probe`. It dials forbidden and required destinations
+from `snet-egress` and logs one JSON line per check plus an `egress.netprobe_result`
+summary to the egress Log Analytics workspace. Read the template's declared posture
+from the `netControls` deployment output (firewall, FQDN mode, NSG mode, allow-list,
+pinned private-endpoint addresses when enabled, probe expectations) next to the last
+probe result — `just infra net-verify` starts the job on demand and prints the
+outcome. Wire-server (`168.63.129.16`) and IMDS checks are informational only; the
+NSG does not block those host-node paths the way the rule table suggests. Alerts in
+`alerts-netprobe.bicep` fire on a failed run or on missing recent success; whether
+the KQL matches real job console logs is unverified in Azure until an operator runs
+the job.
+
 ### The security shape, in one diagram
 
 ```
@@ -556,6 +570,9 @@ modules/
   foundry.bicep       Azure AI Foundry account + model deployments (invoked by foundry-rg.bicep)
   aca-environment.bicep   reusable managed environment (called twice)
   containerapp.bicep  reusable container app (edge/portal/egress + opt-in dev-gateway)
+  migrate-job.bicep   manual Prisma migration job (apps env)
+  netprobe-job.bicep  scheduled network posture probe (egress env)
+  alerts-netprobe.bicep  log alerts on probe failure / no recent success (egress workspace)
   dns.bicep           public DNS zone + records (incl. opt-in dev-api)
 ```
 

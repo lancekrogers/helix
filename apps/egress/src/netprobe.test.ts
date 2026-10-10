@@ -19,6 +19,7 @@ function sampleConfig(overrides: Partial<ProbeConfig> = {}): ProbeConfig {
     firewall: true,
     fqdnAllowlist: false,
     fqdnProtocol: "tls",
+    peAddresses: "pinned",
     appsIp: "10.0.2.10",
     kvPlatformIp: "10.0.7.4",
     blobIp: "10.0.7.5",
@@ -34,6 +35,7 @@ function sampleConfig(overrides: Partial<ProbeConfig> = {}): ProbeConfig {
 
 function sampleEnv(overrides: Record<string, string> = {}): Record<string, string> {
   return {
+    PROBE_PE_ADDRESSES: "pinned",
     PROBE_EXPECT_NSG: "enforce",
     PROBE_EXPECT_FIREWALL: "true",
     PROBE_EXPECT_FQDN_ALLOWLIST: "false",
@@ -203,15 +205,18 @@ describe("probeTls", () => {
 });
 
 describe("buildChecks", () => {
-  const checkIds = [
-    "wire-server-80",
-    "wire-server-32526",
-    "imds-80",
-    "apps-env-443",
+  const peCheckIds = [
     "kv-platform-443",
     "blob-pe-443",
     "kv-connections-443",
     "kv-delegated-443",
+  ] as const;
+
+  const sharedCheckIds = [
+    "wire-server-80",
+    "wire-server-32526",
+    "imds-80",
+    "apps-env-443",
     "postgres-5432",
     "public-allowed-443",
     "public-canary-443",
@@ -221,7 +226,9 @@ describe("buildChecks", () => {
     "dns-resolve",
   ] as const;
 
-  function expectFor(id: (typeof checkIds)[number], cfg: ProbeConfig): string {
+  const pinnedCheckIds = [...sharedCheckIds.slice(0, 4), ...peCheckIds, ...sharedCheckIds.slice(4)];
+
+  function expectFor(id: string, cfg: ProbeConfig): string {
     const denyOnly = cfg.nsg !== "off";
     const enforce = cfg.nsg === "enforce";
     switch (id) {
@@ -257,38 +264,94 @@ describe("buildChecks", () => {
     { nsg: "deny-list-only" as const, fqdnAllowlist: true },
     { nsg: "enforce" as const, fqdnAllowlist: false },
     { nsg: "enforce" as const, fqdnAllowlist: true },
-  ])("expectations for nsg=$nsg fqdnAllowlist=$fqdnAllowlist", ({ nsg, fqdnAllowlist }) => {
-    const cfg = sampleConfig({ nsg, fqdnAllowlist, firewall: fqdnAllowlist || true });
+  ])("pinned expectations for nsg=$nsg fqdnAllowlist=$fqdnAllowlist", ({ nsg, fqdnAllowlist }) => {
+    const cfg = sampleConfig({
+      nsg,
+      fqdnAllowlist,
+      firewall: fqdnAllowlist || true,
+      peAddresses: "pinned",
+    });
     const specs = buildChecks(cfg);
-    expect(specs.map((s) => s.id)).toEqual([...checkIds]);
-    for (const id of checkIds) {
+    expect(specs).toHaveLength(15);
+    expect(specs.map((s) => s.id)).toEqual(pinnedCheckIds);
+    for (const id of pinnedCheckIds) {
       const spec = specs.find((s) => s.id === id) as CheckSpec;
       expect(spec.expect).toBe(expectFor(id, cfg));
     }
   });
+
+  it.each([
+    { nsg: "off" as const, fqdnAllowlist: false },
+    { nsg: "enforce" as const, fqdnAllowlist: true },
+  ])(
+    "dynamic has 11 checks for nsg=$nsg fqdnAllowlist=$fqdnAllowlist",
+    ({ nsg, fqdnAllowlist }) => {
+      const cfg = sampleConfig({
+        nsg,
+        fqdnAllowlist,
+        firewall: fqdnAllowlist || true,
+        peAddresses: "dynamic",
+      });
+      const specs = buildChecks(cfg);
+      expect(specs).toHaveLength(11);
+      expect(specs.map((s) => s.id)).toEqual([...sharedCheckIds]);
+      for (const id of sharedCheckIds) {
+        const spec = specs.find((s) => s.id === id) as CheckSpec;
+        expect(spec.expect).toBe(expectFor(id, cfg));
+      }
+      expect(specs.some((s) => (peCheckIds as readonly string[]).includes(s.id))).toBe(false);
+    },
+  );
 });
 
 describe("parseConfig", () => {
-  it("parses a complete environment", () => {
+  it("parses a complete pinned environment", () => {
     const cfg = parseConfig(sampleEnv());
     expect(cfg.nsg).toBe("enforce");
     expect(cfg.timeoutMs).toBe(5000);
     expect(cfg.fqdnProtocol).toBe("tls");
+    expect(cfg.peAddresses).toBe("pinned");
+    expect(cfg.kvPlatformIp).toBe("10.0.7.4");
+  });
+
+  it("parses dynamic mode without private-endpoint IPs", () => {
+    const env = sampleEnv({ PROBE_PE_ADDRESSES: "dynamic" });
+    delete env.PROBE_KV_PLATFORM_IP;
+    delete env.PROBE_BLOB_PE_IP;
+    delete env.PROBE_KV_CONNECTIONS_IP;
+    delete env.PROBE_KV_DELEGATED_IP;
+    const cfg = parseConfig(env);
+    expect(cfg.peAddresses).toBe("dynamic");
+    expect(cfg.kvPlatformIp).toBe("");
+  });
+
+  it("rejects dynamic mode when a private-endpoint IP is set", () => {
+    expect(() =>
+      parseConfig(sampleEnv({ PROBE_PE_ADDRESSES: "dynamic", PROBE_KV_PLATFORM_IP: "10.0.7.4" })),
+    ).toThrow("PROBE_PE_ADDRESSES=dynamic");
   });
 
   it.each([
+    "PROBE_PE_ADDRESSES",
     "PROBE_EXPECT_NSG",
     "PROBE_EXPECT_FIREWALL",
     "PROBE_EXPECT_FQDN_ALLOWLIST",
     "PROBE_APPS_IP",
-    "PROBE_KV_PLATFORM_IP",
-    "PROBE_BLOB_PE_IP",
-    "PROBE_KV_CONNECTIONS_IP",
-    "PROBE_KV_DELEGATED_IP",
     "PROBE_POSTGRES_HOST",
     "PROBE_ALLOWED_HOST",
     "PROBE_CANARY_HOST",
   ])("throws when %s is missing", (key) => {
+    const env = sampleEnv();
+    delete env[key];
+    expect(() => parseConfig(env)).toThrow(key);
+  });
+
+  it.each([
+    "PROBE_KV_PLATFORM_IP",
+    "PROBE_BLOB_PE_IP",
+    "PROBE_KV_CONNECTIONS_IP",
+    "PROBE_KV_DELEGATED_IP",
+  ])("throws when %s is missing in pinned mode", (key) => {
     const env = sampleEnv();
     delete env[key];
     expect(() => parseConfig(env)).toThrow(key);
