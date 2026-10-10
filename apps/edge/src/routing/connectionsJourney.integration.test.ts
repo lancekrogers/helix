@@ -738,6 +738,7 @@ beforeAll(async () => {
       limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000 },
       managedIdentityConnections: [],
       allowPrivate: true,
+      extraBlockedCidrs: [],
       allowInsecureConnection: true,
     },
     resolver: null,

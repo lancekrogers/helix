@@ -20,6 +20,7 @@ import type { EgressConfig } from "./config.js";
 import { deriveInstructionKey } from "./instruction.js";
 import type { ResolvedConnection, SecretResolver } from "./secrets.js";
 import { InMemoryBurnStore, type InstructionBurnStore } from "./burn.js";
+import { parseCidrList } from "./ssrf.js";
 
 /**
  * The adversarial pass the fetch-proxy demands (fetch-proxy design §6): SSRF to
@@ -102,10 +103,12 @@ function makeApp(
   allowPrivate: boolean,
   allowInsecureConnection = true,
   burnStore: InstructionBurnStore | null = null,
+  extraBlockedCidrs: EgressConfig["extraBlockedCidrs"] = [] as EgressConfig["extraBlockedCidrs"],
 ) {
   const config = {
     limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
     allowPrivate,
+    extraBlockedCidrs,
     // Loopback echo upstreams are http, so the cleartext-injection seam is open
     // for most tests; the issue #11 suite closes it to assert the prod guard.
     allowInsecureConnection,
@@ -165,6 +168,28 @@ describe("egress SSRF hardening", () => {
       await app.close();
     });
   }
+
+  it("refuses a target in EGRESS_EXTRA_BLOCKED_CIDRS", async () => {
+    const app = makeApp(
+      false,
+      true,
+      null,
+      parseCidrList("198.19.0.0/16", "EGRESS_EXTRA_BLOCKED_CIDRS"),
+    );
+    const target = "http://198.19.0.1/";
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(new URL(target).origin),
+        [TARGET_HEADER]: target,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe("blocked");
+    await app.close();
+  });
 
   it("returns a blocked-address message for the Azure platform IP (no dial)", async () => {
     const app = makeApp(false);
@@ -536,6 +561,7 @@ describe("egress body-size cap (issue #8)", () => {
     const config = {
       limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;
     // Body-size cap suite: replay protection is orthogonal, so no burn store.
     app = buildApp({ config, resolver, instructionKey: key, burnStore: null });
@@ -643,6 +669,7 @@ describe("egress body-size cap (issue #8)", () => {
     const config = {
       limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;
     const capApp = buildApp(
       { config, resolver, instructionKey: key, burnStore: null },
@@ -693,6 +720,7 @@ describe("egress body-size cap (issue #8)", () => {
     const config = {
       limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;
     const capApp = buildApp(
       { config, resolver, instructionKey: key, burnStore: null },

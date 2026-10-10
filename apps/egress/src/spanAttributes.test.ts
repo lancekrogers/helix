@@ -225,6 +225,7 @@ describe("a recorded egress span", () => {
     const config = {
       limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
       allowInsecureConnection: true,
     } as EgressConfig;
     const app = buildApp({ config, resolver: null, instructionKey, burnStore: null });

@@ -144,6 +144,7 @@ function makeApp(opts: AppOpts = {}) {
   const config = {
     limits: { maxBodyBytes: 1024 * 1024, timeoutMs: opts.timeoutMs ?? 5_000 },
     allowPrivate: opts.allowPrivate ?? true,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     allowInsecureConnection: opts.allowInsecureConnection ?? true,
   } as EgressConfig;
   return buildApp(
@@ -533,6 +534,7 @@ describe("POST /exchange — authorization before anything else", () => {
     const config = {
       limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
       allowInsecureConnection: true,
     } as EgressConfig;
     const app = buildApp({
@@ -682,7 +684,7 @@ describe("POST /exchange — the pinned transport", () => {
   });
 
   it("the SSRF suites' class, extended to the adapter: blocked under prod flags", async () => {
-    const prodFetch = makePinnedFetch(makePinnedDispatcher(false, 1_000));
+    const prodFetch = makePinnedFetch(makePinnedDispatcher(false, 1_000, []));
     // undici's fetch wraps the connector's refusal as the `cause` of a
     // "fetch failed" TypeError — the same SsrfBlockedError the proxy's
     // `request()` path propagates verbatim.
@@ -724,7 +726,7 @@ describe("POST /exchange — the pinned transport", () => {
   });
 
   it("the SSRF suites' class, extended to the adapter: the dev seams open the same dial", async () => {
-    const devFetch = makePinnedFetch(makePinnedDispatcher(true, 1_000));
+    const devFetch = makePinnedFetch(makePinnedDispatcher(true, 1_000, []));
     // The same loopback target: the connection is now ATTEMPTED (nothing
     // listens on :59999, so the dial fails with a connect error, not an SSRF
     // refusal) — the control, not the address, is what flipped.

@@ -203,6 +203,7 @@ function makeApp(providers: ReturnType<typeof cacheFor>, opts: { wired?: boolean
   const config = {
     limits: { maxBodyBytes: 1024 * 1024, timeoutMs: VENDOR_TIMEOUT_MS },
     allowPrivate: true,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     // The fixture vendor is http; the cleartext seam is a dev/test one.
     allowInsecureConnection: true,
   } as EgressConfig;

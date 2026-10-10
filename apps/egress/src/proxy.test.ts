@@ -105,6 +105,7 @@ function makeApp(allowPrivate: boolean, resolver: SecretResolver | null = fakeRe
   const config = {
     limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
     allowPrivate,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     // Loopback echo upstreams are http; open the cleartext-injection seam so
     // these functional tests exercise injection without TLS (the prod guard and
     // its refusal path are covered in adversarial.test.ts — issue #11).
@@ -712,6 +713,7 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
     const config = {
       limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
       allowInsecureConnection: true,
     } as EgressConfig;
     const app = buildApp(

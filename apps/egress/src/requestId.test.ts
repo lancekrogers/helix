@@ -19,6 +19,7 @@ function buildEgress() {
   const config = {
     limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
     allowPrivate: false,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     allowInsecureConnection: false,
   } as EgressConfig;
   return buildApp({

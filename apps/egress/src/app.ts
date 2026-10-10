@@ -133,6 +133,7 @@ export function buildApp(
     burnStore: deps.burnStore,
     limits: deps.config.limits,
     allowPrivate: deps.config.allowPrivate,
+    extraBlockedCidrs: deps.config.extraBlockedCidrs,
     allowInsecureConnection: deps.config.allowInsecureConnection,
     // The delegated resolution, built against the proxy's own dispatcher so
     // the renewer's vendor round-trips ride the same pinned transport as the

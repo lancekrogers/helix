@@ -221,6 +221,7 @@ parameter:
 | `EDGE_FETCH_MAX_BODY_BYTES` | edge, dev-gateway | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
 | `EDGE_FETCH_MAX_APP_IN_FLIGHT` | edge, dev-gateway | `fetchMaxAppInFlight` | `0` (off). Lease TTL is ten minutes; a call that outlives it stops counting |
 | `EGRESS_MAX_BODY_BYTES` | egress | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
+| `EGRESS_EXTRA_BLOCKED_CIDRS` | egress | unset until the template wires it | built-in SSRF ranges only |
 
 LLM concurrency and the call deadline:
 

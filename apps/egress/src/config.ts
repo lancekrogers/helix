@@ -6,6 +6,7 @@
  * SSRF/limit knobs.
  */
 import { DEFAULT_STATEMENT_TIMEOUT_MS } from "./pool.js";
+import { parseCidrList, type ParsedCidr } from "./ssrf.js";
 /**
  * One `EGRESS_MANAGED_IDENTITY_CONNECTIONS` entry. `connection` is the
  * operator-chosen platform connection name (kebab-case, like a secret name);
@@ -89,6 +90,11 @@ export interface EgressConfig {
   managedIdentityResource?: string;
   /** Permit private/loopback targets — dev/test only; refused in production. */
   allowPrivate: boolean;
+  /**
+   * Extra CIDR ranges the SSRF filter refuses, from `EGRESS_EXTRA_BLOCKED_CIDRS`.
+   * Empty means built-in ranges only. Bypassed by `allowPrivate` like the built-in list.
+   */
+  extraBlockedCidrs: ParsedCidr[];
   /**
    * Permit injecting a connection secret into a cleartext `http://` target —
    * dev/test only (loopback echo upstreams); refused in production. Egress is the
@@ -215,6 +221,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EgressConfig {
       if (on) throw new Error(`${key} is a dev seam and is refused in production`);
     }
   }
+  const extraBlockedCidrs = parseCidrList(
+    env.EGRESS_EXTRA_BLOCKED_CIDRS,
+    "EGRESS_EXTRA_BLOCKED_CIDRS",
+  );
 
   return {
     port: Number(env.EGRESS_PORT ?? env.PORT ?? 8081),
@@ -247,6 +257,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EgressConfig {
     managedIdentityConnections: parseManagedIdentityConnections(env),
     managedIdentityResource: parseManagedIdentityResource(env),
     allowPrivate,
+    extraBlockedCidrs,
     allowInsecureConnection,
   };
 }

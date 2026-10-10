@@ -504,6 +504,7 @@ export class LaneWorld {
         limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 10_000 },
         managedIdentityConnections: [],
         allowPrivate: true,
+        extraBlockedCidrs: [],
         allowInsecureConnection: true,
       },
       resolver: null,

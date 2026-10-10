@@ -184,7 +184,7 @@ function makeRenewer(
       providers: cacheOf(provider),
       credentialStore,
       delegatedStore: delegated,
-      dispatcher: makePinnedDispatcher(true, VENDOR_TIMEOUT_MS),
+      dispatcher: makePinnedDispatcher(true, VENDOR_TIMEOUT_MS, []),
       timeoutMs: VENDOR_TIMEOUT_MS,
       allowInsecureConnection: true,
       lockAcquireTimeoutMs: opts.lockAcquireTimeoutMs,

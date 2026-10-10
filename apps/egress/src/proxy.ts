@@ -45,7 +45,7 @@ import {
 } from "@azx-pbc/shared/telemetry";
 import { instruments, tracer } from "./telemetry.js";
 import { egressSpanAttributes } from "./spanAttributes.js";
-import { SsrfBlockedError, makeValidatingConnector } from "./ssrf.js";
+import { SsrfBlockedError, makeValidatingConnector, type ParsedCidr } from "./ssrf.js";
 
 /**
  * `POST /proxy` — the one route that touches plaintext secrets and the public
@@ -64,6 +64,8 @@ export interface ProxyDeps {
   limits: { maxBodyBytes: number; timeoutMs: number };
   /** Dev/test seam — permit private/loopback targets (false in prod & adversarial tests). */
   allowPrivate: boolean;
+  /** Deployment-supplied SSRF block ranges (from `EGRESS_EXTRA_BLOCKED_CIDRS`). */
+  extraBlockedCidrs: readonly ParsedCidr[];
   /** Dev/test seam — permit secret injection into a cleartext http target (false in prod). */
   allowInsecureConnection: boolean;
   /**
@@ -269,7 +271,11 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
   // Agent returns the 3xx verbatim (belt-and-suspenders, `Location` is also
   // stripped by the response blocklist so the browser can't chase it — issue #10).
   const dispatcher = new Agent({
-    connect: makeValidatingConnector(deps.allowPrivate, deps.limits.timeoutMs),
+    connect: makeValidatingConnector(
+      deps.allowPrivate,
+      deps.limits.timeoutMs,
+      deps.extraBlockedCidrs,
+    ),
     headersTimeout: deps.limits.timeoutMs,
     bodyTimeout: deps.limits.timeoutMs,
   });

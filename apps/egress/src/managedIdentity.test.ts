@@ -176,6 +176,7 @@ function makeApp(resolver: SecretResolver) {
   const config = {
     limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
     allowPrivate: true, // loopback echo upstream
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     allowInsecureConnection: true, // loopback is http; the prod guard is pinned in adversarial.test.ts
   } as EgressConfig;
   return buildApp({ config, resolver, instructionKey: key, burnStore: null });

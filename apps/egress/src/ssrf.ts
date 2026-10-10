@@ -37,6 +37,11 @@ function inV4Cidr(ipInt: number, base: string, bits: number): boolean {
   return (ipInt & mask) === (baseInt & mask);
 }
 
+function inV4Int(ipInt: number, c: { family: 4; base: number; bits: number }): boolean {
+  const mask = c.bits === 0 ? 0 : (0xffffffff << (32 - c.bits)) >>> 0;
+  return (ipInt & mask) === (c.base & mask);
+}
+
 /** IPv4 ranges that must never be reachable through the proxy. */
 const V4_BLOCKED: [string, number][] = [
   ["0.0.0.0", 8], // "this host"
@@ -58,8 +63,9 @@ const V4_BLOCKED: [string, number][] = [
 ];
 
 /** True if a 32-bit IPv4 integer falls in any blocked v4 range. */
-function isBlockedV4Int(ipInt: number): boolean {
-  return V4_BLOCKED.some(([base, bits]) => inV4Cidr(ipInt, base, bits));
+function isBlockedV4Int(ipInt: number, extraBlocked: readonly ParsedCidr[]): boolean {
+  if (V4_BLOCKED.some(([base, bits]) => inV4Cidr(ipInt, base, bits))) return true;
+  return extraBlocked.some((c) => c.family === 4 && inV4Int(ipInt, c));
 }
 
 const MAX128 = (1n << 128n) - 1n;
@@ -111,6 +117,43 @@ function inV6Cidr(val: bigint, base: bigint, bits: number): boolean {
   return (val & mask) === (base & mask);
 }
 
+/** A CIDR from `EGRESS_EXTRA_BLOCKED_CIDRS`, parsed once at boot. */
+export type ParsedCidr =
+  | { family: 4; base: number; bits: number }
+  | { family: 6; base: bigint; bits: number };
+
+export function parseCidr(text: string): ParsedCidr {
+  const slash = text.indexOf("/");
+  if (slash === -1) throw new Error(`"${text}" is not a CIDR (want address/prefix-length)`);
+  const addr = text.slice(0, slash);
+  const lenText = text.slice(slash + 1);
+  if (!/^\d{1,3}$/.test(lenText)) throw new Error(`"${text}" has a bad prefix length`);
+  const bits = Number(lenText);
+  if (addr.includes("%")) throw new Error(`"${text}" must not carry a zone id`);
+  const family = isIP(addr);
+  if (family === 0) throw new Error(`"${text}" does not start with an IP address`);
+  if (bits === 0) throw new Error(`"${text}" is a /0 and would block every address`);
+  if (bits > (family === 4 ? 32 : 128))
+    throw new Error(`"${text}" has a prefix length out of range`);
+  return family === 4
+    ? { family: 4, base: ipv4ToInt(addr)!, bits }
+    : { family: 6, base: ipv6ToBigInt(addr), bits };
+}
+
+/** Empty or whitespace-only means "none". Any bad element throws, naming `name`. */
+export function parseCidrList(raw: string | undefined, name: string): ParsedCidr[] {
+  if (raw === undefined || raw.trim() === "") return [];
+  return raw.split(",").map((part) => {
+    const entry = part.trim();
+    if (entry === "") throw new Error(`${name} has an empty element (check for a stray comma)`);
+    try {
+      return parseCidr(entry);
+    } catch (err) {
+      throw new Error(`${name}: ${(err as Error).message}`, { cause: err });
+    }
+  });
+}
+
 /**
  * IPv6 ranges (IANA IPv6 Special-Purpose Registry) that must never be reachable.
  * Embedded-IPv4 forms (`::ffff:/96` mapped, `64:ff9b::/96` NAT64, `::ffff:0:0:0/96`
@@ -145,17 +188,20 @@ const V6_NAT64 = ipv6ToBigInt("64:ff9b::"); // 64:ff9b::/96
 const V6_TRANSLATED = ipv6ToBigInt("::ffff:0:0:0"); // ::ffff:0:0:0/96 IPv4-translated (SIIT)
 
 /** True if the resolved address is one we must never connect to. */
-export function isBlockedAddress(ip: string): boolean {
+export function isBlockedAddress(ip: string, extraBlocked: readonly ParsedCidr[]): boolean {
   const v4 = ipv4ToInt(ip);
-  if (v4 !== null) return isBlockedV4Int(v4);
+  if (v4 !== null) return isBlockedV4Int(v4, extraBlocked);
 
   if (isIP(ip) === 6) {
     const val = ipv6ToBigInt(ip);
+    if (extraBlocked.some((c) => c.family === 6 && inV6Cidr(val, c.base, c.bits))) return true;
     // Extract the embedded IPv4 and re-check it, regardless of hex/dotted notation.
-    if (inV6Cidr(val, V6_MAPPED, 96)) return isBlockedV4Int(Number(val & 0xffffffffn)); // ::ffff:a.b.c.d
-    if (inV6Cidr(val, V6_NAT64, 96)) return isBlockedV4Int(Number(val & 0xffffffffn)); // 64:ff9b::a.b.c.d
-    if (inV6Cidr(val, V6_TRANSLATED, 96)) return isBlockedV4Int(Number(val & 0xffffffffn)); // ::ffff:0:a.b.c.d
-    if (val >> 32n === 0n) return isBlockedV4Int(Number(val)); // ::a.b.c.d compat (covers ::, ::1)
+    if (inV6Cidr(val, V6_MAPPED, 96))
+      return isBlockedV4Int(Number(val & 0xffffffffn), extraBlocked); // ::ffff:a.b.c.d
+    if (inV6Cidr(val, V6_NAT64, 96)) return isBlockedV4Int(Number(val & 0xffffffffn), extraBlocked); // 64:ff9b::a.b.c.d
+    if (inV6Cidr(val, V6_TRANSLATED, 96))
+      return isBlockedV4Int(Number(val & 0xffffffffn), extraBlocked); // ::ffff:0:a.b.c.d
+    if (val >> 32n === 0n) return isBlockedV4Int(Number(val), extraBlocked); // ::a.b.c.d compat (covers ::, ::1)
     return V6_BLOCKED_NUM.some(([base, bits]) => inV6Cidr(val, base, bits));
   }
   // Not a recognizable IP literal — refuse rather than guess.
@@ -178,13 +224,14 @@ export interface ValidatedTarget {
 export async function resolveAndValidate(
   hostname: string,
   allowPrivate: boolean,
+  extraBlocked: readonly ParsedCidr[],
 ): Promise<ValidatedTarget[]> {
   // URL.hostname keeps IPv6 brackets ("[::1]"); strip them for isIP/lookup.
   const host =
     hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
   const literal = isIP(host);
   if (literal) {
-    if (!allowPrivate && isBlockedAddress(host)) {
+    if (!allowPrivate && isBlockedAddress(host, extraBlocked)) {
       throw new SsrfBlockedError(`${host} is a blocked address`);
     }
     return [{ address: host, family: literal === 6 ? 6 : 4 }];
@@ -194,7 +241,7 @@ export async function resolveAndValidate(
   if (addrs.length === 0) throw new SsrfBlockedError(`${host} did not resolve`);
   if (!allowPrivate) {
     for (const a of addrs) {
-      if (isBlockedAddress(a.address)) {
+      if (isBlockedAddress(a.address, extraBlocked)) {
         throw new SsrfBlockedError(`${hostname} resolves to blocked ${a.address}`);
       }
     }
@@ -228,10 +275,11 @@ export async function resolveAndValidate(
 export function makeValidatingConnector(
   allowPrivate: boolean,
   timeoutMs: number,
+  extraBlocked: readonly ParsedCidr[],
 ): buildConnector.connector {
   const base = buildConnector({ timeout: timeoutMs });
   return function connect(opts, callback): void {
-    resolveAndValidate(opts.hostname, allowPrivate).then(
+    resolveAndValidate(opts.hostname, allowPrivate, extraBlocked).then(
       (targets) => {
         // Dial the validated addresses in resolver order; the first that
         // CONNECTS wins. A host legitimately publishes ::1 and 127.0.0.1 while
@@ -283,8 +331,12 @@ export function makeValidatingConnector(
 }
 
 /** An {@link Agent} over {@link makeValidatingConnector} — the pinned dispatcher. */
-export function makePinnedDispatcher(allowPrivate: boolean, timeoutMs: number): Agent {
+export function makePinnedDispatcher(
+  allowPrivate: boolean,
+  timeoutMs: number,
+  extraBlocked: readonly ParsedCidr[],
+): Agent {
   return new Agent({
-    connect: makeValidatingConnector(allowPrivate, timeoutMs),
+    connect: makeValidatingConnector(allowPrivate, timeoutMs, extraBlocked),
   });
 }

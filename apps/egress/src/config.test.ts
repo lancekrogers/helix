@@ -172,6 +172,70 @@ describe("loadConfig", () => {
 
   // ADR-0046 — the audience override is a spike/sovereign escape hatch, and
   // it is validated like one: a bare https origin, or boot fails.
+  describe("EGRESS_EXTRA_BLOCKED_CIDRS", () => {
+    it("defaults to no extra ranges when unset or whitespace-only", () => {
+      expect(loadConfig(ENV).extraBlockedCidrs).toEqual([]);
+      expect(loadConfig({ ...ENV, EGRESS_EXTRA_BLOCKED_CIDRS: "  " }).extraBlockedCidrs).toEqual(
+        [],
+      );
+    });
+
+    it("parses comma-separated v4 and v6 CIDRs", () => {
+      const config = loadConfig({
+        ...ENV,
+        EGRESS_EXTRA_BLOCKED_CIDRS: "203.0.113.0/24, 2001:db9::/32",
+      });
+      expect(config.extraBlockedCidrs).toHaveLength(2);
+      expect(config.extraBlockedCidrs[0]).toEqual({
+        family: 4,
+        base: expect.any(Number),
+        bits: 24,
+      });
+      expect(config.extraBlockedCidrs[1]).toEqual({
+        family: 6,
+        base: expect.any(BigInt),
+        bits: 32,
+      });
+    });
+
+    it.each([
+      "10.0.0.0",
+      "10.0.0.0/33",
+      "2001:db9::/129",
+      "nope/8",
+      "10.0.0.0/x",
+      "10.0.0.0/0",
+      "10.0.0.0/8,,10.1.0.0/16",
+      "fe80::1%eth0/64",
+    ])("refuses malformed value %s", (value) => {
+      expect(() => loadConfig({ ...ENV, EGRESS_EXTRA_BLOCKED_CIDRS: value })).toThrow(
+        /EGRESS_EXTRA_BLOCKED_CIDRS/,
+      );
+    });
+
+    it("still refuses EGRESS_ALLOW_PRIVATE in production when extra ranges are set", () => {
+      expect(() =>
+        loadConfig({
+          ...ENV,
+          EGRESS_ALLOW_PRIVATE: "true",
+          EGRESS_EXTRA_BLOCKED_CIDRS: "10.9.0.0/16",
+          NODE_ENV: "production",
+        }),
+      ).toThrow(/EGRESS_ALLOW_PRIVATE.*refused in production/);
+    });
+
+    it("boots in production with a valid extra list when allowPrivate is unset", () => {
+      const config = loadConfig({
+        ...ENV,
+        EGRESS_EXTRA_BLOCKED_CIDRS: "10.9.0.0/16",
+        NODE_ENV: "production",
+      });
+      expect(config.extraBlockedCidrs).toHaveLength(1);
+      expect(config.extraBlockedCidrs[0]?.family).toBe(4);
+      expect(config.extraBlockedCidrs[0]?.bits).toBe(16);
+    });
+  });
+
   describe("EGRESS_MANAGED_IDENTITY_RESOURCE", () => {
     it("defaults to undefined (the Foundry audience constant applies)", () => {
       expect(loadConfig(ENV).managedIdentityResource).toBeUndefined();

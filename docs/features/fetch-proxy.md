@@ -71,7 +71,9 @@ plaintext secrets or the public internet:
 3. **SSRF controls** (`apps/egress/src/ssrf.ts`): resolve every address and
    refuse private / loopback / link-local / `169.254.169.254` (IMDS), the Azure
    platform address `168.63.129.16`, and IPv4 documentation ranges (TEST-NET-1/2/3
-   and the deprecated 6to4 relay anycast); pin the
+   and the deprecated 6to4 relay anycast); an install may add more blocked CIDRs
+   with `EGRESS_EXTRA_BLOCKED_CIDRS` (the dev `EGRESS_ALLOW_PRIVATE` seam bypasses
+   that list too); pin the
    connection to the validated IP (cert/SNI still checked against the hostname),
    defeating DNS rebinding; no redirect-following (undici 7 only follows redirects
    when a `redirect` interceptor is composed onto the dispatcher, and egress
