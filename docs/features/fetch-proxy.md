@@ -425,7 +425,7 @@ build well:
 - `apps/edge/src/serving/connectHelper.ts` — the `window.helix.connect` helper script.
 - `apps/edge/src/routing/consentStart.ts` — the raw consent entry route + its terminal pages.
 - `apps/edge/src/gateway/instruction.ts` — mints the attested instruction.
-- `apps/egress/src/{proxy,ssrf,instruction}.ts` — the mechanism plane: verify, inject, SSRF, stream.
+- `apps/egress/src/{proxy,ssrf,instruction,netprobe}.ts` — the mechanism plane: verify, inject, SSRF, stream, plus the standalone network posture probe entry point.
 - `apps/egress/src/delegated.ts` — delegated-call resolution: the caller's connection, renewal, and the error taxonomy.
 - `packages/shared/src/{instruction,manifest}.ts` — the instruction payload + `capabilities.fetch` schema.
 - `packages/shared/src/consent.ts` — the completion-message and helper-result contracts.

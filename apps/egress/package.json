@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node ../../scripts/free-port.mjs ${EGRESS_PORT:-8081} && tsx watch src/server.ts",
     "start": "node --import tsx src/server.ts",
+    "probe": "node --import tsx src/netprobe.ts",
     "typecheck": "tsc"
   },
   "dependencies": {
