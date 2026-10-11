@@ -10,6 +10,7 @@ const LEGACY_CODES = [
   "too_large",
   "replay",
   "upstream_error",
+  "upstream_timeout",
 ] as const;
 
 const DELEGATED_CODES = [

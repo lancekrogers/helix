@@ -106,7 +106,7 @@ function makeApp(
   extraBlockedCidrs: EgressConfig["extraBlockedCidrs"] = [] as EgressConfig["extraBlockedCidrs"],
 ) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate,
     extraBlockedCidrs,
     // Loopback echo upstreams are http, so the cleartext-injection seam is open
@@ -185,6 +185,32 @@ describe("egress SSRF hardening", () => {
         [TARGET_HEADER]: target,
         [METHOD_HEADER]: "GET",
       },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe("blocked");
+    await app.close();
+  });
+
+  it("applies EGRESS_EXTRA_BLOCKED_CIDRS on the llm dispatcher too", async () => {
+    // The llm capability rides its own dispatcher (longer idle timeout). It must
+    // carry the same validating connector, extra block list included. The range
+    // here is not in the built-in list, so only the extra list can refuse it.
+    const app = makeApp(
+      false,
+      true,
+      null,
+      parseCidrList("203.0.114.0/24", "EGRESS_EXTRA_BLOCKED_CIDRS"),
+    );
+    const target = "http://203.0.114.1/";
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(new URL(target).origin, undefined, "llm"),
+        [TARGET_HEADER]: target,
+        [METHOD_HEADER]: "POST",
+      },
+      payload: "{}",
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().code).toBe("blocked");
@@ -559,7 +585,7 @@ describe("egress body-size cap (issue #8)", () => {
     capOrigin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 
     const config = {
-      limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
       extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;
@@ -667,7 +693,7 @@ describe("egress body-size cap (issue #8)", () => {
       },
     });
     const config = {
-      limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
       extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;
@@ -718,7 +744,7 @@ describe("egress body-size cap (issue #8)", () => {
       },
     });
     const config = {
-      limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
       extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { costUsd, limitsForModel } from "./pricing.js";
+import { costUsd, limitsForModel, outputTokenCapForEstimate } from "./pricing.js";
 import { CUT_CHARGE_BASES } from "./telemetry.js";
 import { BYTES_PER_TOKEN, estimateCutUsage } from "./usageEstimate.js";
 
@@ -79,6 +79,51 @@ describe("estimateCutUsage", () => {
     expect(estimatedOutput).toBeGreaterThan(1);
     expect(result.usage.outputTokens).toBe(estimatedOutput);
     expect(result.basis).toBe("mixed");
+  });
+
+  it("does not clamp a reasoning model's relayed output to a maxTokens below the floor", () => {
+    const model = "gpt-5-nano";
+    const floor = outputTokenCapForEstimate(model, 1);
+    expect(floor).toBeGreaterThan(1);
+    const relayedBytes = 3_000;
+    const result = estimateCutUsage({
+      measured: undefined,
+      requestBytes: 30,
+      relayedBytes,
+      model,
+      maxTokens: 1,
+    });
+    // The vendor request was authorized for the floor, not for maxTokens: 1, so
+    // the estimate follows the bytes that were relayed, up to the floor.
+    expect(result.usage.outputTokens).toBe(Math.ceil(relayedBytes / 3));
+    expect(result.usage.outputTokens).toBeLessThanOrEqual(floor);
+  });
+
+  it("caps a reasoning model's relayed output at the floor when maxTokens is below it", () => {
+    const model = "gpt-5-nano";
+    const floor = outputTokenCapForEstimate(model, 1);
+    const result = estimateCutUsage({
+      measured: undefined,
+      requestBytes: 30,
+      relayedBytes: floor * 3 * 10,
+      model,
+      maxTokens: 1,
+    });
+    expect(result.usage.outputTokens).toBe(floor);
+  });
+
+  it("estimates no output for a reasoning model when nothing was relayed", () => {
+    // A cut with nothing relayed is charged its input estimate only. Billing the
+    // floor here would let an instant hang-up record a full completion budget.
+    const result = estimateCutUsage({
+      measured: undefined,
+      requestBytes: 30,
+      relayedBytes: 0,
+      model: "gpt-5-nano",
+      maxTokens: 1,
+    });
+    expect(result.usage.outputTokens).toBe(0);
+    expect(result.usage.inputTokens).toBeGreaterThan(0);
   });
 
   it("estimates multibyte UTF-8 text from byte length", () => {

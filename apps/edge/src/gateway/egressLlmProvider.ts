@@ -28,11 +28,18 @@ export class EgressLlmProvider implements LlmProvider {
   readonly #vendor: EgressLlmVendor;
   readonly #egress: EgressProvider;
   readonly #instructionKey: Buffer;
+  readonly #hopTimeoutMs: number;
 
-  constructor(vendor: EgressLlmVendor, egress: EgressProvider, instructionKey: Buffer) {
+  constructor(
+    vendor: EgressLlmVendor,
+    egress: EgressProvider,
+    instructionKey: Buffer,
+    hopTimeoutMs: number,
+  ) {
     this.#vendor = vendor;
     this.#egress = egress;
     this.#instructionKey = instructionKey;
+    this.#hopTimeoutMs = hopTimeoutMs;
   }
 
   async *stream(req: LlmChatRequest, opts: LlmStreamOpts): AsyncIterable<LlmStreamEvent> {
@@ -66,12 +73,20 @@ export class EgressLlmProvider implements LlmProvider {
       body: this.#vendor.buildBody(req),
       signal: opts.signal,
       correlationId: opts.correlationId,
+      hopTimeoutMs: this.#hopTimeoutMs,
     });
 
     if (res.status !== 200) {
       // A 403 here is egress refusing the connection — typically the platform
       // secret is unset/misnamed. Surface the upstream status to the handler.
       const text = await readText(res.body);
+      let egressCode: string | undefined;
+      try {
+        const parsed = JSON.parse(text) as { code?: string };
+        if (typeof parsed.code === "string") egressCode = parsed.code;
+      } catch {
+        // Opaque body — the handler falls back to status-based mapping.
+      }
       throw new LlmProviderError(
         `egress llm call failed (${res.status}): ${text}`,
         res.status,
@@ -80,6 +95,7 @@ export class EgressLlmProvider implements LlmProvider {
         // header loop as a 200). Coerce-or-drop like `wireCount`: an integer
         // delay-seconds value travels, an HTTP-date or junk does not.
         retryAfterSeconds(res.headers["retry-after"]),
+        egressCode,
       );
     }
 

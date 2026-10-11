@@ -215,8 +215,10 @@ SELECT slug FROM apps
 6. **Apply the new template.** A Bicep default does not reach an install until you apply the template
    with your parameters. Set the four concurrency parameters (`llmMaxAppInFlight`,
    `llmMaxUserInFlight`, `llmMaxInFlight`, `fetchMaxAppInFlight`), the call deadline
-   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. See
-   [Configuration](/deploy/configuration). If this template also ships network controls, read
+   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. The template
+   also sets `EGRESS_LLM_TIMEOUT_MS` from the same `llmMaxCallMs` (plus 120s) so egress's LLM vendor
+   bound cannot drift below the edge deadline. See [Configuration](/deploy/configuration). If this
+   template also ships network controls, read
    [Upgrading to the network controls](#upgrading-to-the-network-controls) step 0 first — set
    `egressNsgEnforce = 'off'` until the scratch-copy test passes before any full apply, including
    this step.
