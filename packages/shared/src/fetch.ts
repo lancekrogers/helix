@@ -151,7 +151,9 @@ export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
  * target; `too_large` a request body over the size cap (413, refused before the
  * upstream call); `replay` a re-presented attested instruction whose one-time
  * `jti` was already burned (409, refused at egress before any upstream call —
- * ADR-0013 Step 1, issue #3); `upstream_error` an egress/transport failure. (A
+ * ADR-0013 Step 1, issue #3); `upstream_error` an egress/transport failure;
+ * `upstream_timeout` a vendor hop that exceeded its idle timeout after the
+ * request was dispatched. (A
  * *response* over the cap cannot use this code — status + headers are already
  * flushed by the time the byte counter trips, so the body is truncated instead;
  * see issue #8 and `@azx-pbc/shared` `capBody`.)
@@ -178,6 +180,7 @@ export const FETCH_ERROR_CODES = [
   "too_large",
   "replay",
   "upstream_error",
+  "upstream_timeout",
   "connection_required",
   "provider_unavailable",
   "provider_misconfigured",

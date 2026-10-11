@@ -454,11 +454,12 @@ When `deployFirewall` is true, see also `infra/azure/README.md`.
 | `PROBE_POSTGRES_HOST` | Postgres FQDN (positive control) |
 | `PROBE_ALLOWED_HOST` | Public host expected reachable on 443 |
 | `PROBE_CANARY_HOST` | Public host expected blocked when allow-list mode is on |
+| `PROBE_CLOSING_DENY_TARGET` | Optional `host:port` (port not 80 or 443) for the `closing-deny` check when proving `enforce` with the firewall off |
 | `PROBE_FQDN_PROTOCOL` | Optional `tls` (default) or `tcp` for public host checks |
 | `PROBE_TIMEOUT_MS` | Optional connect timeout in ms (default 5000) |
 
 Stdout uses `egress.netprobe_check` per check and `egress.netprobe_result` for the
-summary; see `docs/design/logging.md`.
+summary (`ok`, `denyProven`, `closingDenyProven`); see `docs/design/logging.md`.
 
 ## Key files
 

@@ -29,8 +29,13 @@ export interface ProbeConfig {
   postgresHost: string;
   allowedHost: string;
   canaryHost: string;
+  closingDenyHost: string | null;
+  closingDenyPort: number | null;
   timeoutMs: number;
 }
+
+/** Scored blocked checks against these ids prove the NSG deny list when they match. */
+const IN_VNET_DENY_PROOF_CHECK_IDS = new Set(["blob-pe-443"]);
 
 export interface CheckSpec {
   id: string;
@@ -93,6 +98,32 @@ function parseHost(env: Record<string, string | undefined>, key: string): string
     throw new Error(`${key} must be a hostname`);
   }
   return value;
+}
+
+function parseClosingDenyTarget(
+  env: Record<string, string | undefined>,
+): { host: string; port: number } | null {
+  const value = env.PROBE_CLOSING_DENY_TARGET;
+  if (value === undefined || value === "") {
+    return null;
+  }
+  const colon = value.lastIndexOf(":");
+  if (colon <= 0 || colon === value.length - 1) {
+    throw new Error("PROBE_CLOSING_DENY_TARGET must be host:port");
+  }
+  const host = value.slice(0, colon);
+  const portRaw = value.slice(colon + 1);
+  if (!HOST_RE.test(host)) {
+    throw new Error("PROBE_CLOSING_DENY_TARGET host must be a hostname");
+  }
+  const port = Number(portRaw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("PROBE_CLOSING_DENY_TARGET port must be an integer from 1 to 65535");
+  }
+  if (port === 80 || port === 443) {
+    throw new Error("PROBE_CLOSING_DENY_TARGET port must not be 80 or 443");
+  }
+  return { host, port };
 }
 
 function parsePeAddressesMode(env: Record<string, string | undefined>): PeAddressesMode {
@@ -165,8 +196,16 @@ export function parseConfig(env: Record<string, string | undefined>): ProbeConfi
     postgresHost: parseHost(env, "PROBE_POSTGRES_HOST"),
     allowedHost: parseHost(env, "PROBE_ALLOWED_HOST"),
     canaryHost: parseHost(env, "PROBE_CANARY_HOST"),
+    closingDenyHost: null,
+    closingDenyPort: null,
     timeoutMs,
   };
+
+  const closingDeny = parseClosingDenyTarget(env);
+  if (closingDeny) {
+    cfg.closingDenyHost = closingDeny.host;
+    cfg.closingDenyPort = closingDeny.port;
+  }
 
   return cfg;
 }
@@ -174,6 +213,7 @@ export function parseConfig(env: Record<string, string | undefined>): ProbeConfi
 export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
   const denyOnly = cfg.nsg !== "off";
   const enforce = cfg.nsg === "enforce";
+  const closingDenyScored = enforce && !cfg.firewall;
   // Azure does not apply NSG rules to the host-node addresses: 168.63.129.16 on
   // ports 80 and 32526 is exempt outright, and IMDS is filtered only by the
   // AzurePlatformIMDS service tag, not by an address prefix. The application
@@ -181,7 +221,6 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
   // what the replica sees.
   const hostNodeExpect: Expectation = "informational";
   const blobPeExpect: Expectation = denyOnly ? "blocked" : "informational";
-  const portExpect: Expectation = enforce ? "blocked" : "informational";
   const canaryExpect: Expectation = cfg.fqdnAllowlist ? "blocked" : "reachable";
   const fqdnKind: "tcp" | "tls" = cfg.fqdnProtocol === "tls" ? "tls" : "tcp";
 
@@ -242,31 +281,65 @@ export function buildChecks(cfg: ProbeConfig): CheckSpec[] {
       port: 443,
       expect: canaryExpect,
     },
+    // These ports on the allowed host do not discriminate NSG posture: the host
+    // does not answer there from any client, and with the firewall deployed the
+    // firewall drops them before the NSG is in play.
     {
       id: "public-port-25",
       kind: "tcp",
       host: cfg.allowedHost,
       port: 25,
-      expect: portExpect,
+      expect: "informational",
     },
     {
       id: "public-port-22",
       kind: "tcp",
       host: cfg.allowedHost,
       port: 22,
-      expect: portExpect,
+      expect: "informational",
     },
     {
       id: "public-port-8443",
       kind: "tcp",
       host: cfg.allowedHost,
       port: 8443,
-      expect: portExpect,
+      expect: "informational",
     },
     { id: "dns-resolve", kind: "dns", host: cfg.allowedHost, port: 0, expect: "reachable" },
   );
 
+  if (cfg.closingDenyHost !== null && cfg.closingDenyPort !== null) {
+    checks.push({
+      id: "closing-deny",
+      kind: "tcp",
+      host: cfg.closingDenyHost,
+      port: cfg.closingDenyPort,
+      expect: closingDenyScored ? "blocked" : "informational",
+    });
+  }
+
   return checks;
+}
+
+export function computeDenyProven(cfg: ProbeConfig, results: CheckResult[]): boolean {
+  if (cfg.nsg === "off") {
+    return false;
+  }
+  return results.some(
+    (r) =>
+      IN_VNET_DENY_PROOF_CHECK_IDS.has(r.id) &&
+      r.expected === "blocked" &&
+      r.actual === "blocked" &&
+      r.ok,
+  );
+}
+
+export function computeClosingDenyProven(results: CheckResult[]): boolean {
+  const row = results.find((r) => r.id === "closing-deny");
+  if (!row) {
+    return false;
+  }
+  return row.expected === "blocked" && row.actual === "blocked" && row.ok;
 }
 
 export function classify(error: NodeJS.ErrnoException | undefined, timedOut: boolean): Outcome {
@@ -470,6 +543,8 @@ function formatCheckLine(result: CheckResult): string {
 function formatSummaryLine(cfg: ProbeConfig, results: CheckResult[]): string {
   const failed = results.filter((r) => !r.ok).length;
   const allOk = failed === 0;
+  const denyProven = computeDenyProven(cfg, results);
+  const closingDenyProven = computeClosingDenyProven(results);
   return JSON.stringify({
     event: "egress.netprobe_result",
     time: new Date().toISOString(),
@@ -480,6 +555,8 @@ function formatSummaryLine(cfg: ProbeConfig, results: CheckResult[]): string {
     firewall: cfg.firewall,
     fqdnAllowlist: cfg.fqdnAllowlist,
     peAddresses: cfg.peAddresses,
+    denyProven,
+    closingDenyProven,
   });
 }
 

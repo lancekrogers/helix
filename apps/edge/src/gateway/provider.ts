@@ -1,7 +1,13 @@
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 import { Pool, type Dispatcher } from "undici";
-import { priceForModel, type Env, type LlmChatRequest, type LlmUsage } from "@azx-pbc/shared";
+import {
+  priceForModel,
+  REASONING_MIN_COMPLETION_TOKENS_DEFAULT,
+  type Env,
+  type LlmChatRequest,
+  type LlmUsage,
+} from "@azx-pbc/shared";
 
 /**
  * The `LlmProvider` seam (architecture §6.1, project plan §4 M4). The gateway
@@ -173,7 +179,6 @@ export async function* mapAnthropicStream(body: Readable): AsyncIterable<LlmStre
 }
 
 /** Floor for a reasoning model's `max_completion_tokens` when the catalog gives none. */
-const DEFAULT_REASONING_FLOOR = 25_000;
 
 /**
  * The OpenAI **chat/completions** request body (always streamed). The neutral
@@ -199,7 +204,7 @@ export function openAiRequestBody(req: LlmChatRequest): string {
   };
   const price = priceForModel(req.model);
   if (price?.reasoning) {
-    const floor = price.minCompletionTokens ?? DEFAULT_REASONING_FLOOR;
+    const floor = price.minCompletionTokens ?? REASONING_MIN_COMPLETION_TOKENS_DEFAULT;
     body.max_completion_tokens = Math.max(req.maxTokens ?? floor, floor);
   } else if (req.maxTokens !== undefined) {
     body.max_tokens = req.maxTokens;
@@ -351,11 +356,14 @@ export class LlmProviderError extends Error {
    * `retryAfterSeconds` in `egressLlmProvider.ts`).
    */
   readonly retryAfter?: number;
-  constructor(message: string, upstreamStatus?: number, retryAfter?: number) {
+  /** Egress JSON `code` when the failure was a platform refusal before the vendor body. */
+  readonly egressCode?: string;
+  constructor(message: string, upstreamStatus?: number, retryAfter?: number, egressCode?: string) {
     super(message);
     this.name = "LlmProviderError";
     this.upstreamStatus = upstreamStatus;
     this.retryAfter = retryAfter;
+    this.egressCode = egressCode;
   }
 }
 

@@ -89,9 +89,13 @@ in flight.
 
 Each admitted call also gets a wall-clock deadline (`EDGE_LLM_MAX_CALL_MS`, default ten
 minutes). The upstream `AbortSignal` is the client hang-up signal or that timeout,
-whichever comes first. A deadline abort is charged like a partial stream (ledger
-`error` with `deadline_exceeded;usage=…`), not a quota cut. Lease TTL is the deadline
-plus a one-minute grace period so a live call does not lose its slot before it finishes.
+whichever comes first. The edge→egress hop timeout is set above that deadline so the
+abort fires first; egress uses a separate `EGRESS_LLM_TIMEOUT_MS` on vendor calls (above
+the edge deadline, derived from the same Bicep parameter). A deadline abort is charged
+like a partial stream (ledger `error` with `deadline_exceeded;usage=…`), not a quota cut.
+A transport idle timeout after the request was dispatched is charged as a cut with
+`upstream_timeout;usage=…`. Lease TTL is the deadline plus a one-minute grace period so
+a live call does not lose its slot before it finishes.
 The lease is released only after the ledger row is written. Spend is still read **before** the
 lease is taken, so a newly admitted call may not see a row from a call that just finished; overshoot
 past the per-app cap is bounded by roughly **`appCap` concurrent calls** at worst-case cost, not zero.

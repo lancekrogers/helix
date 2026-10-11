@@ -123,7 +123,7 @@ const fakeResolver: SecretResolver = {
 
 function makeApp(allowPrivate: boolean, resolver: SecretResolver | null = fakeResolver) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate,
     extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     // Loopback echo upstreams are http; open the cleartext-injection seam so
@@ -800,7 +800,7 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
       },
     });
     const config = {
-      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
       extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
       allowInsecureConnection: true,
@@ -899,5 +899,74 @@ describe("egress /proxy — hang-up before the headers (upstream abort)", () => 
 
     app.server.closeAllConnections();
     await app.close();
+  });
+});
+
+describe("egress /proxy — capability idle timeouts", () => {
+  let stall: Server;
+  let stallOrigin: string;
+
+  beforeAll(async () => {
+    stall = createServer((req, res) => {
+      res.on("error", () => {});
+      req.on("error", () => {});
+      // Accept the request and send nothing — triggers undici headersTimeout.
+    });
+    await new Promise<void>((resolve) => stall.listen(0, "127.0.0.1", resolve));
+    stallOrigin = `http://127.0.0.1:${(stall.address() as AddressInfo).port}`;
+  });
+  afterAll(async () => {
+    stall.closeAllConnections();
+    await new Promise<void>((resolve) => stall.close(() => resolve()));
+  });
+
+  function makeTimeoutApp(fetchMs: number, llmMs: number) {
+    const config = {
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: fetchMs, llmTimeoutMs: llmMs },
+      allowPrivate: true,
+      allowInsecureConnection: true,
+    } as EgressConfig;
+    return buildApp({ config, resolver: fakeResolver, instructionKey: key, burnStore: null });
+  }
+
+  async function stallInject(
+    app: ReturnType<typeof makeTimeoutApp>,
+    capability: "fetch" | "llm",
+  ): Promise<{ statusCode: number; json: () => unknown; elapsedMs: number }> {
+    const started = Date.now();
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint({ origin: stallOrigin, capability }),
+        [TARGET_HEADER]: `${stallOrigin}/hang`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    return { statusCode: res.statusCode, json: () => res.json(), elapsedMs: Date.now() - started };
+  }
+
+  it("cuts non-LLM fetch calls at EGRESS_TIMEOUT_MS with upstream_timeout", async () => {
+    const app = makeTimeoutApp(80, 5_000);
+    const res = await stallInject(app, "fetch");
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toMatchObject({ code: "upstream_timeout" });
+    await app.close();
+  });
+
+  it("bounds llm calls at EGRESS_LLM_TIMEOUT_MS, not the fetch timeout", async () => {
+    const fetchApp = makeTimeoutApp(120, 5_000);
+    const fetchRes = await stallInject(fetchApp, "fetch");
+    await fetchApp.close();
+    expect(fetchRes.statusCode).toBe(502);
+    expect(fetchRes.json()).toMatchObject({ code: "upstream_timeout" });
+    expect(fetchRes.elapsedMs).toBeLessThan(2_500);
+
+    const llmApp = makeTimeoutApp(120, 800);
+    const llmRes = await stallInject(llmApp, "llm");
+    await llmApp.close();
+    expect(llmRes.statusCode).toBe(502);
+    expect(llmRes.json()).toMatchObject({ code: "upstream_timeout" });
+    expect(llmRes.elapsedMs).toBeGreaterThan(500);
   });
 });

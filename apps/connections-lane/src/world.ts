@@ -506,7 +506,7 @@ export class LaneWorld {
         retireSweepIntervalMs: 60_000,
         instructionSecret: this.instructionSecret,
         exchangeSecret: exchangeSecret(),
-        limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 10_000 },
+        limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 10_000, llmTimeoutMs: 60_000 },
         managedIdentityConnections: [],
         allowPrivate: true,
         extraBlockedCidrs: [],

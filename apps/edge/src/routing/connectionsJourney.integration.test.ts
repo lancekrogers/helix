@@ -735,7 +735,7 @@ beforeAll(async () => {
       retireSweepIntervalMs: 60_000,
       instructionSecret: INSTRUCTION_SECRET,
       exchangeSecret: EXCHANGE_SECRET,
-      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000 },
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000, llmTimeoutMs: 30_000 },
       managedIdentityConnections: [],
       allowPrivate: true,
       extraBlockedCidrs: [],

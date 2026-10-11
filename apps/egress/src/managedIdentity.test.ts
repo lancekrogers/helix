@@ -174,7 +174,7 @@ async function mint(claims: {
 
 function makeApp(resolver: SecretResolver) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate: true, // loopback echo upstream
     extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     allowInsecureConnection: true, // loopback is http; the prod guard is pinned in adversarial.test.ts

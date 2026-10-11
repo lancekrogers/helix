@@ -108,6 +108,23 @@ describe("pricing", () => {
   it("matches Anthropic default output when maxTokens is unset", () => {
     expect(outputTokenCapForEstimate("claude-fable-5-1")).toBe(1024);
   });
+
+  it("floors reasoning output estimates at minCompletionTokens when maxTokens is lower", () => {
+    expect(outputTokenCapForEstimate("gpt-5-nano", 1)).toBe(25_000);
+  });
+
+  it("uses maxTokens for reasoning when it is above the floor", () => {
+    expect(outputTokenCapForEstimate("gpt-5-nano", 30_000)).toBe(30_000);
+  });
+
+  it("never exceeds maxOutputTokens for reasoning models", () => {
+    const cap = outputTokenCapForEstimate("gpt-5-nano", 200_000);
+    expect(cap).toBe(priceForModel("gpt-5-nano")!.maxOutputTokens);
+  });
+
+  it("keeps non-reasoning maxTokens capping unchanged", () => {
+    expect(outputTokenCapForEstimate("claude-fable-5-1", 512)).toBe(512);
+  });
 });
 
 describe("supportsStructuredOutputs (ADR-0034)", () => {

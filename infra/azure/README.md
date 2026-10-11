@@ -35,8 +35,11 @@ summary to the egress Log Analytics workspace. Read the template's declared post
 from the `netControls` deployment output (firewall, FQDN mode, NSG mode, allow-list,
 pinned private-endpoint addresses when enabled, probe expectations) next to the last
 probe result — `just infra net-verify` starts the job on demand and prints the
-outcome. **The probe tests outbound paths only**; a green result does not prove
-edge→egress inbound — run the check below after apply. Wire-server (`168.63.129.16`)
+outcome. **`ok: true` alone does not prove NSG deny rows** unless `denyProven` is
+true (pinned private-endpoint addresses so `blob-pe-443` is scored); the default
+unpinned install exits net-verify with code 3. **The probe tests outbound paths only**;
+a green result does not prove edge→egress inbound — run the check below after apply.
+Wire-server (`168.63.129.16`)
 and IMDS checks are informational only; there is no NSG deny on `168.63.129.16`
 (Microsoft says not to deny it on a Container Apps subnet), and `ssrf.ts` is the
 control for proxied traffic. Alerts in
@@ -54,8 +57,11 @@ infra/netsim/translate.test.mjs`, which also runs in the dev container). The sim
   Azure NSG semantics, subnet attachment, or real platform-address behavior
   (**unverified in Azure**).
 - **`just infra net-verify`** — operator step against a deployed install: starts
-  `<prefix>-netprobe`, waits for the execution, prints probe lines. **Unverified in
-  Azure** by the recipe itself until an operator runs it.
+  `<prefix>-netprobe`, waits for the execution, prints probe lines, exits 1 when
+  `ok` is false, 3 when the NSG is on but `denyProven` is false (unpinned PE
+  addresses). Warns when `enforce` is on but `closingDenyProven` is false — set
+  `netprobeClosingDenyTarget` with the firewall off to prove the closing deny.
+  **Unverified in Azure** by the recipe itself until an operator runs it.
 
 ### The security shape, in one diagram
 
@@ -1453,9 +1459,10 @@ just infra net-verify <resource-group> [namePrefix]
 ```
 
 The recipe starts `<prefix>-netprobe`, waits for the job execution, and prints
-`egress.netprobe_check` / `egress.netprobe_result` lines. Interpreting them
-against your NSG and firewall settings is **unverified in Azure** until you have
-run it on that install. Local rule-order checks (no Azure semantics):
+`egress.netprobe_check` / `egress.netprobe_result` lines. Read `denyProven` and
+`closingDenyProven` in the summary next to `netControls.probe.denyProvable`.
+Interpreting them against your NSG and firewall settings is **unverified in Azure**
+until you have run it on that install. Local rule-order checks (no Azure semantics):
 `just infra net-sim` on a Docker host — see "Verifying the network controls"
 above.
 

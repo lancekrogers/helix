@@ -64,7 +64,30 @@ net-verify resource-group prefix='helix-prod':
     echo '  script -q /dev/null az containerapp exec -g <rg> -n <prefix>-edge --command \'
     echo '    "node -e \"fetch(process.env.EDGE_EGRESS_URL+'\''/health'\'').then(r=>console.log(r.status)).catch(e=>console.log('\''ERR'\'',e.cause?.code))\"" < /dev/null'
     echo "  expect: 200"
-    if [ "$status" = "Succeeded" ]; then
-      exit 0
+    result_json=""
+    if [ -n "$logs" ]; then
+      result_json="$(printf '%s\n' "$logs" | node infra/azure/scripts/parse-netprobe-log.mjs 2>/dev/null || true)"
     fi
-    exit 1
+    if [ -z "$result_json" ]; then
+      echo "no egress.netprobe_result line in job logs (execution status: ${status})"
+      exit 1
+    fi
+    read -r probe_ok probe_nsg probe_deny_proven probe_closing_proven < <(
+      node -p "const p=JSON.parse(process.argv[1]); [p.ok,p.nsg,p.denyProven,p.closingDenyProven].map(String).join(' ')" "$result_json"
+    )
+    if [ "$probe_ok" != "true" ]; then
+      exit 1
+    fi
+    if [ "$probe_nsg" != "off" ] && [ "$probe_deny_proven" != "true" ]; then
+      echo ""
+      echo "net-verify: posture checks matched but no NSG deny was proven (denyProven=false)."
+      echo "With dynamic private-endpoint addresses the probe has no in-VNet target the NSG must block."
+      echo "Set pinPrivateEndpointAddresses=true in the template, redeploy, and run net-verify again."
+      exit 3
+    fi
+    if [ "$probe_nsg" = "enforce" ] && [ "$probe_closing_proven" != "true" ]; then
+      echo ""
+      echo "warning: enforce is on but the closing deny was not proven (closingDenyProven=false)."
+      echo "To prove it, set netprobeClosingDenyTarget to a public host:port outside egressAllowedPorts and run with deployFirewall=false (or on a scratch install without the firewall)."
+    fi
+    exit 0

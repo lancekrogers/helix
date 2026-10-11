@@ -218,8 +218,10 @@ SELECT slug FROM apps
 6. **Apply the new template.** A Bicep default does not reach an install until you apply the template
    with your parameters. Set the four concurrency parameters (`llmMaxAppInFlight`,
    `llmMaxUserInFlight`, `llmMaxInFlight`, `fetchMaxAppInFlight`), the call deadline
-   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. See
-   [Configuration](/deploy/configuration). If this template also ships network controls, read
+   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. The template
+   also sets `EGRESS_LLM_TIMEOUT_MS` from the same `llmMaxCallMs` (plus 120s) so egress's LLM vendor
+   bound cannot drift below the edge deadline. See [Configuration](/deploy/configuration). If this
+   template also ships network controls, read
    [Upgrading to the network controls](#upgrading-to-the-network-controls) step 0 first — set
    `egressNsgEnforce = 'off'` until the scratch-copy test passes before any full apply, including
    this step. If the template also ships tightened `img-src`, set `imgSrcReportOnly = true` in the
@@ -282,10 +284,12 @@ repository. Nothing here runs automatically.
 
 5. **NSG `deny-list-only`.** Apply the template with `egressNsgEnforce=deny-list-only`, then verify
    `/health`, a proxied fetch, an LLM call, a connection-secret read, edge→egress `/health` from inside
-   the edge replica (the probe cannot test inbound rules), and `just infra net-verify`.
+   the edge replica (the probe cannot test inbound rules), and `just infra net-verify` (must exit 0
+   with `denyProven: true` — enable pinning in step 4 first; exit 3 means the NSG was not proven).
 
-6. **`enforce`.** Once the probe is green **and** edge→egress `/health` returns 200, move one install
-   at a time to `egressNsgEnforce=enforce`.
+6. **`enforce`.** Once the probe is green with `denyProven: true` **and** edge→egress `/health`
+   returns 200, move one install at a time to `egressNsgEnforce=enforce`. Optionally set
+   `netprobeClosingDenyTarget` on a firewall-off scratch copy to record `closingDenyProven: true`.
 
 7. **Subnet recreation fallback.** If a populated subnet cannot take an NSG as a plain update,
    recreating the egress environment is the documented disruption — schedule it.
@@ -784,8 +788,10 @@ real outages. Check the things that fail silently:
   Analytics workspaces per install, so **never index them by position**.
 - **Network controls after a networking change.** If the update touched NSG,
   firewall, or private-endpoint parameters, run `just infra net-verify` and read
-  any failing `egress.netprobe_check` lines in the **egress** workspace
-  (**unverified in Azure** until you have run it on that install).
+  `egress.netprobe_result` (`denyProven`, `closingDenyProven`) plus any failing
+  `egress.netprobe_check` lines in the **egress** workspace (exit 3 when the NSG
+  is on but pinning was not used to prove a deny — **unverified in Azure** until
+  you have run it on that install).
 
 ### Verification pitfalls
 
