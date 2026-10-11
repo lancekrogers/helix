@@ -276,10 +276,12 @@ repository. Nothing here runs automatically.
 
 5. **NSG `deny-list-only`.** Apply the template with `egressNsgEnforce=deny-list-only`, then verify
    `/health`, a proxied fetch, an LLM call, a connection-secret read, edge→egress `/health` from inside
-   the edge replica (the probe cannot test inbound rules), and `just infra net-verify`.
+   the edge replica (the probe cannot test inbound rules), and `just infra net-verify` (must exit 0
+   with `denyProven: true` — enable pinning in step 4 first; exit 3 means the NSG was not proven).
 
-6. **`enforce`.** Once the probe is green **and** edge→egress `/health` returns 200, move one install
-   at a time to `egressNsgEnforce=enforce`.
+6. **`enforce`.** Once the probe is green with `denyProven: true` **and** edge→egress `/health`
+   returns 200, move one install at a time to `egressNsgEnforce=enforce`. Optionally set
+   `netprobeClosingDenyTarget` on a firewall-off scratch copy to record `closingDenyProven: true`.
 
 7. **Subnet recreation fallback.** If a populated subnet cannot take an NSG as a plain update,
    recreating the egress environment is the documented disruption — schedule it.
@@ -618,8 +620,10 @@ real outages. Check the things that fail silently:
   Analytics workspaces per install, so **never index them by position**.
 - **Network controls after a networking change.** If the update touched NSG,
   firewall, or private-endpoint parameters, run `just infra net-verify` and read
-  any failing `egress.netprobe_check` lines in the **egress** workspace
-  (**unverified in Azure** until you have run it on that install).
+  `egress.netprobe_result` (`denyProven`, `closingDenyProven`) plus any failing
+  `egress.netprobe_check` lines in the **egress** workspace (exit 3 when the NSG
+  is on but pinning was not used to prove a deny — **unverified in Azure** until
+  you have run it on that install).
 
 ### Verification pitfalls
 

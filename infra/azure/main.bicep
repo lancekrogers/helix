@@ -453,6 +453,9 @@ param netprobeAllowedHost string = 'mcr.microsoft.com'
 @description('Public host deliberately not on any allow-list; used to test firewall allow-list mode.')
 param netprobeCanaryHost string = 'example.net'
 
+@description('Optional host:port outside egressAllowedPorts (not 80 or 443) for the closing-deny probe check. Set only when proving enforce closing deny with the firewall off; leave empty on normal installs.')
+param netprobeClosingDenyTarget string = ''
+
 @description('Log verbosity for all four services (pino levels: fatal|error|warn|info|debug|trace|silent). Sets LOG_LEVEL, which every service reads unless its own <PREFIX>_LOG_LEVEL overrides it — so this one line raises the whole platform, and a per-service override raises just the noisy one. Applied per revision: changing it rolls a new ACA revision rather than taking effect on the running one. NOTE debug/trace on the edge is a data-exposure decision as much as a volume one — this stdout is retained in Log Analytics for 30 days.')
 @allowed(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
 param logLevel string = 'info'
@@ -1780,7 +1783,11 @@ var netprobeProbePeEnv = pinPrivateEndpointAddresses
     ]
   : []
 
-var netprobeProbeEnv = concat(netprobeProbeEnvCommon, netprobeProbePeEnv)
+var netprobeClosingDenyEnv = empty(netprobeClosingDenyTarget)
+  ? []
+  : [{ name: 'PROBE_CLOSING_DENY_TARGET', value: netprobeClosingDenyTarget }]
+
+var netprobeProbeEnv = concat(netprobeProbeEnvCommon, netprobeProbePeEnv, netprobeClosingDenyEnv)
 
 module netprobeJob 'modules/netprobe-job.bicep' = if (deployApps && deployNetprobe) {
   name: 'netprobe-job'
@@ -1853,6 +1860,7 @@ output netControls object = {
     expectFqdnAllowlist: deployFirewall && egressFqdnMode == 'allowlist'
     expectNsg: egressNsgEnforce
     peAddresses: pinPrivateEndpointAddresses ? 'pinned' : 'dynamic'
+    denyProvable: egressNsgEnforce != 'off' && pinPrivateEndpointAddresses
   }
 }
 

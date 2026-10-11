@@ -149,6 +149,7 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `deployNetprobe` | `true` | Daily (and on-demand) network probe job in the egress environment plus log alerts on its result. Requires `deployApps` |
 | `netprobeAllowedHost` | `mcr.microsoft.com` | Host the probe expects to reach on 443; must remain on the egress platform firewall list |
 | `netprobeCanaryHost` | `example.net` | Host deliberately not on any list; used when the firewall runs in `allowlist` mode |
+| `netprobeClosingDenyTarget` | empty | Optional `host:port` (not 80 or 443) passed to the probe as `PROBE_CLOSING_DENY_TARGET` to prove the NSG closing deny when `enforce` and `deployFirewall=false` |
 | `alertEmails` | `[]` | Who alerts notify. **Empty means the rules still deploy and still fire — at nobody.** Always set this, or turn alerts off |
 | `registryStalenessThresholdMs` | `1200000` | Staleness that fires the registry alert |
 | `availabilityTestFrequencySeconds` | `300` | Probe interval per location — the cost knob for availability tests |

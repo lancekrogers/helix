@@ -57,6 +57,7 @@ param deployFirewall = true
 // param egressNsgEnforce = 'off'  // existing installs: keep off until the scratch-copy test and net-verify pass
 // param egressNsgEnforce = 'enforce'  // new installs; existing installs keep the deny-list-only default until net-verify passes
 // param egressAllowedPorts = ['80', '443']  // non-standard approved-origin ports need values here
+// param netprobeClosingDenyTarget = 'origin.example:8443'  // optional; prove enforce closing deny with firewall off
 
 // Wildcard TLS automation (apps/certbot, ADR-0029). true = deploy the certbot
 // scheduled job that issues/renews *.appsDomain via ACME DNS-01 and binds the

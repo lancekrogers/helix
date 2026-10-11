@@ -41,7 +41,7 @@ resource probeFailedRule 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = {
   kind: 'LogAlert'
   properties: {
     displayName: '${namePrefix} network probe reported failure'
-    description: 'A netprobe job run logged egress.netprobe_result with ok=false. In the egress Log Analytics workspace, read the egress.netprobe_check lines from the same execution for which check failed. A TCP reset is counted as reachable, not blocked — only a connect timeout counts as blocked — so a failure is a real posture mismatch. Then run `just infra net-verify` on the install. Wire-server (168.63.129.16) and IMDS checks are informational only; Azure does not apply NSG rules to those host-node paths the way the rule table assumes.'
+    description: 'A netprobe job run logged egress.netprobe_result with ok=false. In the egress Log Analytics workspace, read the egress.netprobe_check lines from the same execution for which check failed. A TCP reset is counted as reachable, not blocked — only a connect timeout counts as blocked — so a failure is a real posture mismatch. Then run `just infra net-verify` on the install (exit 3 when checks match but denyProven=false on an unpinned install). Wire-server (168.63.129.16) and IMDS checks are informational only; Azure does not apply NSG rules to those host-node paths the way the rule table assumes. denyProven in the summary is true only when a scored in-VNet deny check (blob-pe-443 with pinned endpoints) matched; it does not fail the job on default unpinned installs.'
     severity: severity
     enabled: true
     scopes: [workspaceId]

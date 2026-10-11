@@ -219,6 +219,7 @@ function baseProbeEnv(expectNsg, peMode) {
     PROBE_POSTGRES_HOST: "pg.sim.test",
     PROBE_ALLOWED_HOST: "allowed.sim.test",
     PROBE_CANARY_HOST: "canary.sim.test",
+    PROBE_CLOSING_DENY_TARGET: "allowed.sim.test:8443",
     ...peEnv(peMode),
   };
 }
@@ -231,6 +232,7 @@ const SCENARIOS = [
     expectNsg: "off",
     peMode: "pinned",
     wantExit: 0,
+    denyProven: false,
   },
   {
     name: "deny-list-only",
@@ -239,6 +241,7 @@ const SCENARIOS = [
     expectNsg: "deny-list-only",
     peMode: "pinned",
     wantExit: 0,
+    denyProven: true,
   },
   {
     name: "enforce",
@@ -247,6 +250,7 @@ const SCENARIOS = [
     expectNsg: "enforce",
     peMode: "pinned",
     wantExit: 0,
+    denyProven: true,
   },
   {
     name: "deny-list-only-unpinned",
@@ -255,6 +259,7 @@ const SCENARIOS = [
     expectNsg: "deny-list-only",
     peMode: "dynamic",
     wantExit: 0,
+    denyProven: false,
   },
   {
     name: "break-kv",
@@ -283,12 +288,22 @@ const SCENARIOS = [
     expectNsg: "enforce",
     peMode: "pinned",
     wantExit: 1,
-    failCheck: { id: "public-port-25", actual: "reachable" },
+    failCheck: { id: "closing-deny", actual: "reachable" },
+  },
+  {
+    name: "nsg-detached",
+    mode: "off",
+    pinning: "pinned",
+    expectNsg: "deny-list-only",
+    peMode: "pinned",
+    wantExit: 1,
+    failCheck: { id: "blob-pe-443", actual: "reachable" },
   },
 ];
 
 function parseProbeLines(stdout) {
   const checks = new Map();
+  let summary = null;
   for (const line of stdout.split("\n")) {
     if (!line.trim()) {
       continue;
@@ -297,12 +312,14 @@ function parseProbeLines(stdout) {
       const obj = JSON.parse(line);
       if (obj.event === "egress.netprobe_check") {
         checks.set(obj.check, obj);
+      } else if (obj.event === "egress.netprobe_result") {
+        summary = obj;
       }
     } catch {
       /* not JSON */
     }
   }
-  return checks;
+  return { checks, summary };
 }
 
 function runScenario(probeName, scenario, rulesInContainer) {
@@ -334,10 +351,20 @@ function runScenario(probeName, scenario, rulesInContainer) {
   execArgs.push(probeName, "node", "--experimental-strip-types", "/probe/netprobe.ts");
   const r = spawnSync("docker", execArgs, { encoding: "utf8" });
   const exitCode = r.status ?? 1;
-  const checks = parseProbeLines(r.stdout);
+  const { checks, summary } = parseProbeLines(r.stdout);
 
   let ok = exitCode === scenario.wantExit;
   let detail = `exit ${exitCode} (want ${scenario.wantExit})`;
+  const denyExpect = scenario.denyProven;
+  if (denyExpect !== undefined && summary) {
+    if (summary.denyProven !== denyExpect) {
+      ok = false;
+      detail += `; denyProven=${summary.denyProven} want ${denyExpect}`;
+    }
+  } else if (denyExpect !== undefined) {
+    ok = false;
+    detail += "; missing egress.netprobe_result";
+  }
   if (scenario.failCheck) {
     const row = checks.get(scenario.failCheck.id);
     if (!row) {
