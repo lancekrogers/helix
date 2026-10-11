@@ -52,6 +52,8 @@ function stubEgress(
   };
 }
 
+const TEST_LLM_HOP_TIMEOUT_MS = 660_000;
+
 function provider(egress: EgressProvider): EgressLlmProvider {
   return new EgressLlmProvider(
     anthropicVendor({
@@ -61,6 +63,7 @@ function provider(egress: EgressProvider): EgressLlmProvider {
     }),
     egress,
     KEY,
+    TEST_LLM_HOP_TIMEOUT_MS,
   );
 }
 
@@ -122,6 +125,7 @@ describe("EgressLlmProvider", () => {
       }),
       stubEgress({}, (req) => (captured = req)),
       KEY,
+      TEST_LLM_HOP_TIMEOUT_MS,
     );
     await collect(p.stream(CHAT, opts));
 

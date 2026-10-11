@@ -5,6 +5,7 @@
  * secret (to verify what the edge minted), a secret-store custody config, and
  * SSRF/limit knobs.
  */
+import { DEFAULT_LLM_MAX_CALL_MS, egressLlmTimeoutMs } from "@azx-pbc/shared";
 import { DEFAULT_STATEMENT_TIMEOUT_MS } from "./pool.js";
 import { parseCidrList, type ParsedCidr } from "./ssrf.js";
 /**
@@ -70,7 +71,7 @@ export interface EgressConfig {
   delegatedKeyVaultUrl?: string;
   /** Dev custody: path to the locally-generated KEK file (post-create.sh). */
   devKeyPath?: string;
-  limits: { maxBodyBytes: number; timeoutMs: number };
+  limits: { maxBodyBytes: number; timeoutMs: number; llmTimeoutMs: number };
   /**
    * Keyless LLM vendor auth (ADR-0046): connection names for which egress may
    * mint a **managed-identity** Entra token when no `platform` secret row exists,
@@ -248,11 +249,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EgressConfig {
     devKeyPath: env.DEV_SECRETS_KEK_FILE || undefined,
     limits: {
       maxBodyBytes: Number(env.EGRESS_MAX_BODY_BYTES ?? 10 * 1024 * 1024),
-      // 120s, not 30s: this bounds the vendor dispatcher's headers/body
-      // timeouts on the proxied LLM path, where a reasoning model can think
-      // well past 30s before its first byte. The connect half keeps its own
-      // tighter bound via the validating connector's budget.
+      // Non-LLM proxied fetches (`capability: fetch`). LLM vendor hops use
+      // `llmTimeoutMs`, derived from the edge deadline — see `EGRESS_LLM_TIMEOUT_MS`.
       timeoutMs: Number(env.EGRESS_TIMEOUT_MS ?? 120_000),
+      llmTimeoutMs: Number(
+        env.EGRESS_LLM_TIMEOUT_MS ??
+          egressLlmTimeoutMs(Number(env.EDGE_LLM_MAX_CALL_MS ?? DEFAULT_LLM_MAX_CALL_MS)),
+      ),
     },
     managedIdentityConnections: parseManagedIdentityConnections(env),
     managedIdentityResource: parseManagedIdentityResource(env),

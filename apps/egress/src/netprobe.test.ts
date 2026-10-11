@@ -5,11 +5,14 @@ import * as netprobe from "./netprobe.js";
 import {
   buildChecks,
   classify,
+  computeClosingDenyProven,
+  computeDenyProven,
   parseConfig,
   probeTcp,
   probeTls,
   runChecks,
   type CheckSpec,
+  type CheckResult,
   type ProbeConfig,
 } from "./netprobe.js";
 
@@ -28,9 +31,28 @@ function sampleConfig(overrides: Partial<ProbeConfig> = {}): ProbeConfig {
     postgresHost: "postgres.example.internal",
     allowedHost: "mcr.microsoft.com",
     canaryHost: "probe-canary.example.com",
+    closingDenyHost: null,
+    closingDenyPort: null,
     timeoutMs: 5000,
     ...overrides,
   };
+}
+
+function resultsFromSpecs(
+  specs: CheckSpec[],
+  actualFor: (spec: CheckSpec) => netprobe.Outcome,
+): CheckResult[] {
+  return specs.map((spec) => {
+    const actual = actualFor(spec);
+    const ok = spec.expect === "informational" || spec.expect === actual;
+    return {
+      id: spec.id,
+      target: spec.kind === "dns" ? spec.host : `${spec.host}:${spec.port}`,
+      expected: spec.expect,
+      actual,
+      ok,
+    };
+  });
 }
 
 function sampleEnv(overrides: Record<string, string> = {}): Record<string, string> {
@@ -230,7 +252,7 @@ describe("buildChecks", () => {
 
   function expectFor(id: string, cfg: ProbeConfig): string {
     const denyOnly = cfg.nsg !== "off";
-    const enforce = cfg.nsg === "enforce";
+    const closingDenyScored = cfg.nsg === "enforce" && !cfg.firewall;
     switch (id) {
       case "wire-server-80":
       case "wire-server-32526":
@@ -252,7 +274,9 @@ describe("buildChecks", () => {
       case "public-port-25":
       case "public-port-22":
       case "public-port-8443":
-        return enforce ? "blocked" : "informational";
+        return "informational";
+      case "closing-deny":
+        return closingDenyScored ? "blocked" : "informational";
       default:
         throw new Error(`unknown id ${id}`);
     }
@@ -301,6 +325,44 @@ describe("buildChecks", () => {
         expect(spec.expect).toBe(expectFor(id, cfg));
       }
       expect(specs.some((s) => (peCheckIds as readonly string[]).includes(s.id))).toBe(false);
+    },
+  );
+
+  it("adds closing-deny when PROBE_CLOSING_DENY_TARGET is set", () => {
+    const cfg = sampleConfig({
+      nsg: "enforce",
+      firewall: false,
+      closingDenyHost: "allowed.example",
+      closingDenyPort: 8443,
+    });
+    const specs = buildChecks(cfg);
+    const closing = specs.find((s) => s.id === "closing-deny");
+    expect(closing).toEqual({
+      id: "closing-deny",
+      kind: "tcp",
+      host: "allowed.example",
+      port: 8443,
+      expect: "blocked",
+    });
+  });
+
+  it.each([
+    { nsg: "off" as const, firewall: false, expect: "informational" as const },
+    { nsg: "deny-list-only" as const, firewall: false, expect: "informational" as const },
+    { nsg: "enforce" as const, firewall: true, expect: "informational" as const },
+    { nsg: "enforce" as const, firewall: false, expect: "blocked" as const },
+  ])(
+    "closing-deny expectation for nsg=$nsg firewall=$firewall",
+    ({ nsg, firewall, expect: want }) => {
+      const cfg = sampleConfig({
+        nsg,
+        firewall,
+        fqdnAllowlist: false,
+        closingDenyHost: "allowed.example",
+        closingDenyPort: 8443,
+      });
+      const spec = buildChecks(cfg).find((s) => s.id === "closing-deny");
+      expect(spec?.expect).toBe(want);
     },
   );
 });
@@ -373,6 +435,76 @@ describe("parseConfig", () => {
   it("rejects a non-IP apps address", () => {
     expect(() => parseConfig(sampleEnv({ PROBE_APPS_IP: "not-an-ip" }))).toThrow("PROBE_APPS_IP");
   });
+
+  it("parses PROBE_CLOSING_DENY_TARGET", () => {
+    const cfg = parseConfig(sampleEnv({ PROBE_CLOSING_DENY_TARGET: "host.example:8443" }));
+    expect(cfg.closingDenyHost).toBe("host.example");
+    expect(cfg.closingDenyPort).toBe(8443);
+  });
+
+  it.each([
+    { value: "bad", msg: "host:port" },
+    { value: "host:80", msg: "must not be 80 or 443" },
+    { value: "host:443", msg: "must not be 80 or 443" },
+    { value: "host:0", msg: "1 to 65535" },
+    { value: "not-a-host!:8443", msg: "hostname" },
+  ])("rejects PROBE_CLOSING_DENY_TARGET=$value", ({ value, msg }) => {
+    expect(() => parseConfig(sampleEnv({ PROBE_CLOSING_DENY_TARGET: value }))).toThrow(msg);
+  });
+});
+
+describe("denyProven and closingDenyProven", () => {
+  it("is true for pinned NSG on when blob-pe-443 is blocked", () => {
+    const cfg = sampleConfig({ nsg: "deny-list-only", peAddresses: "pinned" });
+    const specs = buildChecks(cfg);
+    const results = resultsFromSpecs(specs, (spec) =>
+      spec.id === "blob-pe-443"
+        ? "blocked"
+        : spec.expect === "informational"
+          ? "reachable"
+          : "reachable",
+    );
+    expect(computeDenyProven(cfg, results)).toBe(true);
+  });
+
+  it("is false when dynamic PE addresses leave no in-VNet deny proof", () => {
+    const cfg = sampleConfig({ nsg: "deny-list-only", peAddresses: "dynamic" });
+    const specs = buildChecks(cfg);
+    const results = resultsFromSpecs(specs, () => "reachable");
+    expect(computeDenyProven(cfg, results)).toBe(false);
+  });
+
+  it("is false when NSG is off", () => {
+    const cfg = sampleConfig({ nsg: "off", peAddresses: "pinned" });
+    const specs = buildChecks(cfg);
+    const results = resultsFromSpecs(specs, () => "reachable");
+    expect(computeDenyProven(cfg, results)).toBe(false);
+  });
+
+  it("is false when blob-pe-443 mismatches", () => {
+    const cfg = sampleConfig({ nsg: "enforce", peAddresses: "pinned" });
+    const specs = buildChecks(cfg);
+    const results = resultsFromSpecs(specs, (spec) =>
+      spec.id === "blob-pe-443" ? "reachable" : "reachable",
+    );
+    expect(computeDenyProven(cfg, results)).toBe(false);
+  });
+
+  it("closingDenyProven follows the closing-deny check", () => {
+    const cfg = sampleConfig({
+      nsg: "enforce",
+      firewall: false,
+      closingDenyHost: "allowed.example",
+      closingDenyPort: 8443,
+    });
+    const specs = buildChecks(cfg);
+    const blocked = resultsFromSpecs(specs, (spec) =>
+      spec.id === "closing-deny" ? "blocked" : "reachable",
+    );
+    const reachable = resultsFromSpecs(specs, () => "reachable");
+    expect(computeClosingDenyProven(blocked)).toBe(true);
+    expect(computeClosingDenyProven(reachable)).toBe(false);
+  });
 });
 
 describe("main", () => {
@@ -394,6 +526,8 @@ describe("main", () => {
     const last = JSON.parse(lines.at(-1) as string);
     expect(last.event).toBe("egress.netprobe_result");
     expect(last.ok).toBe(true);
+    expect(last.denyProven).toBe(true);
+    expect(last.closingDenyProven).toBe(false);
     vi.restoreAllMocks();
   });
 
