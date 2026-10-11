@@ -13,6 +13,7 @@ import {
   INSTR_EGRESS_PROXY_DURATION,
   INSTR_EGRESS_RENEWALS,
   INSTR_EGRESS_RETIREMENTS,
+  INSTR_EGRESS_UPSTREAM_ABORTS,
   INSTR_PROVIDERS_LISTEN_STATUS,
   INSTR_PROVIDERS_RECONCILES,
 } from "@azx-pbc/shared/telemetry";
@@ -53,6 +54,8 @@ export interface EgressInstruments {
    * sweep losing a claim race to a writer — the design working, not a fault.
    */
   retirements: Counter;
+  /** `helix.capability` only. Never `appId`, see the allowlist note on `proxyDuration`. */
+  upstreamAborts: Counter;
 }
 
 /**
@@ -92,6 +95,10 @@ export function instruments(): EgressInstruments {
     retirements: meter.createCounter(INSTR_EGRESS_RETIREMENTS, {
       description:
         "Credential-retirement ledger entries consumed by the sweep, by outcome and env.",
+    }),
+    upstreamAborts: meter.createCounter(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      description:
+        "Proxied calls abandoned by the edge before the response finished, by capability.",
     }),
   };
   return cached;

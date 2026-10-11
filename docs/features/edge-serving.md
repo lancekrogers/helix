@@ -1,6 +1,6 @@
 # Edge serving
 
-> **Related ADRs:** [ADR-0017](../adr/0017-registry-listen-notify-projection.md) (registry projection) · [ADR-0025](../adr/0025-registry-projection-hardening.md) (projection hardening) · [ADR-0009](../adr/0009-relaxed-csp.md) (relaxed CSP) · [ADR-0019](../adr/0019-subdomain-per-app-isolation.md) (subdomain isolation) · [ADR-0020](../adr/0020-static-only-apps-v1.md) (static-only apps) · [ADR-0003](../adr/0003-dependency-minimal-edge.md) (dependency-minimal edge) · [ADR-0002](../adr/0002-postgres-role-split-rls.md) (Postgres role split) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split).
+> **Related ADRs:** [ADR-0017](../adr/0017-registry-listen-notify-projection.md) (registry projection) · [ADR-0025](../adr/0025-registry-projection-hardening.md) (projection hardening) · [ADR-0009](../adr/0009-relaxed-csp.md) (relaxed CSP) · [ADR-0019](../adr/0019-subdomain-per-app-isolation.md) (subdomain isolation) · [ADR-0020](../adr/0020-static-only-apps-v1.md) (static-only apps) · [ADR-0003](../adr/0003-dependency-minimal-edge.md) (dependency-minimal edge) · [ADR-0002](../adr/0002-postgres-role-split-rls.md) (Postgres role split) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split) · [ADR-0028](../adr/0028-deployment-model-customer-deployed.md) (per-install domain split).
 
 The edge (`apps/edge`) routes requests by hostname, authenticates app users,
 streams assets from Blob, and applies the platform CSP. Missing and archived
@@ -14,11 +14,24 @@ See [`apps/edge/README.md`](../../apps/edge/README.md) for the full request flow
 
 ### Host classification (the two-router discipline)
 
-Every request is classified **once** at an `onRequest` hook into `app` / `auth` / `platform`,
-and the two worlds never mix — platform handlers are unreachable on app hosts and vice versa
-(architecture §3, decision 12). `apps/edge/src/app.ts:156` decorates `req.hostClass`;
-`apps/edge/src/routing/hosts.ts` does the parsing. Reserved subdomains (`auth`, `portal`,
-`api`, `www`) are protected; an unmatched slug falls through to `platform`.
+Every request is classified **once** at an `onRequest` hook into `app` / `legacy-app` / `auth` /
+`platform`, and the two worlds never mix — platform handlers are unreachable on app hosts and vice
+versa (architecture §3, decision 12). `apps/edge/src/app.ts` decorates `req.hostClass`;
+`apps/edge/src/routing/hosts.ts` does the parsing via `classifyHost(host, baseDomain,
+controlDomain, legacyAppRedirect)`. Reserved subdomains (`auth`, `portal`, `api`, `www`) are
+protected under the apps suffix; in split layout `auth.<appsDomain>` is platform, not auth. An
+unmatched slug falls through to `platform`.
+
+When `EDGE_LEGACY_APP_REDIRECT` is on in a split install, `legacy-app` hosts run a GET/HEAD-only
+307 to the same path on the apps domain (`routing/legacyRedirect.ts`), with `Cache-Control:
+no-store` and the `helix.edge.legacy_app_redirects` counter (`outcome` dimension). Paths starting
+with `_` are never redirected. `publicOrigin` refuses reserved labels so app URL builders cannot
+silently emit control-host origins.
+
+| Setting | Default | Failure direction |
+| --- | --- | --- |
+| `EDGE_CONTROL_DOMAIN` | unset → `EDGE_BASE_DOMAIN` | Unset or blank: single-domain layout. Control domain under the apps domain or invalid hostname: edge refuses to boot |
+| `EDGE_LEGACY_APP_REDIRECT` | off | Off: old app hosts on the control domain 404. On (split only): 307 for live apps. Ignored without a split |
 
 A consequence worth knowing: `/health` returns the platform health JSON on platform/auth hosts,
 but on an app host it serves the app's own `/health` file (or the SPA fallback) — see
@@ -132,13 +145,29 @@ XML can execute script). The split:
   `/_api/*`), `form-action 'self'`, `frame-ancestors 'none'`, `base-uri 'self'`.
 - **Relaxed / code-provenance** (vibe-coded apps inline/eval freely): `script-src`/`style-src`
   with `'unsafe-inline' 'unsafe-eval'` + a curated CDN allowlist (cdnjs, jsDelivr, unpkg, esm.sh,
-  tailwind, Google Fonts). `img-src https: data: blob:` stays open — an acknowledged exfil-via-
-  navigation trade-off (§4.4).
+  tailwind, Google Fonts).
+- **Image / plugin containment:** enforced `img-src 'self' data: blob:` plus approved origins and
+  operator `EDGE_IMG_SRC_EXTRA`; `object-src 'none'`. Top-level navigation, popups/`window.open`,
+  approved origins, request URLs to permitted CDN hosts (Hypothesis), WebRTC, and DNS
+  prefetch/preconnect hints remain open (WebRTC and DNS-hint behavior under this policy is
+  untested). The platform does not claim confidentiality against a hostile app author.
 
 An app's approved `externalOrigins` (from its manifest, gated through the approvals
-write-gate) extend both `connect-src` and `img-src`. Origins are reduced to bare CSP sources
-(`new URL().origin` — scheme+host+port, path stripped) and invalid entries are dropped
-fail-closed. A same-origin `report-uri /_csp-report` funnels violations to the edge sink.
+write-gate) extend `connect-src` (`https:` and `wss:`) and `img-src` (`https:` only). Origins are
+reduced to bare CSP sources (`new URL().origin` — scheme+host+port, path stripped); wildcard hosts,
+non-`https`/`wss` schemes for `connect-src`, and hostnames outside `[a-z0-9.-]` (aside from IPv6) are
+dropped fail-closed. A same-origin `report-uri /_csp-report` funnels violations to the edge sink.
+The sink caps stored reports at 100 INSERTs per app per 10-minute window (`CSP_REPORT_INSERT_MAX` /
+`CSP_REPORT_INSERT_WINDOW_MS` in `apps/edge/src/serving/cspReportThrottle.ts`); additional reports
+are counted on `helix.edge.csp_reports` with `helix.outcome=dropped` but not persisted. The portal
+**Violations** screen (`GET /api/v1/csp/violations`) aggregates the last 30 days
+(`CSP_VIOLATIONS_LOOKBACK_DAYS`). A report's `blockedUri` can carry the data a page tried to send
+out; admins see it when reviewing violations.
+
+Per-install settings: `EDGE_IMG_SRC_EXTRA` (operator-trusted image hosts, never an image proxy),
+`EDGE_IMG_SRC_ALLOW_ALL` (restores `img-src https: data: blob:` on the enforced header while keeping
+`object-src 'none'`), and `EDGE_IMG_SRC_REPORT_ONLY` (measurement window: the previous open policy
+enforced and the tightened one as Report-Only, until the operator enforces).
 
 ### Transparent fetch shim (serve-time HTML inlining)
 

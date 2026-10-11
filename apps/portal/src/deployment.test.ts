@@ -5,6 +5,7 @@ import {
   assertDeploymentConfig,
   connectionsCallbackUrl,
   resolveAppPublicBase,
+  resolveControlPublicBase,
   resolveDevApiBase,
   resolveEgressBaseUrl,
   resolvePlatformMonthlyUsdCap,
@@ -94,6 +95,96 @@ describe("connectionsCallbackUrl", () => {
       "http://auth.localhost:8081/connections/callback",
     );
   });
+
+  it("uses the control base when CONTROL_PUBLIC_BASE is set", () => {
+    const env = {
+      APP_PUBLIC_BASE: "https://apps.example.test",
+      CONTROL_PUBLIC_BASE: "https://control.example.test",
+    };
+    expect(connectionsCallbackUrl(env)).toBe(
+      "https://auth.control.example.test/connections/callback",
+    );
+    expect(appPublicUrl("demo", env)).toBe("https://demo.apps.example.test");
+    expect(appPublicUrl("demo", env)).not.toContain("control.example.test");
+    expect(connectionsCallbackUrl(env)).not.toContain("apps.example.test");
+  });
+});
+
+describe("resolveControlPublicBase", () => {
+  it("defaults to the apps base when unset", () => {
+    expect(
+      resolveControlPublicBase({ APP_PUBLIC_BASE: "https://azx.helix.azxlabs.io" }).origin,
+    ).toBe("https://azx.helix.azxlabs.io");
+  });
+
+  it("defaults to the apps base when blank", () => {
+    expect(
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://azx.helix.azxlabs.io",
+        CONTROL_PUBLIC_BASE: "   ",
+      }).origin,
+    ).toBe("https://azx.helix.azxlabs.io");
+  });
+
+  it("returns a distinct control origin when set", () => {
+    expect(
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://apps.example.test",
+        CONTROL_PUBLIC_BASE: "https://control.example.test",
+      }).origin,
+    ).toBe("https://control.example.test");
+  });
+
+  it("rejects a non-URL value", () => {
+    expect(() =>
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://apps.example.test",
+        CONTROL_PUBLIC_BASE: "control.example.test",
+      }),
+    ).toThrow(/not a valid absolute URL/);
+  });
+
+  it("rejects a scheme or port mismatch with APP_PUBLIC_BASE", () => {
+    expect(() =>
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://apps.example.test",
+        CONTROL_PUBLIC_BASE: "http://control.example.test",
+      }),
+    ).toThrow(/same scheme and port/);
+    expect(() =>
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://apps.example.test:8443",
+        CONTROL_PUBLIC_BASE: "https://control.example.test",
+      }),
+    ).toThrow(/same scheme and port/);
+  });
+
+  it("rejects a control host that is a subdomain of the apps host", () => {
+    expect(() =>
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://apps.example.test",
+        CONTROL_PUBLIC_BASE: "https://control.apps.example.test",
+      }),
+    ).toThrow(/subdomain/);
+  });
+
+  it("allows the delegated-subdomain case (apps host under the control registrable domain)", () => {
+    expect(
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://apps.local.helix.azxlabs.io",
+        CONTROL_PUBLIC_BASE: "https://local.helix.azxlabs.io",
+      }).hostname,
+    ).toBe("local.helix.azxlabs.io");
+  });
+
+  it("rejects an apps host on or under auth. of the control domain", () => {
+    expect(() =>
+      resolveControlPublicBase({
+        APP_PUBLIC_BASE: "https://auth.control.example.test",
+        CONTROL_PUBLIC_BASE: "https://control.example.test",
+      }),
+    ).toThrow(/must not be on or under auth\.control\.example\.test/);
+  });
 });
 
 describe("resolveDevApiBase", () => {
@@ -177,6 +268,26 @@ describe("assertDeploymentConfig", () => {
       assertDeploymentConfig({
         NODE_ENV: "production",
         APP_PUBLIC_BASE: "https://azx.helix.azxlabs.io",
+        DEV_API_PUBLIC_BASE: "",
+      }),
+    ).not.toThrow();
+  });
+
+  it("throws for a malformed CONTROL_PUBLIC_BASE", () => {
+    expect(() =>
+      assertDeploymentConfig({
+        APP_PUBLIC_BASE: "https://apps.example.test",
+        CONTROL_PUBLIC_BASE: "not-a-url",
+      }),
+    ).toThrow(/CONTROL_PUBLIC_BASE/);
+  });
+
+  it("passes for a well-formed split-domain pair", () => {
+    expect(() =>
+      assertDeploymentConfig({
+        NODE_ENV: "production",
+        APP_PUBLIC_BASE: "https://apps.example.test",
+        CONTROL_PUBLIC_BASE: "https://control.example.test",
         DEV_API_PUBLIC_BASE: "",
       }),
     ).not.toThrow();

@@ -14,8 +14,13 @@ import {
 import {
   DURATION_BUCKETS_MS,
   INSTR_APP_VISITS,
+  INSTR_CSP_REPORTS,
+  INSTR_GATEWAY_ADMISSION_DENIED,
+  INSTR_GATEWAY_CUT_CHARGES,
+  INSTR_GATEWAY_PLATFORM_SPEND_RATIO,
   INSTR_GATEWAY_CALLS,
   INSTR_GATEWAY_DURATION,
+  INSTR_LEGACY_APP_REDIRECTS,
   INSTR_REGISTRY_LOAD_FAILURES,
   INSTR_REGISTRY_STALE_FOR_MS,
   INSTR_SESSION_GATE_DENIED,
@@ -69,6 +74,19 @@ export interface EdgeInstruments {
   trustProxyUnresolved: ObservableGauge;
   /** `appId`, `outcome` ∈ `VISIT_RECORD_OUTCOMES` (ADR-0050). */
   appVisits: Counter;
+  /** `outcome` ∈ `LEGACY_REDIRECT_OUTCOMES`. */
+  legacyAppRedirects: Counter;
+  /** `appId`, `directive` ∈ `CSP_REPORT_DIRECTIVES`, `disposition` ∈ `CSP_REPORT_DISPOSITIONS`. */
+  cspReports: Counter;
+  /** `appId`, `basis` ∈ `CUT_CHARGE_BASES` — operational only, never reconciled with the ledger. */
+  gatewayCutCharges: Counter;
+  /**
+   * `capability`, `reason` ∈ `ADMISSION_DENIAL_REASONS`, `appId`. Never `userOid`.
+   * Not gated by the denial throttle — counts refusals the ledger drops.
+   */
+  gatewayAdmissionDenied: Counter;
+  /** Cached platform spend over the configured ceiling; dimension `helix.env`. */
+  platformSpendRatio: ObservableGauge;
 }
 
 /**
@@ -127,6 +145,27 @@ export function instruments(): EdgeInstruments {
       description:
         "Hosted-app document loads the edge tried to record, by outcome. Operational only — " +
         "the owner-facing counts come from app_visits.",
+    }),
+    legacyAppRedirects: meter.createCounter(INSTR_LEGACY_APP_REDIRECTS, {
+      description:
+        "Requests to an old <slug>.<control domain> host while the legacy redirect is on, by outcome. " +
+        "No host, path or slug is recorded: this is the signal that says when to turn the redirect off.",
+    }),
+    cspReports: meter.createCounter(INSTR_CSP_REPORTS, {
+      description:
+        "CSP violation reports received, by app, directive and disposition. Operational only; " +
+        "the owner-facing counts come from csp_reports.",
+    }),
+    gatewayCutCharges: meter.createCounter(INSTR_GATEWAY_CUT_CHARGES, {
+      description:
+        "LLM calls charged without a final usage block, by how the charge was derived. Operational only; never reconciled with the ledger.",
+    }),
+    gatewayAdmissionDenied: meter.createCounter(INSTR_GATEWAY_ADMISSION_DENIED, {
+      description: "LLM gateway admission denials by capability and reason.",
+    }),
+    platformSpendRatio: meter.createObservableGauge(INSTR_GATEWAY_PLATFORM_SPEND_RATIO, {
+      description:
+        "Cached platform LLM spend today divided by the configured daily ceiling. Absent until the first successful read.",
     }),
   };
   return cached;

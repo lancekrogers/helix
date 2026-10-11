@@ -68,7 +68,9 @@ These are where the security model lives (see `docs/platform-architecture.md` §
   security-sensitive code in the platform.
 - **Cross-app isolation** — subdomain-per-app origins, host-only cookies (cookie
   tossing/shadowing), Origin validation + `form-action` at the gateway, and the block on
-  app-supplied service-worker registration.
+  app-supplied service-worker registration. An install may optionally serve apps from a separate
+  domain from the control hosts; that closes cookie-bomb and reputation blast radius only when the
+  apps domain is a separate registrable domain or a Public Suffix List entry.
 - **The serving path** — the auth gate before any asset is served, CSP injection on every app
   response, and host-routing confusion (app content reachable on the auth/portal hosts, gated
   content served without a session, version/pointer mixups).
@@ -93,16 +95,24 @@ These are where the security model lives (see `docs/platform-architecture.md` §
   platform already assumes.
 - **Relaxed CSP directives** — inline scripts/styles, event handlers, `eval`, and the curated
   CDN allowlist are deliberate (ADR-0009); containment lives in the data-flow directives
-  (`connect-src`, `form-action`, `frame-ancestors`). An open `img-src` and navigation-based
-  exfiltration are documented residual risks (architecture §10), as is misuse of a capability
-  _within_ its granted scope.
+  (`connect-src`, `form-action`, `frame-ancestors`, tightened `img-src`, `object-src 'none'`).
+  Navigation, popups, approved origins, request URLs to permitted CDN hosts (Hypothesis), WebRTC,
+  and DNS hints remain exfil channels (architecture §10; WebRTC and DNS-hint behavior under CSP is
+  untested). App code can still send out what its
+  viewer can read — the platform does not claim confidentiality against a hostile app author. Misuse
+  of a capability _within_ its granted scope is also a residual risk.
+- **Fetch-proxy response posture** — `/_api/fetch/*` refuses worker and service-worker destination
+  loads, sets `content-security-policy: default-src 'none'` on every proxied response, and strips
+  `Service-Worker-Allowed` from upstream headers so only the platform offline worker route may emit
+  it.
 - **Dev-only stand-ins** — `apps/dev-idp` (the local OIDC issuer) and the dev AES-GCM secret
   envelope are never deployed. Only report these if the same flaw applies to the production
   path (Entra ID, Key Vault).
 - **Known, tracked gaps** — before reporting a _missing_ control, check [`TODO.md`](TODO.md);
   known items include per-app RBAC (reads are still authenticated-only, ADR-0007 residual),
-  confirming `deployFirewall` is on in the live deployments, and Public Suffix List
-  submission. (Admin per-user session revocation shipped — the portal Sessions screen —
+  confirming `deployFirewall` is on in the live deployments, and **operator-run** Public Suffix
+  List submission when the apps zone is a delegated subdomain (required for same-site separation).
+  (Admin per-user session revocation shipped — the portal Sessions screen —
   and is no longer a gap.) A bypass of a control that _is_ built
   remains a valid report.
 - **The usual exclusions** — volumetric DoS, unverified scanner output, social engineering,

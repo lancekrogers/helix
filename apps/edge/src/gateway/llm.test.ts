@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { request as undiciRequest } from "undici";
-import { describe, expect, it } from "vitest";
+import {
+  abortInFlightWorkForShutdown,
+  resetProcessShutdownSignalForTests,
+} from "@azx-pbc/shared/lifecycle";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
+import { ATTR_REASON, INSTR_GATEWAY_ADMISSION_DENIED, SPAN_LLM } from "@azx-pbc/shared/telemetry";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
+import { BYTES_PER_TOKEN, costUsd, outputTokenCapForEstimate } from "@azx-pbc/shared";
+import { EgressProviderError } from "./egressProvider.js";
 import { buildApp } from "../app.js";
 import { SESSION_COOKIE } from "../auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "../auth/sessions.js";
@@ -17,6 +25,9 @@ import {
   registryEntry,
 } from "../test/fakes.js";
 import { LlmProviderError } from "./provider.js";
+import { ERROR_DETAIL_MAX } from "./usage.js";
+import { secondsUntilNextLocalMidnight } from "./llm.js";
+import { InMemoryLeaseStore, type LeaseStore } from "./leaseStore.js";
 
 /**
  * The `/_api/llm/chat` gateway (architecture §6.1, project plan §4 M4): authn,
@@ -36,40 +47,86 @@ interface LlmEdge {
   sessions: FakeSessionStore;
   provider: FakeLlmProvider;
   usage: FakeUsageStore;
+  leases: InMemoryLeaseStore;
 }
 
 function buildLlmEdge(
   opts: {
-    llm?: { models: string[]; dollarsPerDay?: number } | null;
+    llm?: {
+      models: string[];
+      dollarsPerDay?: number;
+      visibilityMode?: "internal" | "public";
+    } | null;
     withProvider?: boolean;
+    defaultDollarsPerDay?: number;
+    platformCeilingDollars?: number;
+    maxAppInFlight?: number;
+    maxUserInFlight?: number;
+    maxInFlight?: number;
+    maxCallMs?: number;
+    leases?: LeaseStore;
+    allowUnauthenticated?: boolean;
   } = {},
 ): LlmEdge {
   const sessions = new FakeSessionStore();
   const provider = new FakeLlmProvider();
   const usage = new FakeUsageStore();
+  const leases = opts.leases instanceof InMemoryLeaseStore ? opts.leases : new InMemoryLeaseStore();
   // Default cap is $1/day (1e6 micro-USD); the burst sub-cap is $1/6.
   const llm = opts.llm === undefined ? { models: [MODEL], dollarsPerDay: 1 } : opts.llm;
   const app = buildApp({
-    config: testEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+    config: testEdgeConfig({
+      auth: testAuthConfig(),
+      allowUnauthenticated: opts.allowUnauthenticated ?? false,
+      allowPublicApps: opts.allowUnauthenticated ?? false,
+      llm: {
+        endpoint: "https://api.anthropic.com",
+        path: "/v1/messages",
+        anthropicVersion: "2023-06-01",
+        connection: "anthropic",
+        openai: {
+          endpoint: "https://api.openai.com",
+          path: "/v1/chat/completions",
+          connection: "openai",
+        },
+        defaultDollarsPerDay: opts.defaultDollarsPerDay ?? 50,
+        platformDollarsPerDay: opts.platformCeilingDollars ?? 0,
+        maxAppInFlight: opts.maxAppInFlight ?? 0,
+        maxUserInFlight: opts.maxUserInFlight ?? 0,
+        maxInFlight: opts.maxInFlight ?? 0,
+        maxCallMs: opts.maxCallMs ?? 600_000,
+      },
+    }),
     registry: new FakeRegistry([
-      registryEntry({ appId: APP_ID, slug: "demo", blobPrefix: PREFIX, llm }),
+      registryEntry({
+        appId: APP_ID,
+        slug: "demo",
+        blobPrefix: PREFIX,
+        visibilityMode: opts.llm?.visibilityMode ?? "internal",
+        llm: llm === null ? undefined : { models: llm.models, dollarsPerDay: llm.dollarsPerDay },
+      }),
     ]),
     blob: new FakeBlobReader(),
     sessions,
     oidc: new FakeOidcClient(),
     llmProvider: opts.withProvider === false ? null : provider,
     usage: opts.withProvider === false ? null : usage,
+    leases,
   });
-  return { app, sessions, provider, usage };
+  return { app, sessions, provider, usage, leases };
 }
 
-async function seedSession(sessions: FakeSessionStore, appId = APP_ID): Promise<string> {
+async function seedSession(
+  sessions: FakeSessionStore,
+  appId = APP_ID,
+  oid = "oid-alice",
+): Promise<string> {
   const id = randomUUID();
   await sessions.createPending({
     id,
     appId,
     user: {
-      oid: "oid-alice",
+      oid,
       displayName: "Alice Anders",
       name: null,
       email: null,
@@ -142,6 +199,27 @@ describe("happy paths", () => {
       errorDetail: null,
     });
     expect(edge.usage.records[0]?.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("meters once with done totals when the provider emits an interim usage event", async () => {
+    const edge = buildLlmEdge();
+    edge.provider.earlyUsage = {
+      inputTokens: 999,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    };
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+
+    expect(res.statusCode).toBe(200);
+    expect(edge.usage.records).toHaveLength(1);
+    expect(edge.usage.records[0]).toMatchObject({
+      inputTokens: 5,
+      outputTokens: 2,
+      costMicroUsd: 75,
+      outcome: "ok",
+    });
   });
 
   it("returns a single JSON body when stream:false", async () => {
@@ -341,6 +419,52 @@ describe("quota: block-new, finish-in-flight (USD)", () => {
     ]);
   });
 
+  it("sets helix.reason on the llm span for day and burst refusals", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const dayEdge = buildLlmEdge();
+      dayEdge.usage.spendTodayMicro = 1_000_000;
+      const dayToken = await seedSession(dayEdge.sessions);
+      await chat(dayEdge, dayToken, ASK);
+      const daySpan = telemetry.spans().find((s) => s.name === SPAN_LLM);
+      expect(daySpan?.attributes[ATTR_REASON]).toBe("app_budget_day");
+
+      telemetry.reset();
+      const burstEdge = buildLlmEdge();
+      burstEdge.usage.spendTodayMicro = 200_000;
+      burstEdge.usage.spendHourMicro = 200_000;
+      const burstToken = await seedSession(burstEdge.sessions);
+      await chat(burstEdge, burstToken, ASK);
+      const burstSpan = telemetry.spans().find((s) => s.name === SPAN_LLM);
+      expect(burstSpan?.attributes[ATTR_REASON]).toBe("app_budget_burst");
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
+  it("throttles quota_blocked ledger rows after 20 refusals per window but counts every refusal", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const edge = buildLlmEdge();
+      edge.usage.spendTodayMicro = 1_000_000;
+      const token = await seedSession(edge.sessions);
+      for (let i = 0; i < 25; i += 1) {
+        const res = await chat(edge, token, ASK);
+        expect(res.statusCode).toBe(429);
+        expect(res.json().error.code).toBe("quota_exceeded");
+      }
+      const blocked = edge.usage.records.filter((r) => r.outcome === "quota_blocked");
+      expect(blocked).toHaveLength(20);
+      const denied = (await telemetry.metrics()).filter(
+        (p) => p.name === INSTR_GATEWAY_ADMISSION_DENIED,
+      );
+      const totalDenied = denied.reduce((sum, p) => sum + p.value, 0);
+      expect(totalDenied).toBe(25);
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
   it("admits an under-cap request and runs it to completion even if it crosses", async () => {
     const edge = buildLlmEdge();
     edge.usage.spendTodayMicro = 999_999; // just under the $1 cap — admitted
@@ -366,12 +490,41 @@ describe("quota: block-new, finish-in-flight (USD)", () => {
     });
   });
 
-  it("imposes no cap when the grant omits dollarsPerDay", async () => {
-    const edge = buildLlmEdge({ llm: { models: [MODEL] } });
-    edge.usage.spendTodayMicro = 10_000_000_000;
-    const token = await seedSession(edge.sessions);
-    const res = await chat(edge, token, ASK);
-    expect(res.statusCode).toBe(200);
+  it("enforces the install default when the grant omits dollarsPerDay", async () => {
+    const unset = buildLlmEdge({ llm: { models: [MODEL] } });
+    unset.usage.spendTodayMicro = 50_000_000;
+    const token = await seedSession(unset.sessions);
+    const atCap = await chat(unset, token, ASK);
+    expect(atCap.statusCode).toBe(429);
+    expect(atCap.json().error.code).toBe("quota_exceeded");
+    expect(unset.provider.calls).toHaveLength(0);
+
+    const burst = buildLlmEdge({ llm: { models: [MODEL] } });
+    burst.usage.spendTodayMicro = 1_000_000;
+    burst.usage.spendHourMicro = Math.ceil(50_000_000 / 6);
+    const burstToken = await seedSession(burst.sessions);
+    const overBurst = await chat(burst, burstToken, ASK);
+    expect(overBurst.statusCode).toBe(429);
+    expect(overBurst.json().error.code).toBe("rate_limited");
+
+    const under = buildLlmEdge({ llm: { models: [MODEL] } });
+    under.usage.spendTodayMicro = 49_999_999;
+    under.usage.spendHourMicro = 0;
+    const underToken = await seedSession(under.sessions);
+    const ok = await chat(under, underToken, ASK);
+    expect(ok.statusCode).toBe(200);
+
+    const explicit = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 500 } });
+    explicit.usage.spendTodayMicro = 400_000_000;
+    const explicitToken = await seedSession(explicit.sessions);
+    const explicitOk = await chat(explicit, explicitToken, ASK);
+    expect(explicitOk.statusCode).toBe(200);
+
+    const noDefault = buildLlmEdge({ llm: { models: [MODEL] }, defaultDollarsPerDay: 0 });
+    noDefault.usage.spendTodayMicro = 10_000_000_000;
+    const noDefaultToken = await seedSession(noDefault.sessions);
+    const unlimited = await chat(noDefault, noDefaultToken, ASK);
+    expect(unlimited.statusCode).toBe(200);
   });
 
   it("403s a model with no configured price before reaching the provider", async () => {
@@ -557,6 +710,245 @@ describe("an upstream 429 is a throttle, not an outage", () => {
   });
 });
 
+describe("cut and failed calls are charged", () => {
+  function cutChargeMicro(
+    body: { model: string; messages: { content: string }[]; system?: string },
+    usage: { inputTokens: number; outputTokens: number },
+  ): number {
+    return Math.round(
+      costUsd({
+        model: body.model,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      }) * 1_000_000,
+    );
+  }
+
+  it("charges an input-byte estimate and blocks the next call when the budget is tight", async () => {
+    const system = "x".repeat(3000);
+    const body = { ...ASK, stream: false, system };
+    const requestBytes =
+      Buffer.byteLength(system, "utf8") + Buffer.byteLength(ASK.messages[0]!.content, "utf8");
+    const inputTokens = Math.ceil(requestBytes / BYTES_PER_TOKEN);
+    const expectedMicro = cutChargeMicro(body, { inputTokens, outputTokens: 0 });
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: (expectedMicro - 1) / 1_000_000 },
+    });
+    const token = await seedSession(edge.sessions);
+    edge.provider.deltas = Array.from({ length: 50 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      for (let n = 0; n < 500; n++) {
+        if (edge.provider.sawAbort) return;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+
+    function socketHeaders(t: string): Record<string, string> {
+      return {
+        host: HOST.host,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${t}`,
+      };
+    }
+
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: socketHeaders(token),
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => edge.provider.calls.length === 1, "the provider to be called");
+      ac.abort();
+      await pending;
+      await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the cut row to land");
+
+      expect(edge.usage.records[0]).toMatchObject({
+        outcome: "error",
+        inputTokens,
+        stopReason: null,
+      });
+      expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThanOrEqual(expectedMicro);
+      expect(edge.usage.records[0]?.errorDetail).toMatch(/;usage=estimated$/);
+
+      const blocked = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: socketHeaders(token),
+        body: JSON.stringify(ASK),
+      });
+      expect(blocked.statusCode).toBe(429);
+      expect(((await blocked.body.json()) as { error: { code: string } }).error.code).toBe(
+        "quota_exceeded",
+      );
+      expect(edge.usage.records).toHaveLength(2);
+      expect(edge.usage.records[1]?.outcome).toBe("quota_blocked");
+    });
+  });
+
+  it("prefers measured input and estimates relayed output on a mixed hang-up", async () => {
+    const edge = buildLlmEdge();
+    edge.provider.earlyUsage = {
+      inputTokens: 1200,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    };
+    edge.provider.deltas = Array.from({ length: 200 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async (i) => {
+      if (i > 0) await new Promise((r) => setTimeout(r, 5));
+    };
+    const token = await seedSession(edge.sessions);
+    await withServer(edge.app, async (base) => {
+      const res = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: true }),
+      });
+      expect(res.statusCode).toBe(200);
+      for await (const chunk of res.body) {
+        if (String(chunk).includes("event: delta")) break;
+      }
+      res.body.destroy();
+      await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the cut row to land");
+    });
+    const relayedBytes = Buffer.byteLength("d0", "utf8");
+    const estimatedOutput = Math.ceil(relayedBytes / BYTES_PER_TOKEN);
+    expect(edge.usage.records[0]).toMatchObject({
+      inputTokens: 1200,
+      stopReason: null,
+    });
+    expect(edge.usage.records[0]?.outputTokens).toBeGreaterThanOrEqual(estimatedOutput);
+    expect(edge.usage.records[0]?.errorDetail).toMatch(/;usage=mixed$/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("charges a post-200 OpenAI-shaped stream failure and keeps the in-band error frame", async () => {
+    const edge = buildLlmEdge();
+    const msg = "openai stream ended without a usage block";
+    edge.provider.errorAfterDeltas = new LlmProviderError(msg);
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("event: error");
+    const row = edge.usage.records[0];
+    expect(row).toMatchObject({ outcome: "error", stopReason: null });
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+    expect(row?.errorDetail).toMatch(new RegExp(`^${msg};usage=estimated$`));
+  });
+
+  it("does not estimate a vendor rejection before the stream starts", async () => {
+    for (const status of [429, 400, 500]) {
+      const edge = buildLlmEdge();
+      edge.provider.error = new LlmProviderError(`vendor ${status}`, status);
+      const token = await seedSession(edge.sessions);
+      const res = await chat(edge, token, { ...ASK, stream: true });
+      expect(res.statusCode).toBeGreaterThanOrEqual(400);
+      expect(edge.usage.records[0]).toMatchObject({ outcome: "error", costMicroUsd: 0 });
+      expect(edge.usage.records[0]?.errorDetail ?? "").not.toMatch(/;usage=/);
+    }
+  });
+
+  it("keeps the usage marker when the upstream error text is very long", async () => {
+    const edge = buildLlmEdge();
+    const long = "e".repeat(1000);
+    edge.provider.errorAfterDeltas = new LlmProviderError(long);
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, { ...ASK, stream: true });
+    const detail = edge.usage.records[0]?.errorDetail ?? "";
+    expect(detail.length).toBeLessThanOrEqual(ERROR_DETAIL_MAX);
+    expect(detail.endsWith(";usage=estimated")).toBe(true);
+  });
+
+  it("does not call the provider when the client leaves during admission", async () => {
+    const edge = buildLlmEdge({ maxAppInFlight: 5 });
+    const token = await seedSession(edge.sessions);
+    let unblock: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    const baseAcquire = edge.leases.acquire.bind(edge.leases);
+    vi.spyOn(edge.leases, "acquire").mockImplementation(async (req, ttl) => {
+      await gate;
+      return baseAcquire(req, ttl);
+    });
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: true }),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(
+        () => (edge.leases.acquire as ReturnType<typeof vi.fn>).mock.calls.length === 1,
+        "lease acquire to start",
+      );
+      ac.abort();
+      await new Promise((r) => setTimeout(r, 100));
+      unblock();
+      await pending;
+      await until(() => edge.usage.records.length === 1, "cut row");
+    });
+    expect(edge.provider.calls).toHaveLength(0);
+    expect(String(edge.usage.records[0]?.errorDetail)).toMatch(/^client_disconnected;usage=/);
+  });
+
+  it("charges the non-streaming path the same way on a hang-up", async () => {
+    const edge = buildLlmEdge();
+    const token = await seedSession(edge.sessions);
+    edge.provider.deltas = Array.from({ length: 50 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      for (let n = 0; n < 500; n++) {
+        if (edge.provider.sawAbort) return;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: false }),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => edge.provider.calls.length === 1, "the provider to be called");
+      ac.abort();
+      await pending;
+      await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the cut row to land");
+    });
+    expect(String(edge.usage.records[0]?.errorDetail)).toMatch(/^client_disconnected;usage=/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+    expect(edge.usage.records[0]?.stopReason).toBeNull();
+  });
+});
+
 /**
  * Real-socket coverage for client disconnect. The rest of this file drives the
  * app through `app.inject()`, which cannot express a client hanging up — and
@@ -603,7 +995,11 @@ describe("/_api/llm/chat over a real socket", () => {
     // Metered once, and marked as the app leaving rather than a vendor failure.
     expect(edge.usage.records).toHaveLength(1);
     expect(edge.usage.records[0]?.outcome).toBe("error");
-    expect(edge.usage.records[0]?.errorDetail).toBe("client_disconnected");
+    expect(edge.usage.records[0]?.errorDetail).toMatch(
+      /^client_disconnected;usage=(measured|estimated|mixed)$/,
+    );
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+    expect(edge.usage.records[0]?.stopReason).toBeNull();
   });
 
   it("aborts a non-streaming call when the client hangs up", async () => {
@@ -625,7 +1021,15 @@ describe("/_api/llm/chat over a real socket", () => {
       ac.abort();
       await pending;
       await until(() => edge.provider.sawAbort, "the provider signal to abort");
+      await until(() => edge.usage.records.length === 1, "the call to be metered");
     });
+    expect(edge.usage.records).toHaveLength(1);
+    expect(edge.usage.records[0]?.outcome).toBe("error");
+    expect(edge.usage.records[0]?.errorDetail).toMatch(
+      /^client_disconnected;usage=(measured|estimated|mixed)$/,
+    );
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+    expect(edge.usage.records[0]?.stopReason).toBeNull();
   });
 
   it("streams a normal completion unchanged over a socket", async () => {
@@ -663,5 +1067,667 @@ describe("/_api/llm/chat over a real socket", () => {
     });
     expect(edge.provider.sawAbort).toBe(false);
     expect(edge.usage.records[0]?.outcome).toBe("ok");
+  });
+});
+
+describe("secondsUntilNextLocalMidnight", () => {
+  it("returns seconds until local midnight for a mid-day instant", () => {
+    const now = new Date(2026, 5, 15, 12, 0, 0);
+    expect(secondsUntilNextLocalMidnight(now)).toBe(43_200);
+  });
+
+  it("returns at least 1 second just before local midnight", () => {
+    const now = new Date(2026, 5, 15, 23, 59, 59, 500);
+    expect(secondsUntilNextLocalMidnight(now)).toBe(1);
+  });
+});
+
+describe("platform ceiling", () => {
+  it("503s at the ceiling with retry-after and a throttled denial row", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const edge = buildLlmEdge({
+        llm: { models: [MODEL], dollarsPerDay: 10 },
+        platformCeilingDollars: 1,
+      });
+      edge.usage.spendTodayMicro = 0;
+      edge.usage.platformSpendTodayMicro = 1_000_000;
+      const token = await seedSession(edge.sessions);
+      const res = await chat(edge, token, ASK);
+      expect(res.statusCode).toBe(503);
+      expect(res.json().error.code).toBe("capability_unavailable");
+      expect(res.headers["retry-after"]).toBeDefined();
+      const retryAfter = Number(res.headers["retry-after"]);
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+      expect(retryAfter).toBeLessThanOrEqual(86_400);
+      expect(edge.provider.calls).toHaveLength(0);
+      expect(edge.usage.records).toEqual([
+        expect.objectContaining({
+          outcome: "quota_blocked",
+          errorDetail: "platform_ceiling",
+        }),
+      ]);
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
+  it("serves when platform spend is below the ceiling", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 10 },
+      platformCeilingDollars: 2,
+    });
+    edge.usage.platformSpendTodayMicro = 1_000_000;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("ignores the ceiling when it is disabled", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 10 },
+      platformCeilingDollars: 0,
+    });
+    edge.usage.platformSpendTodayMicro = 9_000_000;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("prefers the per-app 429 when both app and platform are over budget", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 1 },
+      platformCeilingDollars: 1,
+    });
+    edge.usage.spendTodayMicro = 1_000_000;
+    edge.usage.platformSpendTodayMicro = 1_000_000;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(429);
+    expect(res.json().error.code).toBe("quota_exceeded");
+  });
+
+  it("throttles platform_ceiling ledger rows but counts every admission denial", async () => {
+    const telemetry = startRecordingTelemetry();
+    try {
+      const edge = buildLlmEdge({
+        llm: { models: [MODEL], dollarsPerDay: 10 },
+        platformCeilingDollars: 1,
+      });
+      edge.usage.platformSpendTodayMicro = 1_000_000;
+      const token = await seedSession(edge.sessions);
+      for (let i = 0; i < 25; i += 1) {
+        const res = await chat(edge, token, ASK);
+        expect(res.statusCode).toBe(503);
+      }
+      const blocked = edge.usage.records.filter((r) => r.outcome === "quota_blocked");
+      expect(blocked).toHaveLength(20);
+      const denied = (await telemetry.metrics()).filter(
+        (p) =>
+          p.name === INSTR_GATEWAY_ADMISSION_DENIED &&
+          p.attributes["helix.reason"] === "platform_ceiling",
+      );
+      const totalDenied = denied.reduce((sum, p) => sum + p.value, 0);
+      expect(totalDenied).toBe(25);
+    } finally {
+      await telemetry.restore();
+    }
+  });
+
+  it("503s with retry-after 5 when the platform read fails", async () => {
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 10 },
+      platformCeilingDollars: 1,
+    });
+    edge.usage.platformReadError = new Error("db down");
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error.code).toBe("capability_unavailable");
+    expect(res.headers["retry-after"]).toBe("5");
+    expect(edge.provider.calls).toHaveLength(0);
+    expect(edge.usage.records).toHaveLength(0);
+  });
+
+  it("counts a cut-stream charge toward the platform sum", async () => {
+    const system = "x".repeat(3000);
+    const body = { ...ASK, stream: false, system };
+    const requestBytes =
+      Buffer.byteLength(system, "utf8") + Buffer.byteLength(ASK.messages[0]!.content, "utf8");
+    const inputTokens = Math.ceil(requestBytes / BYTES_PER_TOKEN);
+    const expectedMicro = Math.round(
+      costUsd({
+        model: body.model,
+        inputTokens,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      }) * 1_000_000,
+    );
+    const edge = buildLlmEdge({
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+      platformCeilingDollars: expectedMicro / 1_000_000,
+    });
+    const token = await seedSession(edge.sessions);
+    edge.provider.deltas = Array.from({ length: 50 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    };
+    await withServer(edge.app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => edge.provider.calls.length === 1, "provider called");
+      ac.abort();
+      await pending;
+      await until(() => edge.usage.records.length === 1, "cut row");
+      const blocked = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${token}`,
+        },
+        body: JSON.stringify(ASK),
+      });
+      expect(blocked.statusCode).toBe(503);
+      expect(((await blocked.body.json()) as { error: { code: string } }).error.code).toBe(
+        "capability_unavailable",
+      );
+    });
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThanOrEqual(expectedMicro);
+  });
+});
+
+describe("concurrency caps and the call deadline", () => {
+  afterEach(() => {
+    resetProcessShutdownSignalForTests();
+  });
+
+  async function holdFirstDelta(edge: LlmEdge): Promise<() => void> {
+    let resume!: () => void;
+    const gate = new Promise<void>((r) => {
+      resume = r;
+    });
+    edge.provider.onDelta = async () => {
+      await gate;
+    };
+    return resume;
+  }
+
+  it("refuses a second concurrent call per app and admits again after the first finishes", async () => {
+    const edge = buildLlmEdge({
+      maxAppInFlight: 1,
+      maxUserInFlight: 10,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const alice = await seedSession(edge.sessions, APP_ID, "oid-a");
+    const bob = await seedSession(edge.sessions, APP_ID, "oid-b");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, alice, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first call upstream");
+    const blocked = await chat(edge, bob, { ...ASK, stream: true });
+    expect(blocked.statusCode).toBe(503);
+    expect(blocked.json().error.code).toBe("capability_unavailable");
+    expect(edge.provider.calls).toHaveLength(1);
+    resume();
+    await first;
+    const third = await chat(edge, bob, ASK);
+    expect(third.statusCode).toBe(200);
+  });
+
+  it("refuses a second concurrent call from the same user but admits a different user", async () => {
+    const edge = buildLlmEdge({
+      maxAppInFlight: 5,
+      maxUserInFlight: 1,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const alice = await seedSession(edge.sessions, APP_ID, "oid-a");
+    const bob = await seedSession(edge.sessions, APP_ID, "oid-b");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, alice, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first call upstream");
+    const sameUser = await chat(edge, alice, { ...ASK, stream: true });
+    expect(sameUser.statusCode).toBe(503);
+    resume();
+    await first;
+    const otherUser = await chat(edge, bob, { ...ASK, stream: true });
+    expect(otherUser.statusCode).toBe(200);
+  });
+
+  it("does not bucket anonymous callers by user scope", async () => {
+    const edge = buildLlmEdge({
+      allowUnauthenticated: true,
+      maxAppInFlight: 5,
+      maxUserInFlight: 1,
+      llm: { models: [MODEL], dollarsPerDay: 100, visibilityMode: "public" },
+    });
+    const [first, second] = await Promise.all([
+      chat(edge, null, { ...ASK, stream: true }),
+      chat(edge, null, { ...ASK, stream: true }),
+    ]);
+    expect(first.statusCode).not.toBe(503);
+    expect(second.statusCode).not.toBe(503);
+  });
+
+  it("refuses when the replica gate is full", async () => {
+    const edge = buildLlmEdge({
+      maxInFlight: 1,
+      maxAppInFlight: 100,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+    const b = await seedSession(edge.sessions, APP_ID, "oid-b");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, a, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first call");
+    const blocked = await chat(edge, b, { ...ASK, stream: true });
+    expect(blocked.statusCode).toBe(503);
+    expect(blocked.json().error.message).toContain("replica");
+    resume();
+    await first;
+  });
+
+  it("cuts and releases the lease when process shutdown aborts an in-flight stream", async () => {
+    const leases = new InMemoryLeaseStore();
+    const releaseRows: number[] = [];
+    const ctx: { edge: LlmEdge | undefined } = { edge: undefined };
+    const baseRelease = leases.release.bind(leases);
+    vi.spyOn(leases, "release").mockImplementation(async (id) => {
+      releaseRows.push(ctx.edge!.usage.records.length);
+      await baseRelease(id);
+    });
+    ctx.edge = buildLlmEdge({
+      maxAppInFlight: 5,
+      leases,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const token = await seedSession(ctx.edge.sessions);
+    const resume = await holdFirstDelta(ctx.edge);
+    const pending = chat(ctx.edge, token, { ...ASK, stream: true });
+    await until(() => ctx.edge!.provider.calls.length === 1, "upstream started");
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(1);
+    abortInFlightWorkForShutdown();
+    resume();
+    await pending;
+    await until(() => ctx.edge!.usage.records.length === 1, "shutdown cut row");
+    expect(ctx.edge!.usage.records[0]?.outcome).toBe("error");
+    expect(ctx.edge!.usage.records[0]?.errorDetail).toContain("process_shutdown");
+    expect(releaseRows[0]).toBe(1);
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  it("releases the lease only after the ledger row on streaming, non-streaming, upstream-error and hang-up paths", async () => {
+    const cases = [
+      {
+        label: "streaming ok",
+        run: async (edge: LlmEdge, token: string) => chat(edge, token, { ...ASK, stream: true }),
+      },
+      {
+        label: "non-streaming ok",
+        run: async (edge: LlmEdge, token: string) => chat(edge, token, { ...ASK, stream: false }),
+      },
+      {
+        label: "upstream error after delta",
+        run: async (edge: LlmEdge, token: string) => {
+          edge.provider.errorAfterDeltas = new LlmProviderError("boom");
+          edge.provider.deltas = ["x"];
+          return chat(edge, token, { ...ASK, stream: true });
+        },
+      },
+    ];
+
+    for (const c of cases) {
+      const leases = new InMemoryLeaseStore();
+      const releaseRows: number[] = [];
+      const ctx: { edge: LlmEdge | undefined } = { edge: undefined };
+      const baseRelease = leases.release.bind(leases);
+      vi.spyOn(leases, "release").mockImplementation(async (id) => {
+        releaseRows.push(ctx.edge!.usage.records.length);
+        await baseRelease(id);
+      });
+      ctx.edge = buildLlmEdge({
+        maxAppInFlight: 5,
+        leases,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const token = await seedSession(ctx.edge.sessions);
+      await c.run(ctx.edge, token);
+      expect(releaseRows[0], c.label).toBe(1);
+      expect(leases.held(`llm:app:${APP_ID}`), c.label).toBe(0);
+      const ok = await chat(ctx.edge, token, ASK);
+      expect(ok.statusCode, c.label).toBe(200);
+    }
+
+    const leases = new InMemoryLeaseStore();
+    const releaseRows: number[] = [];
+    const hangCtx: { edge: LlmEdge | undefined } = { edge: undefined };
+    const baseRelease = leases.release.bind(leases);
+    vi.spyOn(leases, "release").mockImplementation(async (id) => {
+      releaseRows.push(hangCtx.edge!.usage.records.length);
+      await baseRelease(id);
+    });
+    hangCtx.edge = buildLlmEdge({
+      maxAppInFlight: 5,
+      leases,
+      llm: { models: [MODEL], dollarsPerDay: 100 },
+    });
+    const hangToken = await seedSession(hangCtx.edge.sessions);
+    await withServer(hangCtx.edge.app, async (base) => {
+      const res = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers: {
+          host: HOST.host,
+          "sec-fetch-mode": "cors",
+          "content-type": "application/json",
+          origin: ORIGIN,
+          cookie: `${SESSION_COOKIE}=${hangToken}`,
+        },
+        body: JSON.stringify({ ...ASK, stream: true }),
+      });
+      for await (const chunk of res.body) {
+        if (String(chunk).includes("event: delta")) break;
+      }
+      res.body.destroy();
+      await until(() => hangCtx.edge!.usage.records.length === 1, "hang-up row");
+    });
+    expect(releaseRows[0]).toBe(1);
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  it("treats 0 as disabling each cap", async () => {
+    const edge = buildLlmEdge({ maxAppInFlight: 0, maxUserInFlight: 0, maxInFlight: 0 });
+    const a = await seedSession(edge.sessions, APP_ID, "oid-1");
+    const b = await seedSession(edge.sessions, APP_ID, "oid-2");
+    const resume = await holdFirstDelta(edge);
+    const first = chat(edge, a, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 1, "first");
+    const second = chat(edge, b, { ...ASK, stream: true });
+    await until(() => edge.provider.calls.length === 2, "second");
+    resume();
+    const [r1, r2] = await Promise.all([first, second]);
+    expect(r1.statusCode).toBe(200);
+    expect(r2.statusCode).toBe(200);
+  });
+
+  it("fails closed when lease acquire throws and returns the replica gate", async () => {
+    class BrokenStore extends InMemoryLeaseStore {
+      #fail = true;
+      override async acquire(...args: Parameters<LeaseStore["acquire"]>) {
+        if (this.#fail) {
+          this.#fail = false;
+          throw new Error("db down");
+        }
+        return super.acquire(...args);
+      }
+    }
+    const broken = new BrokenStore();
+    const edge = buildLlmEdge({ maxAppInFlight: 5, maxInFlight: 5, leases: broken });
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, ASK);
+    expect(res.statusCode).toBe(503);
+    expect(edge.provider.calls).toHaveLength(0);
+    const ok = await chat(edge, token, ASK);
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("charges a deadline abort and returns an in-band streaming error", async () => {
+    const edge = buildLlmEdge({ maxCallMs: 50, llm: { models: [MODEL], dollarsPerDay: 100 } });
+    edge.provider.deltas = Array.from({ length: 20 }, (_, i) => `d${i}`);
+    edge.provider.onDelta = async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    };
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("event: error");
+    const row = edge.usage.records[0];
+    expect(row?.outcome).toBe("error");
+    expect(row?.errorDetail).toMatch(/^deadline_exceeded;usage=/);
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+    expect(row?.stopReason).toBeNull();
+    expect(edge.leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  function undiciBodyTimeout(): Error {
+    const err = new Error("Body Timeout");
+    (err as NodeJS.ErrnoException).code = "UND_ERR_BODY_TIMEOUT";
+    return err;
+  }
+
+  it("does not charge a connect timeout: the request never left", async () => {
+    const edge = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 100 } });
+    const connectTimeout = new Error("Connect Timeout Error");
+    (connectTimeout as NodeJS.ErrnoException).code = "UND_ERR_CONNECT_TIMEOUT";
+    edge.provider.error = connectTimeout;
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, { ...ASK, stream: false });
+    const row = edge.usage.records[0];
+    expect(row?.errorDetail).not.toMatch(/^upstream_timeout/);
+    expect(row?.costMicroUsd).toBe(0);
+  });
+
+  it("charges upstream_timeout when the hop idles out before any stream byte (streaming)", async () => {
+    const edge = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 100 } });
+    edge.provider.error = new EgressProviderError("egress request failed", {
+      cause: undiciBodyTimeout(),
+    });
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: true });
+    expect(res.statusCode).toBe(502);
+    const row = edge.usage.records[0];
+    expect(row?.errorDetail).toMatch(/^upstream_timeout;usage=/);
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("charges upstream_timeout when the hop idles out before any stream byte (non-streaming)", async () => {
+    const edge = buildLlmEdge({ llm: { models: [MODEL], dollarsPerDay: 100 } });
+    edge.provider.error = undiciBodyTimeout();
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: false });
+    expect(res.statusCode).toBe(502);
+    expect(edge.usage.records[0]?.errorDetail).toMatch(/^upstream_timeout;usage=/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("records $0 on a vendor 429 before any byte", async () => {
+    const edge = buildLlmEdge();
+    edge.provider.error = new LlmProviderError('egress llm call failed (429): {"error":{}}', 429);
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, { ...ASK, stream: false });
+    expect(edge.usage.records[0]?.costMicroUsd).toBe(0);
+  });
+
+  it("uses deadline_exceeded when the call deadline fires before hop timeouts", async () => {
+    const edge = buildLlmEdge({ maxCallMs: 50, llm: { models: [MODEL], dollarsPerDay: 100 } });
+    const aborted = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    edge.provider.hangUntilAbort = aborted;
+    const token = await seedSession(edge.sessions);
+    const res = await chat(edge, token, { ...ASK, stream: false });
+    expect(res.statusCode).toBe(502);
+    expect(edge.usage.records[0]?.errorDetail).toMatch(/^deadline_exceeded;usage=/);
+    expect(edge.usage.records[0]?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("estimates a cut reasoning call from the relayed bytes, not from a tiny maxTokens", async () => {
+    const REASONING_MODEL = "gpt-5-nano";
+    const edge = buildLlmEdge({ llm: { models: [REASONING_MODEL], dollarsPerDay: 100 } });
+    // A long visible answer, then the stream dies with no usage block.
+    const answer = "x".repeat(3_000);
+    edge.provider.deltas = [answer];
+    edge.provider.errorAfterDeltas = new Error("upstream reset");
+    const token = await seedSession(edge.sessions);
+    const body = { model: REASONING_MODEL, messages: ASK.messages, maxTokens: 1, stream: false };
+    await chat(edge, token, body);
+    const floor = outputTokenCapForEstimate(REASONING_MODEL, 1);
+    const row = edge.usage.records[0];
+    expect(floor).toBeGreaterThan(1);
+    // Clamping to the client's maxTokens would record 1 here.
+    expect(row?.outputTokens).toBeGreaterThan(100);
+    expect(row?.outputTokens).toBeLessThanOrEqual(floor);
+    expect(row?.costMicroUsd).toBeGreaterThan(0);
+  });
+
+  it("charges only the input estimate when a reasoning call times out with nothing relayed", async () => {
+    const REASONING_MODEL = "gpt-5-nano";
+    const edge = buildLlmEdge({ llm: { models: [REASONING_MODEL], dollarsPerDay: 100 } });
+    edge.provider.error = undiciBodyTimeout();
+    const token = await seedSession(edge.sessions);
+    const body = { model: REASONING_MODEL, messages: ASK.messages, maxTokens: 1, stream: false };
+    await chat(edge, token, body);
+    const row = edge.usage.records[0];
+    // A short prompt on the cheapest model rounds to zero micro-dollars, so the
+    // charge is asserted on tokens: the input estimate is recorded, no output.
+    expect(row?.errorDetail).toMatch(/^upstream_timeout;usage=/);
+    expect(row?.outputTokens).toBe(0);
+    expect(row?.inputTokens).toBeGreaterThan(0);
+  });
+
+  it("passes maxCallMs plus grace as the lease TTL", async () => {
+    const leases = new InMemoryLeaseStore();
+    const acquire = vi.spyOn(leases, "acquire");
+    const edge = buildLlmEdge({ maxCallMs: 12_000, maxAppInFlight: 5, leases });
+    const token = await seedSession(edge.sessions);
+    await chat(edge, token, ASK);
+    expect(acquire).toHaveBeenCalledWith(expect.any(Array), 12_000 + 60_000);
+  });
+
+  it("records admission_denied metrics for concurrency reasons without personal dimensions", async () => {
+    const assertReason = async (
+      reason: "concurrency_app" | "concurrency_user" | "concurrency_replica",
+      run: () => Promise<void>,
+    ): Promise<void> => {
+      const recording = startRecordingTelemetry();
+      try {
+        await run();
+        const points = (await recording.metrics()).filter(
+          (p) => p.name === INSTR_GATEWAY_ADMISSION_DENIED,
+        );
+        const match = points.filter((p) => p.attributes["helix.reason"] === reason);
+        expect(match.length).toBeGreaterThan(0);
+        for (const point of match) {
+          expect(Object.keys(point.attributes).sort()).toEqual([
+            "helix.app_id",
+            "helix.capability",
+            "helix.reason",
+          ]);
+        }
+      } finally {
+        await recording.restore();
+      }
+    };
+    await assertReason("concurrency_app", async () => {
+      const edge = buildLlmEdge({
+        maxAppInFlight: 1,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+      const b = await seedSession(edge.sessions, APP_ID, "oid-b");
+      const resume = await holdFirstDelta(edge);
+      const first = chat(edge, a, { ...ASK, stream: true });
+      await until(() => edge.provider.calls.length === 1, "first");
+      await chat(edge, b, { ...ASK, stream: true });
+      resume();
+      await first;
+    });
+    await assertReason("concurrency_user", async () => {
+      const edge = buildLlmEdge({
+        maxAppInFlight: 10,
+        maxUserInFlight: 1,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+      const resume = await holdFirstDelta(edge);
+      const first = chat(edge, a, { ...ASK, stream: true });
+      await until(() => edge.provider.calls.length === 1, "first");
+      const denied = await chat(edge, a, { ...ASK, stream: true });
+      expect(denied.statusCode).toBe(503);
+      resume();
+      await first;
+    });
+    await assertReason("concurrency_replica", async () => {
+      const edge = buildLlmEdge({
+        maxInFlight: 1,
+        maxAppInFlight: 10,
+        llm: { models: [MODEL], dollarsPerDay: 100 },
+      });
+      const a = await seedSession(edge.sessions, APP_ID, "oid-a");
+      const b = await seedSession(edge.sessions, APP_ID, "oid-b");
+      const resume = await holdFirstDelta(edge);
+      const first = chat(edge, a, { ...ASK, stream: true });
+      await until(() => edge.provider.calls.length === 1, "first");
+      await chat(edge, b, { ...ASK, stream: true });
+      resume();
+      await first;
+    });
+  });
+
+  it("charges eight hung-up streams against the platform ceiling (KP-2 end to end)", async () => {
+    const edge = buildLlmEdge({
+      maxAppInFlight: 20,
+      maxUserInFlight: 20,
+      maxInFlight: 20,
+      // High enough for eight concurrent hang-ups (~30 micro each), low enough to block a ninth.
+      platformCeilingDollars: 0.000_22,
+      llm: { models: [MODEL], dollarsPerDay: 1000 },
+    });
+    edge.provider.deltas = Array.from({ length: 50 }, (_, n) => `d${n}`);
+    edge.provider.onDelta = async () => {
+      for (let n = 0; n < 500; n++) {
+        if (edge.provider.sawAbort) return;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+    const token = await seedSession(edge.sessions);
+    await withServer(edge.app, async (base) => {
+      const headers = {
+        host: HOST.host,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      };
+      const hangUps = Array.from({ length: 8 }, () => new AbortController());
+      const pending = hangUps.map((ac) =>
+        undiciRequest(`${base}/_api/llm/chat`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...ASK, stream: true }),
+          signal: ac.signal,
+        }).catch(() => undefined),
+      );
+      await until(() => edge.provider.calls.length === 8, "eight upstream calls");
+      for (const ac of hangUps) ac.abort();
+      await Promise.all(pending);
+      await until(() => edge.usage.records.length === 8, "eight cut rows");
+      for (const row of edge.usage.records) {
+        expect(row.outcome).toBe("error");
+        expect(row.errorDetail).toMatch(/;usage=/);
+        expect(row.costMicroUsd).toBeGreaterThan(0);
+      }
+      expect(edge.leases.held(`llm:app:${APP_ID}`)).toBe(0);
+      const totalMicro = edge.usage.records.reduce((n, r) => n + (r.costMicroUsd ?? 0), 0);
+      const platform = await edge.usage.platformLlmSpendMicroUsd("prod");
+      expect(platform.todayMicro).toBe(totalMicro);
+      expect(totalMicro).toBeGreaterThan(50);
+      const blocked = await undiciRequest(`${base}/_api/llm/chat`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(ASK),
+      });
+      expect(blocked.statusCode).toBe(503);
+    });
   });
 });

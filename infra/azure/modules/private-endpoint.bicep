@@ -22,6 +22,12 @@ param groupId string
 @description('Resource id of the private DNS zone for this service.')
 param privateDnsZoneId string
 
+@description('Static private IP for the endpoint NIC, inside the endpoint subnet. Empty keeps today\'s behavior: Azure picks one. The NSG on snet-egress names the Key Vault endpoints by address, so the callers that matter pass one. Whether API version 2024-05-01 accepts ipConfigurations for these target types is unverified in Azure.')
+param privateIpAddress string = ''
+
+@description('memberName for the static IP configuration. Defaults to groupId; Key Vault uses "default" and Blob uses "blob". Only read when privateIpAddress is set. memberName values are unverified in Azure.')
+param memberName string = groupId
+
 resource privateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
   name: name
   location: location
@@ -38,6 +44,22 @@ resource privateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
         }
       }
     ]
+    // Spread, not `ipConfigurations: null`: with no pinned address the property is omitted
+    // entirely, so the request matches an endpoint created before pinning existed.
+    ...(empty(privateIpAddress)
+      ? {}
+      : {
+          ipConfigurations: [
+            {
+              name: 'ipconfig-${name}'
+              properties: {
+                groupId: groupId
+                memberName: memberName
+                privateIPAddress: privateIpAddress
+              }
+            }
+          ]
+        })
   }
 }
 

@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { resolveAppForAuth, validateReturnPath, visibilityAllows } from "./validate.js";
+import type { FastifyRequest } from "fastify";
+import { controlOrigin, publicOrigin } from "../config.js";
+import {
+  isSameOrigin,
+  makeSameOriginCheck,
+  resolveAppForAuth,
+  validateReturnPath,
+  visibilityAllows,
+} from "./validate.js";
+import { splitEdgeConfig, testAuthConfig } from "../test/config.js";
 import { FakeRegistry, registryEntry } from "../test/fakes.js";
 
 describe("validateReturnPath (the open-redirect corpus)", () => {
@@ -27,6 +36,11 @@ describe("validateReturnPath (the open-redirect corpus)", () => {
       "\\\\evil.example",
       "javascript:alert(1)",
       "data:text/html,x",
+      "//auth.local.helix.azxlabs.io/x",
+      "https://helix-apps.localhost/",
+      "/\\helix-apps.localhost",
+      "/%0d%0aSet-Cookie:x=1",
+      "/\t/evil.example",
     ]) {
       expect(validateReturnPath(evil), evil).toBeNull();
     }
@@ -93,6 +107,12 @@ describe("resolveAppForAuth", () => {
     expect(resolveAppForAuth(registry, undefined).kind).toBe("unknown");
     expect(resolveAppForAuth(registry, "Not A Slug!").kind).toBe("unknown");
     expect(resolveAppForAuth(registry, "gone").kind).toBe("unknown");
+  });
+
+  it("treats reserved platform slugs as unknown (no handoff for unservable apps)", () => {
+    for (const slug of ["auth", "portal", "api", "www"]) {
+      expect(resolveAppForAuth(registry, slug).kind).toBe("unknown");
+    }
   });
 
   it("fails closed on public visibility (no session to mint)", () => {
@@ -181,5 +201,47 @@ describe("visibilityAllows", () => {
     expect(visibilityAllows(unknown, [])).toBe(false);
     expect(visibilityAllows(unknown, ["any", "groups"])).toBe(false);
     expect(visibilityAllows({ ...entry, visibilityMode: "" as never }, [])).toBe(false);
+  });
+});
+
+describe("isSameOrigin / makeSameOriginCheck (split layout)", () => {
+  const cfg = splitEdgeConfig({ auth: testAuthConfig() });
+  const entry = registryEntry({ slug: "appa" });
+
+  it("accepts only the apps-domain origin for the slug", () => {
+    expect(isSameOrigin(publicOrigin(cfg, "appa"), cfg, "appa")).toBe(true);
+    expect(isSameOrigin(controlOrigin(cfg, "auth"), cfg, "appa")).toBe(false);
+    expect(isSameOrigin(publicOrigin(cfg, "appb"), cfg, "appa")).toBe(false);
+    expect(isSameOrigin(`https://appa.${cfg.controlDomain}:8080`, cfg, "appa")).toBe(false);
+  });
+
+  it("makeSameOriginCheck honours Fetch Metadata and refuses worker loads", () => {
+    const check = makeSameOriginCheck(cfg);
+    const good = {
+      headers: {
+        origin: publicOrigin(cfg, "appa"),
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+      },
+    } as FastifyRequest;
+    expect(check(good, entry)).toBe(true);
+
+    const cross = {
+      headers: {
+        origin: publicOrigin(cfg, "appa"),
+        "sec-fetch-site": "cross-site",
+        "sec-fetch-mode": "cors",
+      },
+    } as FastifyRequest;
+    expect(check(cross, entry)).toBe(false);
+
+    const worker = {
+      headers: {
+        origin: publicOrigin(cfg, "appa"),
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-dest": "worker",
+      },
+    } as FastifyRequest;
+    expect(check(worker, entry)).toBe(false);
   });
 });

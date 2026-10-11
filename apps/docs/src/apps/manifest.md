@@ -16,7 +16,7 @@ or set it when you create the app.
 {
   llm: {
     models: string[]          // which models the app may call
-    dollarsPerDay?: number    // daily spend cap in USD
+    dollarsPerDay?: number    // daily spend cap in USD; omit for the install default
   },
   data: {
     user: boolean             // per-user key/value store
@@ -65,9 +65,11 @@ The thresholds are platform policy. Two rules to know:
 
 - **Reducing privilege never needs approval.** Removing a grant, lowering a
   budget, or going from public back to internal all apply immediately.
-- **Adding a budget is a reduction, removing one is an increase.** An unset
-  budget means unlimited, so removing a cap makes the app more powerful and
-  needs an approval.
+- **Adding a budget is a reduction, removing one is an increase.** For data and
+  fetch, an unset budget means unlimited. For the LLM spend cap, omitting the
+  field uses the install default (see above), but removing an explicit cap still
+  needs approval because that default may be higher or unlimited on some
+  installs.
 
 If the change contains anything that needs approval, the whole submission
 becomes one pending request, and an admin sees the full diff.

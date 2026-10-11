@@ -5,6 +5,7 @@
 //   whether the service has recovered.
 // - Unresolved proxy: forwarded traffic never resolves beyond the socket peer,
 //   combining per-IP limits into ingress-wide buckets.
+// - LLM platform ceiling: helix.gateway.admission_denied with reason platform_ceiling.
 //
 // Query the shared Log Analytics workspace. Its metric table is AppMetrics,
 // with Sum/ItemCount/Min/Max columns, not customMetrics.value.
@@ -171,6 +172,45 @@ resource trustProxyRule 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = if
       allOf: [
         {
           query: trustProxyQuery
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4 — platform LLM daily ceiling reached
+// ---------------------------------------------------------------------------
+// Unverified in Azure: Properties["helix.reason"] and sum(Sum) on AppMetrics counters.
+var platformCeilingQuery = 'AppMetrics | where Name == "helix.gateway.admission_denied" | where tostring(Properties["helix.reason"]) == "platform_ceiling" | summarize Denied = sum(Sum) by AppRoleName | where Denied > 0'
+
+resource platformCeilingRule 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = if (includeMetricRule) {
+  name: '${namePrefix}-alert-llm-platform-ceiling'
+  location: location
+  kind: 'LogAlert'
+  properties: {
+    displayName: 'LLM platform ceiling reached'
+    description: 'The platform-wide daily LLM spend ceiling was reached and new LLM calls are being refused with 503 until local midnight.'
+    severity: severity
+    enabled: true
+    scopes: [workspaceId]
+    evaluationFrequency: evaluationFrequency
+    windowSize: windowSize
+    criteria: {
+      allOf: [
+        {
+          query: platformCeilingQuery
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0

@@ -4,9 +4,12 @@
  * telemetry on SIGTERM/SIGINT.
  *
  * Fastify closes idle connections but waits for active requests. Long-lived
- * SSE streams may outlast shutdown, so a hard deadline forces exit. The default
- * 10-second grace period fits inside ACA's documented 30-second stop window.
- * Signals may be missed and SIGKILL cannot be handled; the telemetry batch
+ * SSE streams may outlast shutdown, so a hard deadline forces exit. In-flight
+ * gateway work is aborted shortly before that deadline so cut rows and lease
+ * release can finish inside the drain; streams that complete earlier are left
+ * alone. The default 10-second grace period fits inside ACA's documented
+ * 30-second stop window. Signals may be missed and SIGKILL cannot be handled;
+ * the telemetry batch
  * interval limits pending data loss in those cases.
  *
  * Node-only: export through @azx-pbc/shared/lifecycle, outside the barrel used
@@ -35,7 +38,31 @@ export interface ShutdownTarget {
  */
 export const DEFAULT_SHUTDOWN_GRACE_MS = 10_000;
 
+/**
+ * How long before the hard shutdown deadline to abort in-flight gateway work (LLM streams,
+ * etc.). Leaves room for the cut path and lease release before `process.exit`.
+ */
+export const SHUTDOWN_ABORT_MARGIN_MS = 3_000;
+
 const SIGNALS = ["SIGTERM", "SIGINT"] as const;
+
+/** Aborted on shutdown so in-flight upstream work can cut and release leases. */
+let processShutdownController = new AbortController();
+
+/** Combined into gateway upstream `AbortSignal.any` (edge LLM, etc.). */
+export function processShutdownSignal(): AbortSignal {
+  return processShutdownController.signal;
+}
+
+/** Abort in-flight gateway work when a drain starts. Tests may call directly. */
+export function abortInFlightWorkForShutdown(): void {
+  processShutdownController.abort();
+}
+
+/** @internal Vitest-only: replace an already-aborted controller between cases. */
+export function resetProcessShutdownSignalForTests(): void {
+  processShutdownController = new AbortController();
+}
 
 /**
  * Resolve `SHUTDOWN_GRACE_MS`, or the {@link DEFAULT_SHUTDOWN_GRACE_MS}.
@@ -72,9 +99,11 @@ export interface GracefulShutdownOptions {
  * produced the logger and before or after `listen` — the teardown hooks are
  * guarded, so a signal during boot is as safe as one at rest.
  *
- * On a signal: log, start the (unref'd) deadline, `close()`, exit 0 — including
- * when `close()` rejects. A second signal during the drain is a no-op; forcing
- * past a stuck drain is SIGKILL's job, and the orchestrator has it.
+ * On a signal: log, schedule in-flight abort at `graceMs - SHUTDOWN_ABORT_MARGIN_MS`
+ * (immediate when grace is at or below the margin), start the (unref'd) hard deadline,
+ * `close()`, exit 0 — including when `close()` rejects. A second signal during the
+ * drain is a no-op; forcing past a stuck drain is SIGKILL's job, and the orchestrator
+ * has it.
  */
 export function installGracefulShutdown(
   target: ShutdownTarget,
@@ -97,6 +126,15 @@ export function installGracefulShutdown(
   const onSignal = (signal: NodeJS.Signals): void => {
     if (stopping) return;
     stopping = true;
+    let abortTimer: NodeJS.Timeout | undefined;
+    if (graceMs <= SHUTDOWN_ABORT_MARGIN_MS) {
+      abortInFlightWorkForShutdown();
+    } else {
+      abortTimer = setTimeout(() => {
+        abortInFlightWorkForShutdown();
+      }, graceMs - SHUTDOWN_ABORT_MARGIN_MS);
+      abortTimer.unref();
+    }
     log.info(
       { event: "shutdown.signal", signal, graceMs },
       `${signal} received — draining in-flight requests (hard deadline ${graceMs} ms)`,
@@ -120,6 +158,7 @@ export function installGracefulShutdown(
         log.error({ event: "shutdown.error", err }, "close failed during shutdown");
       })
       .finally(() => {
+        if (abortTimer !== undefined) clearTimeout(abortTimer);
         clearTimeout(deadline);
         log.info({ event: "shutdown.exit" }, "drain complete — exiting");
         exitSoon();

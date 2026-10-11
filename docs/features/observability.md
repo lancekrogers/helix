@@ -43,6 +43,7 @@ terminates untrusted traffic (decision 4).
 | `helix.gateway.llm` / `.fetch` / `.data` | the `/_api/*` handlers |
 | `helix.auth.oidc.start` / `.callback`, `helix.auth.handoff.complete` | the auth routes |
 | `helix.auth.connections.proxy` | the auth host's `/connections/*` reverse proxy |
+| `helix.edge.legacy_app_redirect` | the split-layout grace redirect on old `<slug>.<controlDomain>` hosts (`onRequest`, before platform routes) |
 | `helix.consent.start` | the app host's `/_api/connections/:ref/start` route — the consent popup's prod entry |
 | `helix.consent.start.dev` | the dev gateway's `/:slug/_api/connections/:ref/start` route — the dev tier's bearer POST → single-use popup URL |
 | `helix.consent.cancel.edge` | the app host's `/_api/connections/attempt/cancel` route — the connect helper's cancellation acknowledgement, forwarding to the portal's own `.cancel` span |
@@ -100,6 +101,15 @@ looked up:
   records `http.route` per surface — `/_api/llm/chat` or
   `/_api/openai/v1/chat/completions` — so throttles on the OpenAI-compatible
   route are findable by route.
+- `helix.gateway.llm` spans carry `helix.usage.basis` ∈ {`measured`, `estimated`,
+  `mixed`} when a call ends without a final usage block (a client hang-up or a
+  post-200 stream failure charged from interim counts and byte estimates).
+- When the edge hangs up before egress has sent response headers,
+  `helix.egress.proxy` records `helix.client_disconnected` = true and omits
+  `helix.outcome` and `helix.upstream.status`, because no upstream response was
+  committed; the `helix.egress.proxy.duration` sample for that call carries no
+  outcome dimension. A hang-up after the headers keeps the committed status and
+  outcome and adds `helix.client_disconnected` = true.
 - `helix.egress.exchange` spans carry `helix.outcome` ∈
   `EGRESS_EXCHANGE_OUTCOMES` (`exchanged`, `rejected`, `provider_unavailable`,
   `exchange_failed`, `unauthorized`, `malformed`, `unconfigured` — the seven
@@ -187,8 +197,12 @@ looked up:
 | `helix.registry.stale_for_ms` | observable gauge | — |
 | `helix.registry.load_failures` | counter | `outcome` |
 | `helix.gateway.calls` | counter | `capability`, `outcome`, `appId` |
+| `helix.gateway.cut_charges` | counter | `appId`, `basis` (`measured` / `estimated` / `mixed`; operational only, never reconciled with the ledger. Alert on a high share of `estimated`: it means the vendor is not delivering counts) |
+| `helix.gateway.admission_denied` | counter | `capability` (`llm` or `fetch`), `reason` (`app_budget_day`, `app_budget_burst`, `platform_ceiling`, `concurrency_app`, `concurrency_user`, `concurrency_replica`), `appId`. Not gated by the denial throttle, so it counts refusals the ledger drops |
+| `helix.gateway.platform_spend_ratio` | observable gauge | `env` | Cached platform LLM spend today divided by `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`. Absent until the first successful read. Alert at 80% before the block when wired in Azure (unverified) |
 | `helix.gateway.duration` | histogram (ms) | `capability`, `outcome` |
 | `helix.egress.proxy.duration` | histogram (ms) | `outcome` |
+| `helix.egress.upstream_aborts` | counter | `capability` (`llm` or `fetch`) |
 | `helix.egress.exchanges` | counter | `outcome`, `env` |
 | `helix.egress.renewals` | counter | `outcome`, `env` (the renewal taxonomy; alert on a run of `temporary_failure`/`admin_action`, and treat any `uncertain_rotation` as a user-visible reconnection) |
 | `helix.egress.retirements` | counter | `outcome`, `env` (the retirement ledger's consumption: `retired` / `failed` / `claimed_lost`. `failed` is the alertable word — it also fires the fixed `egress.connection_retire_failed` warn event, and the entry is restored and retried on a later pass within the 15-minute recovery bound. `claimed_lost` is the sweep losing a claim race to a writer (a reconnect's swap, a newer mark) — the conditional re-check working, never a fault; see ADR-0031 amendment item 12 for why the claim must be CAS) |
@@ -197,6 +211,8 @@ looked up:
 | `helix.session.gate_denied` | counter | `reason` |
 | `helix.edge.trust_proxy.unresolved` | observable gauge | — |
 | `helix.app.visits` | counter | `appId`, `outcome` (`recorded` / `failed` / `dropped` / `deduplicated`; the fire-and-forget `app_visits` write, ADR-0050. Alert on a sustained `failed` or `dropped` rate. The owner's numbers come from the table, never this counter) |
+| `helix.edge.legacy_app_redirects` | counter | `outcome` (`redirected` / `unknown_app` / `refused_path`; when `redirected` stays at zero for your chosen period, turn `EDGE_LEGACY_APP_REDIRECT` off) |
+| `helix.edge.csp_reports` | counter | `appId`, `directive` (`img-src` / `connect-src` / `script-src` / `style-src` / `font-src` / `object-src` / `other`), `disposition` (`enforce` / `report` / `unknown`; `report` only during `EDGE_IMG_SRC_REPORT_ONLY`, `enforce` after the tightened policy is on the enforced header), `helix.outcome` (`recorded` / `dropped` / `failed` — whether the report row was inserted, dropped past the per-app cap, or the insert failed). Blocked and document URIs are never recorded on this counter. Owner-facing counts come from `csp_reports`, not this counter |
 | `helix.consent.operations` | counter | `operation`, `outcome` (ADR-0031 as amended; the portal's first instrument — see the `helix.outcome` vocabularies in `@azx-pbc/shared/telemetry`) |
 
 `appId` is a dimension; **`userOid` never is** — unbounded and personal data, it
@@ -302,6 +318,14 @@ component, so traces and metrics land in the same Log Analytics workspace the
 environment already ships stdout to. Metrics arrive in `customMetrics`
 (`AppMetrics` under the workspace schema — the two names are the same table).
 
+**Network probe logs (stdout, not OTLP).** The `<prefix>-netprobe` job emits
+structured lines `egress.netprobe_check` (per destination) and
+`egress.netprobe_result` (roll-up). They are registered in
+[`docs/design/logging.md`](../design/logging.md); alerts in
+`alerts-netprobe.bicep` query `ContainerAppConsoleLogs_CL` in the **egress**
+workspace. Whether job console JSON lands in that table with the expected shape
+is **unverified in Azure** until an operator runs `just infra net-verify`.
+
 Two alert rules read the registry gauges, and they read **different signals on
 purpose** (`infra/azure/modules/alerts.bicep`); a third reads the trust-proxy
 one:
@@ -322,6 +346,8 @@ process:
 | `alerts-infra.bicep` | Azure platform metrics: `is_db_alive`, `storage_percent`, `RestartCount`, ingress `Requests` 5xx, Service Health | Postgres down or filling, container crash loops, edge server errors, Azure's own incidents |
 | `alerts-cost.bicep` | Billing | A monthly budget over the platform-infra resource groups (LLM spend is excluded by topology — the Foundry account has its own group). Notifies; never enforces |
 | `alerts-cost-foundry.bicep` | Billing | With `deployFoundry`: a monthly budget on the Foundry account's group — the LLM axis. Notifies; never enforces |
+| `firewall-diagnostics.bicep` | Log Analytics `AZFWApplicationRule` (and `AZFWNetworkRule`, `AZFWThreatIntel` for diagnostics) | Application-rule **denials** from the egress subnet when `deployFirewall` and `deployInfraAlerts` are on — usually a host missing from `egressAllowedFqdns`. KQL table/column names are **unverified in Azure** |
+| `alerts-netprobe.bicep` | Log Analytics `ContainerAppConsoleLogs_CL` — `egress.netprobe_result` / `egress.netprobe_check` from the `<prefix>-netprobe` job | Probe run failed (`ok=false`) or no successful run in the lookback window. **The only alert module that reads the egress environment's workspace** (apps alerts and firewall denials read the apps workspace) |
 
 The availability tests are the probe this page used to list under "not built":
 `/health` always answers 200, so grading it means reading the body, and a

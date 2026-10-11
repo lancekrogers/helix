@@ -54,3 +54,6 @@ apps/docs/.vitepress/cache/
 # (ADR-0036 decision 7). The template is the single authored source.
 apps/docs/src/apps/quickstart.md
 logs_*.zip
+
+# Rule-table copy the local NSG simulation mounts while it runs
+infra/netsim/.docker-rules.json

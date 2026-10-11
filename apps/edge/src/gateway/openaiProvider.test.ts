@@ -131,6 +131,15 @@ describe("mapOpenAiStream", () => {
       { type: "delta", text: "Hello" },
       { type: "delta", text: " world" },
       {
+        type: "usage",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 7,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+      {
         type: "done",
         stopReason: "end_turn",
         usage: {
@@ -188,6 +197,27 @@ describe("mapOpenAiStream", () => {
     await expect(
       collect(mapOpenAiStream(Readable.from([Buffer.from(sse)]))),
     ).rejects.toBeInstanceOf(LlmProviderError);
+  });
+
+  it("yields no usage event when the stream ends without a usage block", async () => {
+    const sse =
+      chunk({ choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }] }) +
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
+      "data: [DONE]\n\n";
+    const seen: LlmStreamEvent[] = [];
+    await expect(
+      (async () => {
+        try {
+          for await (const ev of mapOpenAiStream(Readable.from([Buffer.from(sse)]))) {
+            seen.push(ev);
+          }
+        } catch (err) {
+          expect(err).toBeInstanceOf(LlmProviderError);
+          throw err;
+        }
+      })(),
+    ).rejects.toBeInstanceOf(LlmProviderError);
+    expect(seen.some((e) => e.type === "usage")).toBe(false);
   });
 
   it("completes normally when usage arrives even without a trailing [DONE]", async () => {
@@ -309,5 +339,40 @@ describe("RoutingLlmProvider", () => {
     await expect(collect(routing.stream(req({ model: "gpt-4o" }), OPTS))).rejects.toMatchObject({
       upstreamStatus: 503,
     });
+  });
+
+  it("forwards usage events from the inner provider unchanged", async () => {
+    const usage: LlmStreamEvent = {
+      type: "usage",
+      usage: {
+        inputTokens: 3,
+        outputTokens: 1,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+    };
+    const done: LlmStreamEvent = {
+      type: "done",
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 3,
+        outputTokens: 1,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+    };
+    class UsageThenDone implements LlmProvider {
+      async *stream(): AsyncIterable<LlmStreamEvent> {
+        yield usage;
+        yield done;
+      }
+      async close(): Promise<void> {}
+    }
+    const routing = new RoutingLlmProvider({
+      anthropic: new UsageThenDone(),
+      openai: new Recorder(),
+    });
+    const events = await collect(routing.stream(req({ model: "claude-opus-4-8" }), OPTS));
+    expect(events).toEqual([usage, done]);
   });
 });

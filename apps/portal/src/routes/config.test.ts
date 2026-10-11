@@ -34,6 +34,22 @@ describe("GET /api/v1/config", () => {
     });
   });
 
+  it("does not expose the control domain in the config payload", async () => {
+    await withEnv(
+      {
+        APP_PUBLIC_BASE: "https://apps.example.com",
+        CONTROL_PUBLIC_BASE: "https://control.example.com",
+      },
+      async () => {
+        const res = await t.app.inject({ url: "/api/v1/config" });
+        expect(res.json<{ appPublicBase: string }>().appPublicBase).toBe(
+          "https://apps.example.com",
+        );
+        expect(JSON.stringify(res.json())).not.toContain("control.example.com");
+      },
+    );
+  });
+
   describe("deploy size caps", () => {
     it("reports the defaults in megabytes", async () => {
       await withEnv(

@@ -23,6 +23,10 @@ function createApp(payload: Record<string, unknown>) {
   return t.app.inject({ method: "POST", url: "/api/v1/apps", headers: authHeader(), payload });
 }
 
+function createdApp(res: { json: () => unknown }) {
+  return res.json() as { id: string };
+}
+
 describe("POST /api/v1/apps", () => {
   it("creates an app (201), defaulting visibility to internal", async () => {
     const slug = uniqueSlug();
@@ -33,6 +37,8 @@ describe("POST /api/v1/apps", () => {
     expect(body.displayName).toBe("My App");
     expect(body.visibility).toEqual({ mode: "internal" });
     expect(body.currentVersionId).toBeNull();
+    expect(body.pending).toBeNull();
+    expect(body.applied).toEqual([]);
   });
 
   it("rejects an unauthenticated request (401)", async () => {
@@ -92,6 +98,87 @@ describe("POST /api/v1/apps", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error.code).toBe("validation_failed");
+  });
+
+  it("write-gate: baseline capabilities at create commit on the row", async () => {
+    const slug = uniqueSlug();
+    const res = await createApp({
+      slug,
+      displayName: "Baseline create",
+      capabilities: { llm: { models: ["claude-opus-4-8"], dollarsPerDay: 25 } },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.pending).toBeNull();
+    expect(body.applied.length).toBeGreaterThan(0);
+
+    const got = await t.app.inject({
+      method: "GET",
+      url: `/api/v1/apps/${slug}/manifest`,
+      headers: authHeader(),
+    });
+    expect(got.json().capabilities.llm).toEqual({
+      models: ["claude-opus-4-8"],
+      dollarsPerDay: 25,
+    });
+  });
+
+  it("write-gate: elevated LLM budget at create stores baseline only and opens a request", async () => {
+    const slug = uniqueSlug();
+    const res = await createApp({
+      slug,
+      displayName: "High budget",
+      capabilities: { llm: { models: ["claude-opus-4-8"], dollarsPerDay: 100 } },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(typeof body.pending).toBe("string");
+    expect(body.applied.map((d: { path: string }) => d.path)).toContain(
+      "llm.models[+claude-opus-4-8]",
+    );
+
+    const got = await t.app.inject({
+      method: "GET",
+      url: `/api/v1/apps/${slug}/manifest`,
+      headers: authHeader(),
+    });
+    expect(got.json().capabilities.llm).toEqual({ models: ["claude-opus-4-8"] });
+
+    const reqs = await t.prisma.approvalRequest.findMany({
+      where: { appId: body.id },
+    });
+    expect(reqs).toHaveLength(1);
+    expect(reqs[0]?.status).toBe("pending");
+    expect(reqs[0]?.deltas).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "llm.dollarsPerDay" })]),
+    );
+  });
+
+  it("write-gate: a fresh LLM grant with no budget at create opens a pending request", async () => {
+    const slug = uniqueSlug();
+    const res = await createApp({
+      slug,
+      displayName: "Unset cap",
+      capabilities: { llm: { models: ["claude-opus-4-8"] } },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(typeof body.pending).toBe("string");
+
+    const got = await t.app.inject({
+      method: "GET",
+      url: `/api/v1/apps/${slug}/manifest`,
+      headers: authHeader(),
+    });
+    expect(got.json().capabilities.llm).toEqual({ models: ["claude-opus-4-8"] });
+
+    const reqs = await t.prisma.approvalRequest.findMany({
+      where: { appId: body.id },
+    });
+    expect(reqs).toHaveLength(1);
+    expect(reqs[0]?.deltas).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "llm.dollarsPerDay" })]),
+    );
   });
 });
 
@@ -184,7 +271,7 @@ describe("PATCH /api/v1/apps/:slug", () => {
   it("records the changed description in the app.update audit trail", async () => {
     const slug = uniqueSlug();
     const created = await createApp({ slug, displayName: "Audited" });
-    const appId = created.json().id;
+    const appId = createdApp(created).id;
     await t.app.inject({
       method: "PATCH",
       url: `/api/v1/apps/${slug}`,
@@ -230,7 +317,7 @@ describe("POST /api/v1/apps/:slug/archive and /unarchive", () => {
     expect(unarchived.statusCode).toBe(200);
     expect(unarchived.json().archivedAt).toBeNull();
 
-    const appId = created.json().id;
+    const appId = createdApp(created).id;
     const events = await t.prisma.auditEvent.findMany({ where: { appId } });
     const actions = events.map((e) => e.action);
     expect(actions).toContain("app.archive");
@@ -317,7 +404,7 @@ describe("manifest (capabilities) GET/PUT", () => {
     });
     expect(put.json().pending).toBeNull();
 
-    const events = await t.prisma.auditEvent.findMany({ where: { appId: created.json().id } });
+    const events = await t.prisma.auditEvent.findMany({ where: { appId: createdApp(created).id } });
     expect(events.map((e) => e.action)).toContain("app.manifest.set");
   });
 
@@ -345,12 +432,14 @@ describe("manifest (capabilities) GET/PUT", () => {
     expect(body.manifest.capabilities.data.user).toBe(true);
     expect(typeof body.pending).toBe("string");
 
-    const reqs = await t.prisma.approvalRequest.findMany({ where: { appId: created.json().id } });
+    const reqs = await t.prisma.approvalRequest.findMany({
+      where: { appId: createdApp(created).id },
+    });
     expect(reqs).toHaveLength(1);
     expect(reqs[0]?.status).toBe("pending");
     expect(reqs[0]?.risk).toBe("high");
 
-    const events = await t.prisma.auditEvent.findMany({ where: { appId: created.json().id } });
+    const events = await t.prisma.auditEvent.findMany({ where: { appId: createdApp(created).id } });
     expect(events.map((e) => e.action)).toEqual(
       expect.arrayContaining(["app.manifest.set", "approval.request"]),
     );
@@ -430,6 +519,24 @@ describe("GET /api/v1/apps and /:slug", () => {
     } finally {
       if (prev === undefined) delete process.env.APP_PUBLIC_BASE;
       else process.env.APP_PUBLIC_BASE = prev;
+    }
+  });
+
+  it("keeps app URLs on the apps host when CONTROL_PUBLIC_BASE is set", async () => {
+    const prevBase = process.env.APP_PUBLIC_BASE;
+    const prevControl = process.env.CONTROL_PUBLIC_BASE;
+    process.env.APP_PUBLIC_BASE = "https://apps.example.com";
+    process.env.CONTROL_PUBLIC_BASE = "https://control.example.com";
+    try {
+      const slug = uniqueSlug();
+      const created = await createApp({ slug, displayName: "Split" });
+      expect(created.json().url).toBe(`https://${slug}.apps.example.com`);
+      expect(created.json().url).not.toContain("control.example.com");
+    } finally {
+      if (prevBase === undefined) delete process.env.APP_PUBLIC_BASE;
+      else process.env.APP_PUBLIC_BASE = prevBase;
+      if (prevControl === undefined) delete process.env.CONTROL_PUBLIC_BASE;
+      else process.env.CONTROL_PUBLIC_BASE = prevControl;
     }
   });
 
@@ -768,7 +875,7 @@ describe("concurrent policy writes", () => {
     // neither may be turned away as a conflict and no origin may be dropped.
     expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
     const reqs = await t.prisma.approvalRequest.findMany({
-      where: { appId: created.json().id as string },
+      where: { appId: createdApp(created).id },
     });
     expect(reqs).toHaveLength(2);
     expect(reqs.flatMap((r) => (r.deltas as { path: string }[]).map((d) => d.path)).sort()).toEqual(

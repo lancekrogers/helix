@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { installGracefulShutdown } from "@azx-pbc/shared/lifecycle";
 import { startTelemetry } from "@azx-pbc/telemetry";
 import { buildApp, SERVICE_NAME } from "./app.js";
-import { loadConfig, publicOrigin } from "./config.js";
+import { controlOrigin, loadConfig } from "./config.js";
 import { createBlobReader } from "./blob/client.js";
 import { LiveRegistry, type RegistryLogger } from "./registry/listener.js";
 import { OpenIdConnectClient } from "./auth/oidc.js";
@@ -10,14 +10,19 @@ import { PgSessionStore, startSessionSweeper } from "./auth/sessions.js";
 import { anthropicVendor, openAiVendor, type LlmProvider } from "./gateway/provider.js";
 import { EgressLlmProvider } from "./gateway/egressLlmProvider.js";
 import { RoutingLlmProvider } from "./gateway/routingLlmProvider.js";
+import { llmEgressHopTimeoutMs } from "@azx-pbc/shared";
 import { HttpEgressProvider, type EgressProvider } from "./gateway/egressProvider.js";
 import { deriveInstructionKey } from "./gateway/instruction.js";
 import { HttpPortalProvider, type PortalProvider } from "./routing/portalProvider.js";
 import { PgUsageStore, type UsageStore } from "./gateway/usage.js";
+import { ATTR_ENV } from "@azx-pbc/shared/telemetry";
+import type { ObservableResult } from "@opentelemetry/api";
+import { instruments } from "./telemetry.js";
 import { PgAppDataStore, type AppDataStore } from "./gateway/data.js";
 import { IpRateLimiter } from "./gateway/ipRateLimiter.js";
 import { LoginThrottle } from "./auth/loginThrottle.js";
 import { PgCounterStore } from "./gateway/counterStore.js";
+import { PgLeaseStore } from "./gateway/leaseStore.js";
 import { PgCspReportStore } from "./serving/cspReport.js";
 import { PgVisitStore } from "./serving/visits.js";
 import type { PoolClientErrorPhase } from "./db/pool.js";
@@ -128,7 +133,7 @@ const sessions = config.auth
     })
   : null;
 const oidc = config.auth
-  ? new OpenIdConnectClient(config.auth, `${publicOrigin(config, "auth")}/callback`, {
+  ? new OpenIdConnectClient(config.auth, `${controlOrigin(config, "auth")}/callback`, {
       // Straight through to the late-bound registry ref. `info` used to take a
       // bare message and interpolate the issuer into it; it takes an object now
       // so discovery carries an `event` a rule can key on, like every other
@@ -176,6 +181,10 @@ const counterStore = new PgCounterStore(config.databaseUrl, {
   statementTimeoutMs: config.statementTimeoutMs,
   onClientError,
 });
+const leases = new PgLeaseStore(config.databaseUrl, {
+  statementTimeoutMs: config.statementTimeoutMs,
+  onClientError,
+});
 const anonRateLimiter = new IpRateLimiter(config.anonRateLimit, counterStore);
 const loginThrottle = new LoginThrottle(counterStore);
 
@@ -183,6 +192,7 @@ const loginThrottle = new LoginThrottle(counterStore);
 // calls to helix-egress over the EgressProvider seam. The capability is enabled
 // only when both the egress URL and the shared instruction secret are present
 // (otherwise /_api/fetch and the egress LLM path 503 — fail-closed).
+const llmHopTimeoutMs = llmEgressHopTimeoutMs(config.llm.maxCallMs);
 const egress: EgressProvider | null = config.fetch.egressUrl
   ? new HttpEgressProvider(config.fetch.egressUrl, { timeoutMs: config.fetch.timeoutMs })
   : null;
@@ -225,8 +235,14 @@ const llmProvider: LlmProvider | null =
           }),
           egress,
           instructionKey,
+          llmHopTimeoutMs,
         ),
-        openai: new EgressLlmProvider(openAiVendor(config.llm.openai), egress, instructionKey),
+        openai: new EgressLlmProvider(
+          openAiVendor(config.llm.openai),
+          egress,
+          instructionKey,
+          llmHopTimeoutMs,
+        ),
       })
     : null;
 
@@ -246,6 +262,7 @@ const app = buildApp({
   visits,
   anonRateLimiter,
   loginThrottle,
+  leases,
   https,
 });
 logRef.current = {
@@ -272,9 +289,19 @@ const counterSweep = setInterval(() => {
     .catch((err: unknown) => app.log.warn({ err }, "rate_counters sweep failed"));
 }, counterSweepMs);
 counterSweep.unref();
+const leaseSweep = setInterval(() => {
+  void leases
+    .sweep()
+    .catch((err: unknown) => app.log.warn({ err }, "inflight_leases sweep failed"));
+}, 60_000);
+leaseSweep.unref();
 app.addHook("onClose", async () => {
+  if (observePlatformSpendRatio) {
+    instruments().platformSpendRatio.removeCallback(observePlatformSpendRatio);
+  }
   sweeper?.stop();
   clearInterval(counterSweep);
+  clearInterval(leaseSweep);
   oidc?.stop();
   await registry.stop();
   await sessions?.close();
@@ -286,6 +313,7 @@ app.addHook("onClose", async () => {
   await visits.close();
   await llmProvider?.close();
   await counterStore.close();
+  await leases.close();
   await blob.close();
   // Last: flush the final batch after everything that could still record.
   await telemetry.shutdown();
@@ -298,6 +326,64 @@ app.addHook("onClose", async () => {
 // SIGTERM-to-SIGKILL window; SHUTDOWN_GRACE_MS overrides.
 // (`@azx-pbc/shared/lifecycle`, not the barrel — that one is browser-consumed.)
 installGracefulShutdown(app, app.log);
+
+const pgUsage = usage instanceof PgUsageStore ? usage : null;
+let observePlatformSpendRatio: ((result: ObservableResult) => void) | null = null;
+const leaseCapsEnabled =
+  config.llm.maxAppInFlight > 0 ||
+  config.llm.maxUserInFlight > 0 ||
+  config.fetch.maxAppInFlight > 0;
+if (leaseCapsEnabled) {
+  const leaseCheck = await leases.checkInflightLeasesAccess();
+  if (leaseCheck.status === "misconfigured") {
+    throw new Error(
+      `in-flight lease caps are enabled but the database is misconfigured: ${leaseCheck.problem}`,
+    );
+  }
+  if (leaseCheck.status === "unreachable") {
+    app.log.warn(
+      { err: leaseCheck.error, event: "inflight_leases.selftest_unreachable" },
+      "inflight_leases self-test could not reach the database; per-call acquires fail closed",
+    );
+  }
+}
+
+if (config.llm.platformDollarsPerDay > 0 && pgUsage) {
+  const check = await pgUsage.checkPlatformSpendFunction();
+  if (check.status === "misconfigured") {
+    throw new Error(
+      `platform LLM ceiling is enabled but the database is misconfigured: ${check.problem}`,
+    );
+  }
+  if (check.status === "unreachable") {
+    app.log.warn(
+      { err: check.error, event: "platform_ceiling.selftest_unreachable" },
+      "platform ceiling self-test could not reach the database; per-call reads fail closed",
+    );
+  }
+  const ratioGauge = instruments().platformSpendRatio;
+  observePlatformSpendRatio = (result: ObservableResult): void => {
+    const spend = pgUsage.peekPlatformSpend("prod");
+    if (spend) {
+      result.observe(spend.todayMicro / (config.llm.platformDollarsPerDay * 1_000_000), {
+        [ATTR_ENV]: "prod",
+      });
+    }
+  };
+  ratioGauge.addCallback(observePlatformSpendRatio);
+  const minSaneCeiling = 3 * config.llm.defaultDollarsPerDay;
+  if (config.llm.defaultDollarsPerDay > 0 && config.llm.platformDollarsPerDay < minSaneCeiling) {
+    app.log.warn(
+      {
+        event: "platform_ceiling.below_app_default_multiple",
+        platformDollarsPerDay: config.llm.platformDollarsPerDay,
+        llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
+        minimumRecommended: minSaneCeiling,
+      },
+      "platform LLM ceiling is below three times the per-app default; one tenant can exhaust it for every app",
+    );
+  }
+}
 
 try {
   // First load attempt completes before we accept traffic; a down DB logs and
@@ -312,9 +398,18 @@ try {
       service: SERVICE_NAME,
       port,
       baseDomain: config.baseDomain,
+      controlDomain: config.controlDomain,
+      split: config.controlDomain !== config.baseDomain,
       allowUnauthenticated: config.allowUnauthenticated,
       allowPublicApps: config.allowPublicApps,
       allowPasswordApps: config.allowPasswordApps,
+      legacyAppRedirect: config.legacyAppRedirect,
+      llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
+      llmPlatformDollarsPerDay: config.llm.platformDollarsPerDay,
+      llmMaxAppInFlight: config.llm.maxAppInFlight,
+      llmMaxUserInFlight: config.llm.maxUserInFlight,
+      llmMaxInFlight: config.llm.maxInFlight,
+      llmMaxCallMs: config.llm.maxCallMs,
       tls: https !== null,
       // Free, and it answers "why do I have no traces" without an exec into
       // the container — the commonest first question about a telemetry

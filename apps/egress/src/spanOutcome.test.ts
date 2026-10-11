@@ -42,8 +42,9 @@ const key = deriveInstructionKey(randomBytes(32));
 
 function makeApp(burnStore: InstructionBurnStore | null = null): ReturnType<typeof buildApp> {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate: false,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     allowInsecureConnection: false,
   } as EgressConfig;
   return buildApp({ config, resolver: null, instructionKey: key, burnStore });

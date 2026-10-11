@@ -122,10 +122,28 @@ describe("AnthropicProvider (mocked upstream)", () => {
     expect(seenApiKey).toBe("sk-ant-test");
     expect(seenVersion).toBe("2023-06-01");
 
-    // SSE → neutral events: deltas in order, then a done with summed usage.
+    // SSE → neutral events: interim usage, deltas, usage again, then done.
     expect(events).toEqual([
+      {
+        type: "usage",
+        usage: {
+          inputTokens: 11,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
       { type: "delta", text: "Hello" },
       { type: "delta", text: " world" },
+      {
+        type: "usage",
+        usage: {
+          inputTokens: 11,
+          outputTokens: 4,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
       {
         type: "done",
         stopReason: "end_turn",
@@ -243,6 +261,9 @@ describe("SSE parser hardening (issue #12)", () => {
       "",
     ].join("\n\n");
     const events = await collect(mapAnthropicStream(Readable.from([Buffer.from(sse)])));
+    const firstUsage = events.find((e) => e.type === "usage");
+    expect(firstUsage?.type === "usage" && firstUsage.usage.inputTokens).toBe(11);
+    expect(typeof (firstUsage?.type === "usage" && firstUsage.usage.inputTokens)).toBe("number");
     const done = events.at(-1);
     expect(done?.type === "done" && done.usage).toEqual({
       inputTokens: 11, // not "110..." — coerced
@@ -269,10 +290,56 @@ describe("SSE parser hardening (issue #12)", () => {
         `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
         "",
       ].join("\n\n");
+      const seen: LlmStreamEvent[] = [];
       await expect(
-        collect(mapAnthropicStream(Readable.from([Buffer.from(sse)]))),
+        (async () => {
+          try {
+            for await (const ev of mapAnthropicStream(Readable.from([Buffer.from(sse)]))) {
+              seen.push(ev);
+            }
+          } catch (err) {
+            expect(err).toBeInstanceOf(LlmProviderError);
+            throw err;
+          }
+        })(),
       ).rejects.toBeInstanceOf(LlmProviderError);
+      expect(seen.some((e) => e.type === "usage")).toBe(false);
     }
+  });
+
+  it("yields no usage event when message_delta omits usage", async () => {
+    const sse = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 5, output_tokens: 0 } } })}`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+      "",
+    ].join("\n\n");
+    const events = await collect(mapAnthropicStream(Readable.from([Buffer.from(sse)])));
+    expect(events.filter((e) => e.type === "usage")).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "usage",
+      usage: {
+        inputTokens: 5,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+    });
+  });
+
+  it("yields usage at message_start before deltas when the stream ends early", async () => {
+    const sse = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 42, output_tokens: 0 } } })}`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "partial" } })}`,
+      "",
+    ].join("\n\n");
+    const events = await collect(mapAnthropicStream(Readable.from([Buffer.from(sse)])));
+    expect(events[0]?.type).toBe("usage");
+    expect(events[0]).toMatchObject({
+      type: "usage",
+      usage: { inputTokens: 42, outputTokens: 0 },
+    });
+    expect(events[1]).toEqual({ type: "delta", text: "partial" });
   });
 
   it("destroys a separator-less stream once it exceeds the buffer cap", async () => {

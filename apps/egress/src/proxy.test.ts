@@ -1,8 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { Writable } from "node:stream";
 import { SignJWT } from "jose";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { request as undiciRequest } from "undici";
 import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import {
   INSTRUCTION_AUDIENCE,
@@ -12,6 +14,11 @@ import {
   OUTCOME_HEADER,
   TARGET_HEADER,
 } from "@azx-pbc/shared";
+import {
+  ATTR_CAPABILITY,
+  INSTR_EGRESS_UPSTREAM_ABORTS,
+  SPAN_EGRESS_PROXY,
+} from "@azx-pbc/shared/telemetry";
 import { buildApp } from "./app.js";
 import type { EgressConfig } from "./config.js";
 import { signTimestamp } from "./hmac.js";
@@ -36,6 +43,26 @@ beforeAll(async () => {
     if (req.url === "/throttle") {
       res.writeHead(429, { "content-type": "application/json", "retry-after": "30" });
       res.end(JSON.stringify({ error: { code: "429", message: "Rate limit exceeded" } }));
+      return;
+    }
+    if (req.url === "/leaky-headers") {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        etag: '"v1"',
+        "retry-after": "30",
+        "x-ratelimit-remaining": "41",
+        "clear-site-data": '"cookies", "storage"',
+        "content-security-policy": "default-src 'none'",
+        "content-security-policy-report-only": "default-src 'none'",
+        refresh: "0; url=https://evil.example/",
+        "report-to": '{"group":"x","max_age":1,"endpoints":[{"url":"https://evil.example/r"}]}',
+        "reporting-endpoints": 'x="https://evil.example/r"',
+        nel: '{"report_to":"x","max_age":1}',
+        "service-worker-allowed": "/",
+        "alt-svc": 'h3="evil.example:443"',
+        link: '<https://evil.example/p2>; rel="next"',
+      });
+      res.end("{}");
       return;
     }
     const chunks: Buffer[] = [];
@@ -96,8 +123,9 @@ const fakeResolver: SecretResolver = {
 
 function makeApp(allowPrivate: boolean, resolver: SecretResolver | null = fakeResolver) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     // Loopback echo upstreams are http; open the cleartext-injection seam so
     // these functional tests exercise injection without TLS (the prod guard and
     // its refusal path are covered in adversarial.test.ts — issue #11).
@@ -113,6 +141,7 @@ async function mint(claims: {
   origin: string;
   connection?: string;
   appId?: string;
+  capability?: "fetch" | "llm";
 }): Promise<string> {
   // Unique requestId per call so a shared burn store (where wired) wouldn't
   // reject the second mint as a replay.
@@ -120,7 +149,7 @@ async function mint(claims: {
   const jwt = new SignJWT({
     appId: claims.appId ?? "app-1",
     userOid: "user-1",
-    capability: "fetch",
+    capability: claims.capability ?? "fetch",
     origin: claims.origin,
     requestId,
     ...(claims.connection ? { connection: claims.connection } : {}),
@@ -183,6 +212,75 @@ describe("egress /proxy", () => {
     expect(spans[0]?.attributes["helix.outcome"]).toBe("upstream_throttled");
     expect(spans[0]?.attributes["helix.upstream.status"]).toBe(429);
     expect(spans[0]?.status.code).toBe(0); // UNSET
+    await app.close();
+  });
+
+  const NEW_HEADERS = [
+    "clear-site-data",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "refresh",
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+    "service-worker-allowed",
+    "alt-svc",
+  ] as const;
+
+  it.each(NEW_HEADERS)("strips %s from the upstream response", async (name) => {
+    const app = makeApp(true);
+    const token = await mint({ origin });
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/leaky-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers[name]).toBeUndefined();
+    await app.close();
+  });
+
+  it("still forwards link, etag, retry-after and rate-limit headers from the same response", async () => {
+    const app = makeApp(true);
+    const token = await mint({ origin });
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/leaky-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["link"]).toBe('<https://evil.example/p2>; rel="next"');
+    expect(res.headers["etag"]).toBe('"v1"');
+    expect(res.headers["retry-after"]).toBe("30");
+    expect(res.headers["x-ratelimit-remaining"]).toBe("41");
+    await app.close();
+  });
+
+  it("strips them on a connection-backed call too", async () => {
+    const app = makeApp(true);
+    const token = await mint({ origin, connection: "gh" });
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/leaky-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    for (const name of NEW_HEADERS) {
+      expect(res.headers[name]).toBeUndefined();
+    }
+    expect(res.headers["link"]).toBe('<https://evil.example/p2>; rel="next"');
     await app.close();
   });
 
@@ -457,5 +555,418 @@ describe("egress /proxy — connection pooling (ADR-0005 perf note)", () => {
 
     await app.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+});
+
+describe("egress /proxy — client hang-up after the first byte (characterization)", () => {
+  // Result on main (792557a): passes — the vendor response closed ~10–15 ms after the hang-up
+  // (10× run in the dev container, no flake). The claim under test is that a hang-up after
+  // the upstream headers arrive already tears down the vendor connection, through Fastify's
+  // sendStream -> capBody pipeline -> undici body destroy. It says nothing about a hang-up
+  // BEFORE the headers arrive; that window is closed by the next change.
+  let slow: Server;
+  let slowOrigin: string;
+  // Count HTTP requests, not TCP connections: after an aborted stream undici's pool can
+  // open an idle connection that carries no request, and that is not a retry.
+  let requests = 0;
+  let closedEarly = false;
+
+  beforeAll(async () => {
+    slow = createServer((req, res) => {
+      requests += 1;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: first\n\n");
+      let sent = 1;
+      const timer = setInterval(() => {
+        res.write("data: more\n\n");
+        // /finite ends by itself after a few chunks; /stream would run for 10 s.
+        if (req.url === "/finite" && ++sent >= 4) {
+          clearInterval(timer);
+          res.end();
+        }
+      }, 25);
+      const stop = setTimeout(() => {
+        clearInterval(timer);
+        res.end();
+      }, 10_000);
+      // 'close' fires when the socket goes away. writableFinished is still false when
+      // the connection was torn down before end() ran.
+      res.on("close", () => {
+        clearInterval(timer);
+        clearTimeout(stop);
+        if (!res.writableFinished) closedEarly = true;
+      });
+    });
+    await new Promise<void>((resolve) => slow.listen(0, "127.0.0.1", resolve));
+    slowOrigin = `http://127.0.0.1:${(slow.address() as AddressInfo).port}`;
+  });
+  afterAll(async () => {
+    slow.closeAllConnections();
+    await new Promise<void>((resolve) => slow.close(() => resolve()));
+  });
+
+  async function callThroughSocket(path: string) {
+    const app = makeApp(true);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    requests = 0;
+    closedEarly = false;
+    const res = await undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint({ origin: slowOrigin }),
+        [TARGET_HEADER]: `${slowOrigin}${path}`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    return { app, res };
+  }
+
+  it("closes the vendor connection when the client hangs up after the first chunk", async () => {
+    const { app, res } = await callThroughSocket("/stream");
+    expect(res.statusCode).toBe(200);
+    await res.body[Symbol.asyncIterator]().next(); // the first chunk has arrived
+    res.body.destroy(); // the hang-up
+    await vi.waitFor(() => expect(closedEarly).toBe(true), { timeout: 2_000, interval: 10 });
+    // Egress did not send a second request to recover or retry.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(requests).toBe(1);
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("control: a client that stays connected sees the upstream finish normally", async () => {
+    const { app, res } = await callThroughSocket("/finite");
+    await res.body.text(); // read to the end
+    await new Promise((r) => setTimeout(r, 100));
+    expect(closedEarly).toBe(false);
+    app.server.closeAllConnections();
+    await app.close();
+  });
+});
+
+async function metricTotal(name: string, match: Record<string, string>): Promise<number> {
+  const points = await recording.metrics();
+  return points
+    .filter(
+      (m) => m.name === name && Object.entries(match).every(([k, v]) => m.attributes[k] === v),
+    )
+    .reduce((sum, m) => sum + m.value, 0);
+}
+
+describe("egress /proxy — hang-up before the headers (upstream abort)", () => {
+  let slowHeaders: Server;
+  let slowHeadersOrigin: string;
+  let upstreamSawClose = false;
+  let headerDelayTimer: ReturnType<typeof setTimeout> | undefined;
+
+  beforeAll(async () => {
+    slowHeaders = createServer((req, res) => {
+      if (req.url === "/slow-headers") {
+        res.on("error", () => {});
+        const onGone = () => {
+          if (headerDelayTimer !== undefined) clearTimeout(headerDelayTimer);
+          upstreamSawClose = true;
+        };
+        res.on("close", onGone);
+        req.on("close", onGone);
+        headerDelayTimer = setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("late");
+        }, 3000);
+        return;
+      }
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => slowHeaders.listen(0, "127.0.0.1", resolve));
+    slowHeadersOrigin = `http://127.0.0.1:${(slowHeaders.address() as AddressInfo).port}`;
+  });
+  afterAll(async () => {
+    slowHeaders.closeAllConnections();
+    await new Promise<void>((resolve) => slowHeaders.close(() => resolve()));
+  });
+
+  async function callSlowHeaders(
+    app: ReturnType<typeof makeApp>,
+    capability: "fetch" | "llm" = "fetch",
+  ) {
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    upstreamSawClose = false;
+    headerDelayTimer = undefined;
+    const ac = new AbortController();
+    const token = await mint({ origin: slowHeadersOrigin, capability });
+    const req = undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${slowHeadersOrigin}/slow-headers`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    ac.abort();
+    try {
+      await req;
+    } catch {
+      // hang-up
+    }
+    await vi.waitFor(
+      () => {
+        expect(
+          recording
+            .spans()
+            .some(
+              (s) =>
+                s.name === SPAN_EGRESS_PROXY && s.attributes["helix.client_disconnected"] === true,
+            ),
+        ).toBe(true);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    return app;
+  }
+
+  it("closes the upstream connection well before the header delay elapses", async () => {
+    const app = makeApp(true);
+    await callSlowHeaders(app, "fetch");
+    await vi.waitFor(() => expect(upstreamSawClose).toBe(true), { timeout: 1000, interval: 25 });
+    const span = recording.spans().find((s) => s.name === SPAN_EGRESS_PROXY);
+    expect(span?.attributes["helix.client_disconnected"]).toBe(true);
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("never dials the vendor when the client aborts during secret resolution", async () => {
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+
+    let releaseResolve!: () => void;
+    const waitingResolver: SecretResolver = {
+      resolve: async () => {
+        await new Promise<void>((resolve) => {
+          releaseResolve = resolve;
+        });
+        return { value: "ghp_secret", injection: { kind: "header-bearer" } };
+      },
+      close: async () => {},
+    };
+
+    const app = makeApp(true, waitingResolver);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    const ac = new AbortController();
+    const token = await mint({ origin, connection: "gh" });
+    const pending = undiciRequest(`${base}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: token,
+        [TARGET_HEADER]: `${origin}/`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort();
+    // Resolution was still parked when the client left; finishing it must take the hang-up path.
+    releaseResolve();
+    try {
+      await pending;
+    } catch {
+      // hang-up
+    }
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "fetch",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("logs no upstream request failed warning on a pre-header hang-up", async () => {
+    const chunks: string[] = [];
+    const capture = new Writable({
+      write(chunk: unknown, _enc: BufferEncoding, cb: (e?: Error | null) => void) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const config = {
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
+      allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
+      allowInsecureConnection: true,
+    } as EgressConfig;
+    const app = buildApp(
+      { config, resolver: fakeResolver, instructionKey: key, burnStore: null },
+      { level: "warn", stream: capture },
+    );
+    await callSlowHeaders(app, "fetch");
+    expect(chunks.join("")).not.toContain("upstream request failed");
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("increments helix.egress.upstream_aborts with helix.capability only (fetch)", async () => {
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    const app = makeApp(true);
+    await callSlowHeaders(app, "fetch");
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "fetch",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    const points = await recording.metrics();
+    const added = points.filter(
+      (m) =>
+        m.name === INSTR_EGRESS_UPSTREAM_ABORTS &&
+        m.attributes[ATTR_CAPABILITY] === "fetch" &&
+        m.value > 0,
+    );
+    for (const p of added) {
+      expect(Object.keys(p.attributes).sort()).toEqual([ATTR_CAPABILITY]);
+    }
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("increments helix.egress.upstream_aborts for an llm instruction", async () => {
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "llm",
+    });
+    const app = makeApp(true);
+    await callSlowHeaders(app, "llm");
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "llm",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    app.server.closeAllConnections();
+    await app.close();
+  });
+
+  it("still pools sockets after an abandoned call", async () => {
+    let connections = 0;
+    slowHeaders.on("connection", () => void connections++);
+
+    const app = makeApp(true);
+    await callSlowHeaders(app, "fetch");
+    connections = 0;
+
+    const recovery = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint({ origin: slowHeadersOrigin }),
+        [TARGET_HEADER]: `${slowHeadersOrigin}/`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(recovery.statusCode).toBe(200);
+
+    const requests = 6;
+    for (let i = 0; i < requests; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/proxy",
+        headers: {
+          [INSTRUCTION_HEADER]: await mint({ origin: slowHeadersOrigin }),
+          [TARGET_HEADER]: `${slowHeadersOrigin}/`,
+          [METHOD_HEADER]: "GET",
+        },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+    expect(connections).toBeLessThan(requests + 1);
+
+    app.server.closeAllConnections();
+    await app.close();
+  });
+});
+
+describe("egress /proxy — capability idle timeouts", () => {
+  let stall: Server;
+  let stallOrigin: string;
+
+  beforeAll(async () => {
+    stall = createServer((req, res) => {
+      res.on("error", () => {});
+      req.on("error", () => {});
+      // Accept the request and send nothing — triggers undici headersTimeout.
+    });
+    await new Promise<void>((resolve) => stall.listen(0, "127.0.0.1", resolve));
+    stallOrigin = `http://127.0.0.1:${(stall.address() as AddressInfo).port}`;
+  });
+  afterAll(async () => {
+    stall.closeAllConnections();
+    await new Promise<void>((resolve) => stall.close(() => resolve()));
+  });
+
+  function makeTimeoutApp(fetchMs: number, llmMs: number) {
+    const config = {
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: fetchMs, llmTimeoutMs: llmMs },
+      allowPrivate: true,
+      allowInsecureConnection: true,
+    } as EgressConfig;
+    return buildApp({ config, resolver: fakeResolver, instructionKey: key, burnStore: null });
+  }
+
+  async function stallInject(
+    app: ReturnType<typeof makeTimeoutApp>,
+    capability: "fetch" | "llm",
+  ): Promise<{ statusCode: number; json: () => unknown; elapsedMs: number }> {
+    const started = Date.now();
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint({ origin: stallOrigin, capability }),
+        [TARGET_HEADER]: `${stallOrigin}/hang`,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    return { statusCode: res.statusCode, json: () => res.json(), elapsedMs: Date.now() - started };
+  }
+
+  it("cuts non-LLM fetch calls at EGRESS_TIMEOUT_MS with upstream_timeout", async () => {
+    const app = makeTimeoutApp(80, 5_000);
+    const res = await stallInject(app, "fetch");
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toMatchObject({ code: "upstream_timeout" });
+    await app.close();
+  });
+
+  it("bounds llm calls at EGRESS_LLM_TIMEOUT_MS, not the fetch timeout", async () => {
+    const fetchApp = makeTimeoutApp(120, 5_000);
+    const fetchRes = await stallInject(fetchApp, "fetch");
+    await fetchApp.close();
+    expect(fetchRes.statusCode).toBe(502);
+    expect(fetchRes.json()).toMatchObject({ code: "upstream_timeout" });
+    expect(fetchRes.elapsedMs).toBeLessThan(2_500);
+
+    const llmApp = makeTimeoutApp(120, 800);
+    const llmRes = await stallInject(llmApp, "llm");
+    await llmApp.close();
+    expect(llmRes.statusCode).toBe(502);
+    expect(llmRes.json()).toMatchObject({ code: "upstream_timeout" });
+    expect(llmRes.elapsedMs).toBeGreaterThan(500);
   });
 });

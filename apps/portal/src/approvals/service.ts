@@ -12,6 +12,7 @@ import {
   type ManifestUpdateResult,
   type ProviderStamp,
   type Risk,
+  type VisibilityState,
 } from "@azx-pbc/shared";
 import {
   Prisma,
@@ -33,6 +34,8 @@ import { casPolicyWrite } from "../policy/policyWrite.js";
  * audit event commit atomically with the surrounding effective-state write.
  */
 export type Tx = Prisma.TransactionClient;
+
+const EMPTY_CAPABILITIES: Capabilities = { mcp: [], externalOrigins: [] };
 
 export interface OpenRequestArgs {
   appId: string;
@@ -311,6 +314,48 @@ async function restampStaleBindings(
  * that does change the blob then CASes on `policyVersion`, so a concurrent writer
  * cannot be clobbered; an elevated-only change writes nothing at all.
  */
+
+/**
+ * Classify create-time capabilities against the empty effective state, apply
+ * baseline deltas, and open one approval request for the elevated bundle.
+ * Called from `POST /api/v1/apps` inside the create transaction.
+ */
+export async function gateCapabilitiesAtCreate(
+  tx: Tx,
+  opts: {
+    appId: string;
+    requested: Capabilities;
+    visibility: VisibilityState;
+    actor: string;
+    actorOid: string;
+  },
+): Promise<{ applied: Capabilities; baselineDeltas: Delta[]; pending: string | null }> {
+  await validateProviderBindings(tx, opts.requested);
+  const { baselineDeltas, elevatedDeltas, risk } = classifyChange(
+    EMPTY_CAPABILITIES,
+    opts.requested,
+  );
+  const applied = applyDeltas(EMPTY_CAPABILITIES, baselineDeltas);
+  let pending: string | null = null;
+  if (elevatedDeltas.length > 0) {
+    const stamped = await stampElevatedDeltas(
+      tx,
+      elevatedDeltas,
+      opts.visibility.mode === "public",
+    );
+    const baseSnapshot = captureSnapshot(applied, opts.visibility, touchedAreas(elevatedDeltas));
+    pending = await createApprovalRequest(tx, {
+      appId: opts.appId,
+      deltas: stamped,
+      risk,
+      baseSnapshot,
+      requestedOid: opts.actorOid,
+      requestedBy: opts.actor,
+    });
+  }
+  return { applied, baselineDeltas, pending };
+}
+
 export async function applyCapabilityChange(
   prisma: PrismaClient,
   opts: {

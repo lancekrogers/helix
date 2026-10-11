@@ -136,6 +136,7 @@ failure mode.
 | `exchange.failed` / `exchange.rejected` | `apps/egress/src/exchange.ts` — the code-exchange operation's opaque outcomes; fixed strings only, no vendor response content |
 | `egress.renewal.failed` / `egress.renewal.row_unparseable` / `egress.renewal.permissions_lost` / `egress.renewal.uncertain_rotation` / `egress.renewal.seal_failed_after_rotation` | `apps/egress/src/renewal.ts` — the renewal taxonomy's log half (ADR-0007); the last is the rotated-out orphan whose seal failed, which the retirement sweep's ledger re-covers |
 | `egress.connection_retire_failed` | `apps/egress/src/retire.ts` — a retirement-sweep destroy failed after its conditional claim; the ledger mark is restored and the pass retries (ADR-0008, criterion 47) |
+| `egress.netprobe_check` / `egress.netprobe_result` | `apps/egress/src/netprobe.ts` — the network probe's per-check and summary lines; the summary rolls up `ok`, `denyProven` (in-VNet NSG deny proof when pinning is on), and `closingDenyProven`; the failure and absence alerts read `ok` only |
 | `otel.diag` / `otel.config` / `log.level_invalid` | config resolution, written straight to stderr because no logger exists yet |
 
 ## What is deliberately not here

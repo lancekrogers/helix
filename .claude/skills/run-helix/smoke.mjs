@@ -9,9 +9,23 @@
  * is reported as SKIP, never folded into the pass count.
  *
  * See ./SKILL.md for prerequisites and the flag reference.
+ *
+ * Split-domain dev (`HELIX_APPS_DOMAIN`): adds the `split` group (login, Sec-Fetch-Site,
+ * cookie scope, silent refresh). Use `--only split` to run just that group.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, openSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import dns from "node:dns";
+import tls from "node:tls";
+import { createRequire } from "node:module";
+import {
+  copyFileSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -22,6 +36,7 @@ import { resolveStack } from "../../../scripts/stack-env.mjs";
 import { ensureDatabase } from "../../../scripts/ensure-db.mjs";
 
 const ROOT = new URL("../../../", import.meta.url).pathname.replace(/\/$/, "");
+const SMOKE_FIXTURES = join(ROOT, ".claude/skills/run-helix/fixtures");
 const CA = join(ROOT, ".devcontainer/certs/caroot/rootCA.pem");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -53,12 +68,48 @@ const OUT = mkdtempSync(join(tmpdir(), "helix-smoke-"));
 const OFFSET = argv.includes("--offset")
   ? Number(argv[argv.indexOf("--offset") + 1])
   : Number(process.env.HELIX_PORT_OFFSET ?? 1000);
-const STACK = resolveStack({ offset: OFFSET });
+let STACK;
+try {
+  STACK = resolveStack({ offset: OFFSET });
+} catch (err) {
+  console.error(err.message);
+  process.exit(2);
+}
 /** Env every service in THIS stack boots with. */
-const SVC_ENV = { ...process.env, ...STACK.env };
+const SVC_ENV = {
+  ...process.env,
+  ...STACK.env,
+  ...(STACK.split ? { EDGE_SESSION_REFRESH_MS: "3000", EDGE_LEGACY_APP_REDIRECT: "true" } : {}),
+};
 const PORTS = Object.values(STACK.ports);
 
-const GROUPS = ["idp", "portal", "edge", "egress", "spa", "browser", "cli"];
+const GROUPS = ["idp", "portal", "edge", "egress", "spa", "browser", "cli", "split-tls", "split"];
+
+const SPLIT_CERT = join(ROOT, ".devcontainer/certs/local-helix-split.pem");
+const SPLIT_KEY = join(ROOT, ".devcontainer/certs/local-helix-split-key.pem");
+const MKCERT_SPLIT_CMD =
+  "CAROOT=/workspace/.devcontainer/certs/caroot mkcert -cert-file /workspace/.devcontainer/certs/local-helix-split.pem " +
+  "-key-file /workspace/.devcontainer/certs/local-helix-split-key.pem " +
+  '"*.local.helix.azxlabs.io" local.helix.azxlabs.io "*.helix-apps.localhost" helix-apps.localhost "*.apps.local.helix.azxlabs.io" apps.local.helix.azxlabs.io';
+
+const APPS_DOMAIN = STACK.appsDomain;
+const CONTROL_DOMAIN = STACK.controlDomain;
+
+// glibc does not resolve arbitrary *.localhost names, so never rely on getaddrinfo for the apps domain.
+const isAppsHost = (h) => h === APPS_DOMAIN || h.endsWith(`.${APPS_DOMAIN}`);
+const loopbackLookup = (hostname, opts, cb) => {
+  if (!STACK.split || !isAppsHost(hostname)) return dns.lookup(hostname, opts, cb);
+  return opts?.all ? cb(null, [{ address: "127.0.0.1", family: 4 }]) : cb(null, "127.0.0.1", 4);
+};
+
+/** @type {"undici-global-dispatcher" | "dns.lookup-patch" | null} */
+let splitFetchMechanism = null;
+if (STACK.split) {
+  const require = createRequire(join(ROOT, "apps/edge/package.json"));
+  const { Agent, setGlobalDispatcher } = require("undici");
+  setGlobalDispatcher(new Agent({ connect: { lookup: loopbackLookup } }));
+  splitFetchMechanism = "undici-global-dispatcher";
+}
 const wanted = (g) => !only || only === g;
 
 // ── result tracking ───────────────────────────────────────────────────────
@@ -117,7 +168,7 @@ const SERVICES = [
     name: "edge",
     script: "dev:edge",
     port: STACK.ports.edge,
-    health: `https://${BASE_DOMAIN}:${STACK.ports.edge}/health`,
+    health: `https://${CONTROL_DOMAIN}:${STACK.ports.edge}/health`,
   },
 ];
 const procs = [];
@@ -204,7 +255,14 @@ function rawGet(url, headers = {}) {
     const u = new URL(url);
     const mod = u.protocol === "https:" ? httpsModule : httpModule;
     const req = mod.request(
-      { hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: "GET", headers },
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: "GET",
+        headers,
+        lookup: loopbackLookup,
+      },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -220,6 +278,65 @@ function rawGet(url, headers = {}) {
     req.on("error", reject);
     req.end();
   });
+}
+
+/** @param {Map<string, Map<string, string>>} jar hostname → cookie name → value */
+function storeSetCookies(hostname, headers, jar) {
+  const raw = headers["set-cookie"];
+  if (!raw) return;
+  for (const c of [].concat(raw)) {
+    const [kv] = c.split(";");
+    const i = kv.indexOf("=");
+    if (i < 1) continue;
+    const name = kv.slice(0, i).trim();
+    const value = kv.slice(i + 1).trim();
+    if (!jar.has(hostname)) jar.set(hostname, new Map());
+    jar.get(hostname).set(name, value);
+  }
+}
+
+function cookieHeaderFor(hostname, jar) {
+  const cookies = [...(jar.get(hostname) ?? [])].map(([k, v]) => `${k}=${v}`).join("; ");
+  return cookies || undefined;
+}
+
+/** Navigate GET with per-host cookie jar (exact Sec-Fetch-* headers). */
+async function navGet(url, jar) {
+  const u = new URL(url);
+  const cookie = cookieHeaderFor(u.hostname, jar);
+  const r = await rawGet(url, {
+    Accept: "text/html",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+    ...(cookie ? { Cookie: cookie } : {}),
+  });
+  storeSetCookies(u.hostname, r.headers, jar);
+  return r;
+}
+
+/**
+ * Walk the dev IdP from an authorize URL until the edge auth callback is next
+ * (caller follows that hop with the flow cookie on the auth host).
+ */
+async function idpWalkToEdgeCallback(authorizeUrl, jar) {
+  let cur = authorizeUrl;
+  for (let i = 0; i < 12; i++) {
+    const r = await navGet(cur, jar);
+    const loc = r.headers.location;
+    if (loc) {
+      cur = new URL(loc, cur).toString();
+      if (cur.startsWith(`https://auth.${CONTROL_DOMAIN}`)) return cur;
+      continue;
+    }
+    if (/pick a user/i.test(r.body)) {
+      const m = r.body.match(/\?user=([^"]+)"/);
+      assert(m, "no fixture user link on the interaction page");
+      cur = `${cur.split("?")[0]}?user=${m[1]}`;
+      continue;
+    }
+    throw new Error(`IdP walk stalled at ${cur}`);
+  }
+  throw new Error("IdP walk: too many hops");
 }
 
 async function jget(url, init) {
@@ -307,19 +424,30 @@ async function seedRegistry() {
 
   const dir = join(OUT, "seed-app");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    join(dir, "index.html"),
+  const plainHtml =
     "<!doctype html><html><head><title>helix smoke</title></head>" +
-      "<body><h1>helix smoke fixture</h1></body></html>\n",
-  );
+    "<body><h1>helix smoke fixture</h1></body></html>\n";
+  const publicPixelOrigin = `https://smoke-public.${BASE_DOMAIN}:${STACK.ports.edge}`;
+  const cspHtml =
+    "<!doctype html><html><head><title>helix smoke csp</title></head><body>" +
+    `<img id="remote" src="${publicPixelOrigin}/pixel.gif">` +
+    '<img id="inline" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">' +
+    "</body></html>\n";
 
   await check("cli bundle for seeding", () => buildCli());
 
-  for (const [slug, visibility] of [
-    ["smoke-public", "public"],
-    ["smoke-internal", "internal"],
+  // smoke-csp redeploys every run so the served page always matches cspHtml;
+  // the browser check depends on its exact images.
+  for (const [slug, visibility, html, redeploy] of [
+    ["smoke-public", "public", plainHtml, true],
+    ["smoke-internal", "internal", plainHtml, false],
+    ["smoke-csp", "public", cspHtml, true],
   ]) {
     await check(`live ${visibility} app (${slug})`, async () => {
+      writeFileSync(join(dir, "index.html"), html);
+      if (slug === "smoke-public") {
+        copyFileSync(join(SMOKE_FIXTURES, "pixel.gif"), join(dir, "pixel.gif"));
+      }
       // scope=all, not the default mine: the question is "does this slug exist
       // with a live version", not "is it mine". A principal-id re-base (e.g.
       // ADR-0048 changing the dev-token actor's oid) otherwise makes rows
@@ -328,7 +456,7 @@ async function seedRegistry() {
       const { body: apps } = await jget(`${PORTAL}/api/v1/apps?scope=all`, { headers: auth });
       const existing = Array.isArray(apps) ? apps.find((a) => a.slug === slug) : null;
       let how = "reused";
-      if (!existing?.currentVersionId) {
+      if (!existing?.currentVersionId || redeploy) {
         if (!existing) {
           const c = helix("create", "--slug", slug, "--visibility", visibility);
           assert(c.status === 0, `create: ${(c.stderr || c.stdout || "").slice(-300)}`);
@@ -423,7 +551,7 @@ async function checkEdge() {
   const internal = live.find((a) => a.visibility.mode === "internal");
 
   await check("health reports registry-projection freshness", async () => {
-    const { status, body } = await jget(`https://${BASE_DOMAIN}:${STACK.ports.edge}/health`);
+    const { status, body } = await jget(`https://${CONTROL_DOMAIN}:${STACK.ports.edge}/health`);
     eq(status, 200, "status");
     const proj = body.checks?.find((c) => c.name === "registry-projection");
     assert(proj, "registry-projection check missing");
@@ -443,7 +571,23 @@ async function checkEdge() {
     await check("CSP is injected", async () => {
       const { headers } = await jget(EDGE(pub.slug));
       const csp = headers.get("content-security-policy");
+      const reportOnly = headers.get("content-security-policy-report-only");
       assert(csp, "no CSP header");
+      const measurement = SVC_ENV.EDGE_IMG_SRC_REPORT_ONLY === "true";
+      const allowAll = SVC_ENV.EDGE_IMG_SRC_ALLOW_ALL === "true";
+      if (measurement) {
+        assert(
+          !reportOnly || csp.includes("img-src https:"),
+          "measurement mode expected open enforced img-src",
+        );
+      } else if (allowAll) {
+        assert(csp.includes("img-src https:"), "allow-all mode expected open img-src");
+        assert(!reportOnly, "unexpected Report-Only CSP header");
+      } else {
+        assert(!reportOnly, "unexpected Report-Only CSP header");
+        assert(csp.includes("img-src 'self' data: blob:"), "enforced img-src not tightened");
+        assert(csp.includes("object-src 'none'"), "enforced missing object-src");
+      }
       assert(csp.includes("frame-ancestors 'none'"), "frame-ancestors not locked down");
     });
   }
@@ -465,7 +609,10 @@ async function checkEdge() {
       });
       eq(r.status, 302, "status");
       const loc = r.headers.location ?? "";
-      assert(loc.startsWith(`https://auth.${BASE_DOMAIN}`), `unexpected redirect target: ${loc}`);
+      assert(
+        loc.startsWith(`https://auth.${CONTROL_DOMAIN}`),
+        `unexpected redirect target: ${loc}`,
+      );
       return new URL(loc).pathname;
     });
   }
@@ -474,6 +621,102 @@ async function checkEdge() {
     const { status } = await jget(EDGE(`no-such-app-${randomUUID().slice(0, 6)}`));
     eq(status, 404, "status");
   });
+}
+
+async function checkSplitTls() {
+  group("split-tls");
+  console.log(
+    "\n\x1b[1msplit-tls\x1b[0m — split cert, Node fetch, and Chromium on the apps domain",
+  );
+  if (!STACK.split) {
+    skip("split-domain checks", "HELIX_APPS_DOMAIN is unset");
+    return;
+  }
+
+  await check("split TLS cert and key exist", async () => {
+    assert(existsSync(SPLIT_CERT) && existsSync(SPLIT_KEY), `run:\n  ${MKCERT_SPLIT_CMD}`);
+    return "local-helix-split.pem";
+  });
+
+  const smokeHost = `smoke-x.${APPS_DOMAIN}`;
+  const smokeUrl = `https://${smokeHost}:${STACK.ports.edge}/`;
+
+  await check("TLS handshake authorizes apps-domain SNI", async () => {
+    const sock = await new Promise((resolve, reject) => {
+      const s = tls.connect(
+        {
+          host: "127.0.0.1",
+          port: STACK.ports.edge,
+          servername: smokeHost,
+          rejectUnauthorized: true,
+          lookup: loopbackLookup,
+        },
+        () => resolve(s),
+      );
+      s.on("error", reject);
+    });
+    const peer = sock.getPeerCertificate();
+    sock.end();
+    assert(sock.authorized, `TLS not authorized: ${sock.authorizationError}`);
+    const san = peer.subjectaltname ?? "";
+    assert(
+      san.includes(`*.${APPS_DOMAIN}`) || san.includes(smokeHost),
+      `peer SAN missing *.${APPS_DOMAIN}: ${san}`,
+    );
+    return san.split(", ").slice(0, 2).join(", ");
+  });
+
+  await check("fetch reaches the edge on the apps domain (404)", async () => {
+    let mechanism = splitFetchMechanism;
+    let r;
+    try {
+      r = await fetch(smokeUrl);
+    } catch (e) {
+      const code = e.code ?? e.cause?.code;
+      if (code !== "ENOTFOUND") throw e;
+      const orig = dns.lookup;
+      dns.lookup = loopbackLookup;
+      mechanism = "dns.lookup-patch";
+      splitFetchMechanism = mechanism;
+      r = await fetch(smokeUrl);
+      dns.lookup = orig;
+    }
+    eq(r.status, 404, "status");
+    return mechanism ?? "fetch";
+  });
+
+  if (NO_BROWSER) {
+    skip("Chromium reaches the apps domain", "--no-browser");
+  } else if (!findChrome()) {
+    skip("Chromium reaches the apps domain", "no cached Chromium (set HELIX_SMOKE_CHROME)");
+  } else {
+    let browser;
+    try {
+      browser = await launchBrowser({
+        port: STACK.cdpPort + 2,
+        ignoreCertErrors: true,
+        hostRules: [APPS_DOMAIN, CONTROL_DOMAIN],
+      });
+    } catch (e) {
+      skip("Chromium reaches the apps domain", e.message);
+      return;
+    }
+    try {
+      await check("Chromium reaches the apps domain without cert errors", async () => {
+        browser.reset();
+        await browser.navigate(smokeUrl);
+        assert(
+          browser.failedRequests.length === 0,
+          `failed requests: ${browser.failedRequests.slice(0, 3).join(" | ")}`,
+        );
+        const certErr = browser.errors.some((e) => /certificate|SSL|TLS/i.test(e));
+        assert(!certErr, `certificate errors: ${browser.errors.slice(0, 3).join(" | ")}`);
+        return smokeHost;
+      });
+    } finally {
+      browser.close();
+    }
+  }
 }
 
 async function checkEgress() {
@@ -536,7 +779,7 @@ async function checkIdp() {
       const loc = r.headers.get("location");
       if (!loc) return { final: cur, res: r, text: await r.text() };
       cur = new URL(loc, cur).toString();
-      if (cur.startsWith(`https://auth.${BASE_DOMAIN}`)) return { final: cur, res: r, text: "" };
+      if (cur.startsWith(`https://auth.${CONTROL_DOMAIN}`)) return { final: cur, res: r, text: "" };
     }
     throw new Error("too many redirects");
   }
@@ -554,7 +797,7 @@ async function checkIdp() {
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   // Must equal what dev-idp registered for the edge client — the stack sets
   // IDP_EDGE_REDIRECT_URIS, and this is its first (https) entry.
-  const redirectUri = `https://auth.${BASE_DOMAIN}:${STACK.ports.edge}/callback`;
+  const redirectUri = `https://auth.${CONTROL_DOMAIN}:${STACK.ports.edge}/callback`;
   let code = null;
 
   await check("authorize → interaction → code", async () => {
@@ -653,8 +896,22 @@ async function checkBrowser() {
   }
 
   let browser;
+  let cspBrowser;
   try {
-    browser = await launchBrowser({ port: STACK.cdpPort });
+    browser = await launchBrowser({
+      port: STACK.cdpPort,
+      hostRules: STACK.split ? [APPS_DOMAIN, CONTROL_DOMAIN] : [],
+    });
+    try {
+      cspBrowser = await launchBrowser({
+        port: STACK.cdpPort + 1,
+        ignoreCertErrors: true,
+        hostRules: STACK.split ? [APPS_DOMAIN, CONTROL_DOMAIN] : [BASE_DOMAIN],
+      });
+    } catch (e) {
+      browser.close();
+      throw e;
+    }
   } catch (e) {
     return skip("SPA renders in a real browser", e.message);
   }
@@ -706,6 +963,440 @@ async function checkBrowser() {
         return join(OUT, `${name}.png`);
       });
     }
+
+    await check(
+      "enforced CSP blocks remote image and records violation for smoke-csp",
+      async () => {
+        const remoteOrigin = `https://smoke-public.${BASE_DOMAIN}:${STACK.ports.edge}`;
+        const seenBefore = Date.now();
+        cspBrowser.reset();
+        await cspBrowser.navigate(EDGE("smoke-csp"));
+        const remote = await cspBrowser.evaluate(`(() => {
+        const el = document.querySelector('#remote');
+        return { complete: el?.complete ?? false, naturalWidth: el?.naturalWidth ?? -1 };
+      })()`);
+        assert(
+          remote.complete === true,
+          `remote image complete expected true, got ${remote.complete}`,
+        );
+        assert(
+          remote.naturalWidth === 0,
+          `remote image naturalWidth expected 0, got ${remote.naturalWidth}`,
+        );
+        const inlineW = await cspBrowser.evaluate(
+          "document.querySelector('#inline')?.naturalWidth ?? 0",
+        );
+        assert(inlineW === 1, `inline data: image naturalWidth expected 1, got ${inlineW}`);
+        await sleep(3000);
+        const reportPostData = cspBrowser.cspReportPosts.at(-1) ?? null;
+        assert(reportPostData, "no /_csp-report POST captured");
+        let inner;
+        try {
+          inner = JSON.parse(reportPostData)["csp-report"] ?? {};
+        } catch {
+          throw new Error("could not parse report POST body");
+        }
+        assert(
+          String(inner["blocked-uri"] ?? "").startsWith(remoteOrigin),
+          `blocked-uri expected to start with ${remoteOrigin}, got ${inner["blocked-uri"]}`,
+        );
+        const dispositionNote =
+          inner.disposition === undefined
+            ? "disposition absent (unknown)"
+            : `disposition=${JSON.stringify(inner.disposition)}`;
+        assert(
+          inner.disposition === "enforce",
+          `expected disposition enforce, got ${inner.disposition}`,
+        );
+
+        const { body: violations } = await jget(`${PORTAL}/api/v1/csp/violations`, {
+          headers: auth,
+        });
+        const hit = (violations.violations ?? []).find(
+          (v) =>
+            v.appSlug === "smoke-csp" &&
+            v.directive?.includes("img-src") &&
+            String(v.blockedUri ?? "").startsWith(remoteOrigin) &&
+            new Date(v.lastSeen).getTime() >= seenBefore - 5000,
+        );
+        assert(hit, `no recent img-src violation for smoke-csp against ${remoteOrigin}`);
+        return `${hit.count} report(s); ${dispositionNote}`;
+      },
+    );
+
+    await check("granted origin appears in smoke-csp CSP", async () => {
+      const grantOrigin = `https://smoke-public.${BASE_DOMAIN}:${STACK.ports.edge}`;
+      const dbUrl = SVC_ENV.DATABASE_URL;
+      assert(dbUrl, "DATABASE_URL required for grant check");
+      const cap = JSON.stringify({ externalOrigins: [grantOrigin] });
+      try {
+        const grant = spawnSync(
+          "psql",
+          [dbUrl, "-qtc", `UPDATE apps SET capabilities='${cap}'::jsonb WHERE slug='smoke-csp';`],
+          {
+            encoding: "utf8",
+          },
+        );
+        assert(grant.status === 0, `psql grant failed: ${grant.stderr}`);
+        const deadline = Date.now() + 15_000;
+        let csp;
+        for (;;) {
+          const { headers } = await jget(EDGE("smoke-csp"));
+          csp = headers.get("content-security-policy") ?? "";
+          if (csp.includes(grantOrigin)) break;
+          if (Date.now() > deadline) throw new Error("CSP never picked up granted origin");
+          await sleep(250);
+        }
+        assert(
+          csp.includes("connect-src") && csp.includes(grantOrigin),
+          "connect-src missing grant",
+        );
+        assert(csp.includes("img-src") && csp.includes(grantOrigin), "img-src missing grant");
+        cspBrowser.reset();
+        await cspBrowser.navigate(EDGE("smoke-csp"));
+        const remoteW = await cspBrowser.evaluate(
+          "document.querySelector('#remote')?.naturalWidth ?? 0",
+        );
+        assert(remoteW === 1, `granted remote image naturalWidth expected 1, got ${remoteW}`);
+        return grantOrigin;
+      } finally {
+        const clear = spawnSync(
+          "psql",
+          [dbUrl, "-qtc", `UPDATE apps SET capabilities='{}'::jsonb WHERE slug='smoke-csp';`],
+          { encoding: "utf8" },
+        );
+        assert(clear.status === 0, `psql clear grant failed: ${clear.stderr}`);
+      }
+    });
+  } finally {
+    browser.close();
+    cspBrowser?.close();
+  }
+}
+
+async function checkSplit() {
+  group("split");
+  console.log(
+    "\n\x1b[1msplit\x1b[0m — cross-domain login, Sec-Fetch-Site, cookies, silent refresh",
+  );
+
+  if (!STACK.split) {
+    skip("split-domain checks", "HELIX_APPS_DOMAIN is unset");
+    return;
+  }
+
+  const APPS = APPS_DOMAIN;
+  const CONTROL = CONTROL_DOMAIN;
+  const FALLBACK_PAIR = APPS.endsWith(`.${CONTROL}`);
+  const authOrigin = `https://auth.${CONTROL}:${STACK.ports.edge}`;
+  const appUrl = (slug, path = "/") => `https://${slug}.${APPS}:${STACK.ports.edge}${path}`;
+  const slug = "smoke-internal";
+  const sibling = "smoke-public";
+
+  await check("HTTP login across control and apps domains", async () => {
+    const jar = new Map();
+    let r = await navGet(appUrl(slug), jar);
+    eq(r.status, 302, "app gate");
+    let loc = new URL(r.headers.location, appUrl(slug)).toString();
+    assert(loc.startsWith(`${authOrigin}/start`), `expected auth /start, got ${loc}`);
+
+    r = await navGet(loc, jar);
+    assert(r.status >= 300 && r.status < 400, "start → IdP");
+    const idpStart = new URL(r.headers.location, loc).toString();
+    const callback = await idpWalkToEdgeCallback(idpStart, jar);
+    assert(callback.startsWith(`${authOrigin}/callback`), `callback origin: ${callback}`);
+
+    r = await navGet(callback, jar);
+    eq(r.status, 302, "callback → handoff");
+    loc = new URL(r.headers.location, callback).toString();
+    const completeOrigin = new URL(appUrl(slug)).origin;
+    assert(loc.startsWith(`${completeOrigin}/_auth/complete`), `handoff target: ${loc}`);
+
+    await navGet(loc, jar);
+    const appHost = new URL(appUrl(slug)).hostname;
+    const session = jar.get(appHost)?.get("__Host-session");
+    assert(session, "__Host-session not set on app host");
+    for (const [host, cookies] of jar) {
+      if (host !== appHost) assert(!cookies.has("__Host-session"), `session leaked to ${host}`);
+    }
+
+    r = await navGet(appUrl(slug), jar);
+    eq(r.status, 200, "authenticated app page");
+    return `${slug} on ${APPS}`;
+  });
+
+  await check("legacy control host redirects to apps origin", async () => {
+    const legacyUrl = `https://${slug}.${CONTROL}:${STACK.ports.edge}/`;
+    const r = await fetch(legacyUrl, { redirect: "manual" });
+    eq(r.status, 307, "legacy host");
+    const loc = r.headers.get("location") ?? "";
+    assert(loc.startsWith(appUrl(slug)), `expected apps origin, got ${loc}`);
+    assert(r.headers.get("cache-control") === "no-store", "cache-control");
+    return loc;
+  });
+
+  let browser;
+  let chromeVersion = "unknown";
+  if (NO_BROWSER) {
+    skip("split browser login", "--no-browser");
+    skip("Sec-Fetch-Site on handoff and API", "--no-browser");
+    skip("cookie scope across sites", "--no-browser");
+    skip("silent refresh", "--no-browser");
+    return;
+  }
+  if (!findChrome()) {
+    const why = "no cached Chromium (set HELIX_SMOKE_CHROME)";
+    skip("split browser login", why);
+    skip("Sec-Fetch-Site on handoff and API", why);
+    skip("cookie scope across sites", why);
+    skip("silent refresh", why);
+    return;
+  }
+
+  try {
+    browser = await launchBrowser({
+      port: STACK.cdpPort + 3,
+      ignoreCertErrors: true,
+      hostRules: [APPS, CONTROL],
+    });
+    try {
+      const ver = await fetch(`http://127.0.0.1:${STACK.cdpPort + 3}/json/version`);
+      if (ver.ok) chromeVersion = (await ver.json()).Browser ?? chromeVersion;
+    } catch {
+      /* optional */
+    }
+  } catch (e) {
+    const why = e.message;
+    skip("split browser login", why);
+    skip("Sec-Fetch-Site on handoff and API", why);
+    skip("cookie scope across sites", why);
+    skip("silent refresh", why);
+    return;
+  }
+
+  let hypothesisRefuted = false;
+  /** @type {{ url: string, headers: Record<string, string> } | null} */
+  let handoffFromLogin = null;
+
+  try {
+    await check("browser login lands on the app host", async () => {
+      browser.reset();
+      let startCount = 0;
+      const deadline = Date.now() + 90_000;
+      await browser.navigate(appUrl(slug));
+      while (Date.now() < deadline) {
+        const href = await browser.evaluate("location.href");
+        const appOrigin = appUrl(slug).replace(/\/$/, "");
+        if (href.startsWith(appOrigin)) {
+          const path = new URL(href).pathname;
+          if (path !== "/" && !path.startsWith("/index")) {
+            await sleep(500);
+            continue;
+          }
+          handoffFromLogin =
+            browser.requestLog().find((e) => e.url.includes("/_auth/complete")) ?? null;
+          await sleep(500);
+          return href;
+        }
+        if (href.includes("/interaction/")) {
+          const withUser = href.includes("?user=")
+            ? href
+            : `${href}${href.includes("?") ? "&" : "?"}user=alice@azx.dev`;
+          await browser.navigate(withUser);
+          continue;
+        }
+        if (href.includes("/start")) {
+          startCount++;
+          if (startCount > 2) {
+            throw new Error(
+              `login looped through /start (${startCount} times)\n${browser
+                .requestLog()
+                .map((e) => e.url)
+                .join("\n")}`,
+            );
+          }
+        }
+        await sleep(500);
+        await browser.evaluate("void 0");
+      }
+      throw new Error(
+        `timed out waiting for app origin\n${browser
+          .requestLog()
+          .map((e) => e.url)
+          .join("\n")}`,
+      );
+    });
+
+    await check("Sec-Fetch-Site on handoff and credentialed fetches", async () => {
+      const handoff = handoffFromLogin;
+      assert(handoff, "no /_auth/complete captured during browser login");
+      const handoffSite = handoff.headers["sec-fetch-site"] ?? "(missing)";
+      console.log(`  Sec-Fetch-Site on the handoff: ${handoffSite}`);
+
+      browser.reset();
+      await browser.navigate(appUrl(slug));
+      await browser.evaluate(
+        `fetch("/_api/me", { credentials: "include" }).then(() => 1).catch(() => 0)`,
+      );
+      await sleep(800);
+      const meLog = browser.requestLog();
+      const me = meLog.find((e) => e.url.includes("/_api/me"));
+      const meSite = me?.headers["sec-fetch-site"] ?? "(missing)";
+
+      const onApp = async () => {
+        browser.reset();
+        await browser.navigate(appUrl(slug));
+      };
+      // Page-initiated navigations: Sec-Fetch-Site is computed from the app page's
+      // origin. Page.navigate (browser.navigate) is browser-initiated and always
+      // reports `none`, which says nothing about site classification. A fetch()
+      // probe would be blocked by the app CSP (connect-src 'self') before it is
+      // sent; navigation is not governed by CSP.
+      const navigateFromPage = async (target) => {
+        await browser.evaluate(
+          `setTimeout(() => location.assign(${JSON.stringify(target)}), 0); 1`,
+        );
+        await sleep(2000);
+      };
+      await onApp();
+      await navigateFromPage(appUrl(sibling));
+      const sibHost = `${sibling}.${APPS}`;
+      const sib = browser.requestLog().find((e) => {
+        try {
+          const u = new URL(e.url);
+          return u.hostname === sibHost && u.pathname === "/";
+        } catch {
+          return false;
+        }
+      });
+      const sibSite = sib?.headers["sec-fetch-site"] ?? "(missing)";
+
+      await onApp();
+      await navigateFromPage(`${authOrigin}/health`);
+      const ctl = browser.requestLog().find((e) => {
+        try {
+          const u = new URL(e.url);
+          return u.hostname === `auth.${CONTROL}` && u.pathname === "/health";
+        } catch {
+          return false;
+        }
+      });
+      const ctlSite = ctl?.headers["sec-fetch-site"] ?? "(missing)";
+
+      const record = {
+        handoff: handoffSite,
+        apiMe: meSite,
+        siblingApp: sibSite,
+        appToControl: ctlSite,
+        appsDomain: APPS,
+        controlDomain: CONTROL,
+        fallbackPair: FALLBACK_PAIR,
+        chromeVersion,
+      };
+      writeFileSync(join(OUT, "sec-fetch-site.json"), JSON.stringify(record, null, 2));
+
+      // The handoff is recorded, not asserted: it arrives through a redirect chain
+      // that crosses the dev IdP (http://localhost:<port>), so it is cross-site in
+      // either pair, and a browser-initiated login reports `none`. The site
+      // classification is read from the page-initiated app → control navigation.
+      // /_api/me is same-origin by construction; recorded for the artifact, not asserted.
+      eq(sibSite, "same-site", "sibling app Sec-Fetch-Site (page-initiated)");
+      if (FALLBACK_PAIR) {
+        eq(ctlSite, "same-site", "app → control Sec-Fetch-Site in the same-site pair");
+      } else if (ctlSite === "same-site") {
+        hypothesisRefuted = true;
+        console.log("  HYPOTHESIS REFUTED: the two domains are same-site in this browser");
+        return `recorded control=${ctlSite} (expected cross-site)`;
+      } else {
+        eq(ctlSite, "cross-site", "app → control Sec-Fetch-Site (page-initiated)");
+      }
+      return `handoff=${handoffSite}, me=${meSite}, sibling=${sibSite}, control=${ctlSite}`;
+    });
+
+    if (hypothesisRefuted) {
+      skip("cross-site fetch metadata (handoff)", "hypothesis refuted — unverified");
+      skip("cross-site fetch metadata (sibling)", "hypothesis refuted — unverified");
+      skip("cross-site fetch metadata (app→control)", "hypothesis refuted — unverified");
+    }
+
+    await check("app-set cookies do not reach the control host", async () => {
+      await browser.navigate(appUrl(slug));
+      await browser.evaluate(
+        `document.cookie = "probe_apps=1; Domain=${APPS}; Path=/; Secure";` +
+          `document.cookie = "probe_localhost=1; Domain=localhost; Path=/; Secure";` +
+          `document.cookie = "probe_ctl=1; Domain=${CONTROL}; Path=/; Secure";`,
+      );
+      browser.reset();
+      await browser.navigate(appUrl(sibling));
+      const sibReq = browser.requestLog().find((e) => {
+        try {
+          return new URL(e.url).origin === new URL(appUrl(sibling)).origin;
+        } catch {
+          return false;
+        }
+      });
+      const sibCookie = sibReq?.headers.cookie ?? "";
+      assert(
+        sibCookie.includes("probe_apps="),
+        `positive control did not hold: the cookie was never set (${sibCookie})`,
+      );
+
+      browser.reset();
+      await browser.navigate(`${authOrigin}/health`);
+      const ctlReq = browser.requestLog().find((e) => e.url.includes("/health"));
+      assert(ctlReq, "no request to the control host captured");
+      assert(
+        ctlReq.headers["sec-fetch-site"],
+        "control /health request missing Sec-Fetch-Site (network extra-info headers not attached)",
+      );
+      const ctlCookie = ctlReq.headers.cookie ?? "";
+      if (FALLBACK_PAIR) {
+        assert(
+          ctlCookie.includes("probe_ctl="),
+          `expected same-site control cookie on auth host (negative control): ${ctlCookie}`,
+        );
+        return "fallback pair: probe_ctl reached auth (expected without PSL)";
+      }
+      assert(!/probe_/.test(ctlCookie), `probe cookie on control: ${ctlCookie}`);
+      assert(!ctlCookie.includes("__Host-session"), `session cookie on control: ${ctlCookie}`);
+      return "no probe or session on control host";
+    });
+
+    await check("silent refresh through auth host", async () => {
+      await sleep(3500);
+      browser.reset();
+      await browser.navigate(appUrl(slug));
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const href = await browser.evaluate("location.href");
+        if (href.startsWith(appUrl(slug).replace(/\/$/, ""))) break;
+        if (href.includes("/interaction/")) {
+          const withUser = href.includes("?user=")
+            ? href
+            : `${href}${href.includes("?") ? "&" : "?"}user=alice@azx.dev`;
+          browser.reset();
+          await browser.navigate(withUser);
+        }
+        await sleep(400);
+      }
+      const log = browser.requestLog();
+      const silent = log.find((e) => e.url.includes("/start") && e.url.includes("silent=1"));
+      assert(silent, `no silent /start in log:\n${log.map((e) => e.url).join("\n")}`);
+      assert(
+        log.some((e) => e.url.includes("/callback")),
+        "silent refresh missing callback",
+      );
+      assert(
+        log.some((e) => e.url.includes("/_auth/complete")),
+        "silent refresh missing handoff",
+      );
+      const href = await browser.evaluate("location.href");
+      const appOrigin = appUrl(slug).replace(/\/$/, "");
+      assert(href.startsWith(appOrigin), `ended on ${href}`);
+      const endPath = new URL(href).pathname;
+      assert(endPath === "/" || endPath.startsWith("/index"), `ended mid-handoff on ${endPath}`);
+      return "silent=1 chain completed";
+    });
   } finally {
     browser.close();
   }
@@ -753,6 +1444,16 @@ async function main() {
     console.error(`--only must be one of: ${GROUPS.join(", ")}`);
     process.exit(2);
   }
+  if ((only === "split-tls" || only === "split") && !STACK.split) {
+    console.error(`${only} requires HELIX_APPS_DOMAIN to be set.`);
+    process.exit(2);
+  }
+  if (STACK.split && (!existsSync(SPLIT_CERT) || !existsSync(SPLIT_KEY))) {
+    console.error(
+      `\x1b[31msplit TLS cert missing — create it before booting:\x1b[0m\n  ${MKCERT_SPLIT_CMD}\n`,
+    );
+    process.exit(2);
+  }
 
   console.log(`\x1b[1mHelix smoke test\x1b[0m   artifacts → ${OUT}`);
   console.log(
@@ -793,13 +1494,15 @@ async function main() {
     console.error("\n\x1b[31mservices did not come up — aborting\x1b[0m");
   } else {
     try {
-      if (wanted("edge") || wanted("cli")) await seedRegistry();
+      if (wanted("edge") || wanted("cli") || wanted("split")) await seedRegistry();
       if (wanted("idp")) await checkIdp();
       if (wanted("portal")) await checkPortal();
       if (wanted("edge")) await checkEdge();
+      if (wanted("split-tls") && (STACK.split || only === "split-tls")) await checkSplitTls();
       if (wanted("egress")) await checkEgress();
       if (wanted("spa")) await checkSpa();
       if (wanted("browser")) await checkBrowser();
+      if (STACK.split && (!only || only === "split")) await checkSplit();
       if (wanted("cli")) await checkCli();
     } finally {
       cleanupThrowaway();

@@ -1,0 +1,258 @@
+import { randomUUID } from "node:crypto";
+import type { Pool } from "pg";
+import { createEdgePool, withPooledClient, type EdgePoolOpts } from "../db/pool.js";
+
+export interface LeaseRequest {
+  /** `llm:app:<appId>`, `llm:user:<appId>:<userOid>`, `fetch:app:<appId>`. */
+  scope: string;
+  /** Maximum unexpired leases on this scope. 0 or less means no cap: the scope takes no row. */
+  cap: number;
+}
+
+export type AcquireResult = { ok: true; leaseId: string } | { ok: false; scope: string };
+
+export interface LeaseStore {
+  /** All scopes or none. `ttlMs` bounds how long a leaked lease can hold a slot. */
+  acquire(requests: readonly LeaseRequest[], ttlMs: number): Promise<AcquireResult>;
+  release(leaseId: string): Promise<void>;
+  /** GC expired rows. Correctness never depends on it: expired leases are not counted. */
+  sweep(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export const INFLIGHT_LEASES_PRIVILEGE_SQL = `
+SELECT
+  to_regclass('public.inflight_leases') IS NOT NULL AS table_exists,
+  has_table_privilege(current_user, 'public.inflight_leases', 'SELECT') AS can_select,
+  has_table_privilege(current_user, 'public.inflight_leases', 'INSERT') AS can_insert,
+  has_table_privilege(current_user, 'public.inflight_leases', 'DELETE') AS can_delete
+`;
+
+export type InflightLeasesCheck =
+  | { status: "ok" }
+  | { status: "misconfigured"; problem: string }
+  | { status: "unreachable"; error: unknown };
+
+type InflightLeasesPrivilegeRow = {
+  table_exists: boolean;
+  can_select: boolean;
+  can_insert: boolean;
+  can_delete: boolean;
+};
+
+export function classifyInflightLeasesPrivilege(
+  rows: InflightLeasesPrivilegeRow[],
+): Exclude<InflightLeasesCheck, { status: "unreachable" }> {
+  const row = rows[0];
+  if (!row?.table_exists) {
+    return { status: "misconfigured", problem: "inflight_leases table is missing" };
+  }
+  if (!row.can_select || !row.can_insert || !row.can_delete) {
+    return {
+      status: "misconfigured",
+      problem: "helix_edge cannot SELECT, INSERT, and DELETE on inflight_leases",
+    };
+  }
+  return { status: "ok" };
+}
+
+function postgresErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+function cappedRequests(requests: readonly LeaseRequest[]): LeaseRequest[] {
+  const byScope = new Map<string, number>();
+  for (const { scope, cap } of requests) {
+    if (cap <= 0) continue;
+    const prev = byScope.get(scope);
+    if (prev === undefined || cap < prev) byScope.set(scope, cap);
+  }
+  return [...byScope.entries()]
+    .map(([scope, cap]) => ({ scope, cap }))
+    .sort((a, b) => (a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0));
+}
+
+/**
+ * Postgres-backed lease store under the `helix_edge` role (SELECT+INSERT+DELETE on
+ * `inflight_leases`). `acquire` takes advisory xact locks per scope (sorted) so
+ * check-then-insert is atomic under READ COMMITTED.
+ *
+ * Lock keys are hashes of the scope string, so two unrelated scopes can collide and
+ * serialize needlessly — a little extra latency, never incorrect. Counts use
+ * `"expiresAt" > now()` against `timestamp(3)`, the same pattern as {@link PgCounterStore}.
+ */
+export class PgLeaseStore implements LeaseStore {
+  readonly #pool: Pool;
+
+  constructor(databaseUrl: string, opts: EdgePoolOpts = {}) {
+    this.#pool = createEdgePool(databaseUrl, {
+      ...opts,
+      max: opts.max ?? 10,
+      connectionTimeoutMs: opts.connectionTimeoutMs ?? 5_000,
+      label: opts.label ?? "leases",
+    });
+  }
+
+  async acquire(requests: readonly LeaseRequest[], ttlMs: number): Promise<AcquireResult> {
+    const sorted = cappedRequests(requests);
+    const leaseId = randomUUID();
+    if (sorted.length === 0) {
+      return { ok: true, leaseId };
+    }
+
+    return withPooledClient(this.#pool, async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query("SET LOCAL lock_timeout = '250ms'");
+        for (const { scope } of sorted) {
+          try {
+            await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scope]);
+          } catch (err) {
+            if (postgresErrorCode(err) === "55P03") {
+              await client.query("ROLLBACK");
+              return { ok: false as const, scope };
+            }
+            throw err;
+          }
+        }
+        for (const { scope, cap } of sorted) {
+          const res = await client.query<{ n: number }>(
+            `SELECT count(*)::int AS n FROM inflight_leases WHERE scope = $1 AND "expiresAt" > now()`,
+            [scope],
+          );
+          if ((res.rows[0]?.n ?? 0) >= cap) {
+            await client.query("ROLLBACK");
+            return { ok: false as const, scope };
+          }
+        }
+        await client.query(
+          `INSERT INTO inflight_leases (id, scope, "expiresAt")
+             SELECT $1::uuid, s, now() + ($3::text || ' milliseconds')::interval
+             FROM unnest($2::text[]) AS s`,
+          [leaseId, sorted.map((r) => r.scope), ttlMs],
+        );
+        await client.query("COMMIT");
+        return { ok: true as const, leaseId };
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      }
+    });
+  }
+
+  async release(leaseId: string): Promise<void> {
+    await this.#pool.query(`DELETE FROM inflight_leases WHERE id = $1`, [leaseId]);
+  }
+
+  async sweep(): Promise<void> {
+    await this.#pool.query(`DELETE FROM inflight_leases WHERE "expiresAt" < now()`);
+  }
+
+  async checkInflightLeasesAccess(): Promise<InflightLeasesCheck> {
+    try {
+      const res = await this.#pool.query(INFLIGHT_LEASES_PRIVILEGE_SQL);
+      const classified = classifyInflightLeasesPrivilege(res.rows as InflightLeasesPrivilegeRow[]);
+      if (classified.status === "misconfigured") return classified;
+      await withPooledClient(this.#pool, async (client) => {
+        const probeId = randomUUID();
+        const probeScope = `boot:probe:${probeId}`;
+        await client.query("BEGIN");
+        try {
+          await client.query(
+            `INSERT INTO inflight_leases (id, scope, "expiresAt")
+             VALUES ($1::uuid, $2, now() + interval '1 second')`,
+            [probeId, probeScope],
+          );
+          await client.query(`DELETE FROM inflight_leases WHERE id = $1::uuid`, [probeId]);
+          await client.query("ROLLBACK");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {});
+          throw err;
+        }
+      });
+      return { status: "ok" };
+    } catch (err) {
+      return { status: "unreachable", error: err };
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.#pool.end();
+  }
+}
+
+/**
+ * In-memory lease store for unit tests and single-process dev. NOT multi-replica safe.
+ */
+export class InMemoryLeaseStore implements LeaseStore {
+  /** scope → leaseId → expiresAt (epoch ms) */
+  readonly #leases = new Map<string, Map<string, number>>();
+  readonly #now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.#now = now;
+  }
+
+  async acquire(requests: readonly LeaseRequest[], ttlMs: number): Promise<AcquireResult> {
+    const sorted = cappedRequests(requests);
+    const leaseId = randomUUID();
+    if (sorted.length === 0) {
+      return { ok: true, leaseId };
+    }
+
+    const t = this.#now();
+    for (const { scope, cap } of sorted) {
+      const active = this.#countActive(scope, t);
+      if (active >= cap) {
+        return { ok: false, scope };
+      }
+    }
+    const expiresAt = t + ttlMs;
+    for (const { scope } of sorted) {
+      let m = this.#leases.get(scope);
+      if (!m) {
+        m = new Map();
+        this.#leases.set(scope, m);
+      }
+      m.set(leaseId, expiresAt);
+    }
+    return { ok: true, leaseId };
+  }
+
+  async release(leaseId: string): Promise<void> {
+    for (const m of this.#leases.values()) {
+      m.delete(leaseId);
+    }
+  }
+
+  async sweep(): Promise<void> {
+    const t = this.#now();
+    for (const [scope, m] of this.#leases) {
+      for (const [id, exp] of m) {
+        if (exp <= t) m.delete(id);
+      }
+      if (m.size === 0) this.#leases.delete(scope);
+    }
+  }
+
+  async close(): Promise<void> {}
+
+  /** Unexpired leases on `scope` — for tests only. */
+  held(scope: string): number {
+    return this.#countActive(scope, this.#now());
+  }
+
+  #countActive(scope: string, t: number): number {
+    const m = this.#leases.get(scope);
+    if (!m) return 0;
+    let n = 0;
+    for (const exp of m.values()) {
+      if (exp > t) n += 1;
+    }
+    return n;
+  }
+}

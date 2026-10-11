@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { APP_DESCRIPTION_MAX, AppSchema } from "./app.js";
+import { DeltaSchema } from "./approval.js";
 import { CapabilitiesSchema } from "./manifest.js";
 import { VersionSchema } from "./version.js";
 import { WritableVisibilitySchema } from "./visibility.js";
@@ -22,6 +23,17 @@ export const CreateAppRequestSchema = z.object({
   capabilities: CapabilitiesSchema.optional(),
 });
 export type CreateAppRequest = z.infer<typeof CreateAppRequestSchema>;
+
+/**
+ * `POST /api/v1/apps` response under the capability write-gate (§3). The app
+ * fields sit at the top level for backward compatibility with clients that parse
+ * `AppSchema` only; `applied` and `pending` are additive.
+ */
+export const CreateAppResultSchema = AppSchema.extend({
+  applied: z.array(DeltaSchema),
+  pending: z.string().nullable(),
+});
+export type CreateAppResult = z.infer<typeof CreateAppResultSchema>;
 
 /**
  * `PATCH /api/v1/apps/:slug` body — partial registry-record edit. Only the keys

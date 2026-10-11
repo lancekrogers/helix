@@ -569,10 +569,10 @@ export type ConsentNonceRedemption =
  * recorded against a revision must not send the user through configuration
  * that attempt never saw.
  *
- * `callbackUrl` is the caller's (the portal's own convention-derived value,
- * `deployment.ts connectionsCallbackUrl`): the redemption has no edge call
- * to supply it, and the reserved-subdomain derivation is the value the
- * consistency session test-pins to the edge's topology.
+ * `callbackUrl` is the caller's configured control-origin value
+ * (`deployment.ts` `connectionsCallbackUrl` / `CONTROL_PUBLIC_BASE`): the
+ * redemption has no edge call to supply it, and the consistency session
+ * test-pins the same URL the edge expects for the deployment topology.
  */
 export async function redeemConsentNonce(
   prisma: PrismaClient,

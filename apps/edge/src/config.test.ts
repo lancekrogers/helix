@@ -1,6 +1,13 @@
 import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
-import { loadConfig, loadDevGatewayConfig, parseConnectionString, publicOrigin } from "./config.js";
+import { classifyHost, RESERVED_SUBDOMAINS } from "./routing/hosts.js";
+import {
+  controlOrigin,
+  loadConfig,
+  loadDevGatewayConfig,
+  parseConnectionString,
+  publicOrigin,
+} from "./config.js";
 
 // The well-known Azurite dev credentials (public, not a secret).
 const AZURITE_KEY =
@@ -80,6 +87,29 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...ENV, EDGE_ALLOW_PUBLIC_APPS: "1" }).allowPublicApps).toBe(false);
   });
 
+  it("parses EDGE_LEGACY_APP_REDIRECT strictly and only in split layout", () => {
+    expect(loadConfig(ENV).legacyAppRedirect).toBe(false);
+    expect(loadConfig({ ...ENV, EDGE_LEGACY_APP_REDIRECT: "true" }).legacyAppRedirect).toBe(false);
+    for (const value of ["TRUE", "1", "", "  "]) {
+      expect(loadConfig({ ...ENV, EDGE_LEGACY_APP_REDIRECT: value }).legacyAppRedirect).toBe(false);
+    }
+    const split = loadConfig({
+      ...ENV,
+      EDGE_BASE_DOMAIN: "helix-apps.localhost",
+      EDGE_CONTROL_DOMAIN: "helix-control.localhost",
+      EDGE_LEGACY_APP_REDIRECT: "true",
+    });
+    expect(split.legacyAppRedirect).toBe(true);
+    expect(
+      loadConfig({
+        ...ENV,
+        EDGE_BASE_DOMAIN: "helix-apps.localhost",
+        EDGE_CONTROL_DOMAIN: "helix-control.localhost",
+        EDGE_LEGACY_APP_REDIRECT: "TRUE",
+      }).legacyAppRedirect,
+    ).toBe(false);
+  });
+
   it("honors overrides", () => {
     const config = loadConfig({
       ...ENV,
@@ -130,6 +160,115 @@ describe("loadConfig", () => {
     ).toThrow(/EDGE_RECONCILE_INTERVAL_MS must be a positive number/);
   });
 
+  it("parses EDGE_LLM_PLATFORM_DOLLARS_PER_DAY with the same rules as other gateway knobs", () => {
+    for (const bad of ["abc", "-1", "NaN", "Infinity"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_LLM_PLATFORM_DOLLARS_PER_DAY: bad })).toThrow(
+        /EDGE_LLM_PLATFORM_DOLLARS_PER_DAY must be a non-negative number/,
+      );
+    }
+    expect(loadConfig({ ...ENV }).llm.platformDollarsPerDay).toBe(0);
+    expect(
+      loadConfig({ ...ENV, EDGE_LLM_PLATFORM_DOLLARS_PER_DAY: "100" }).llm.platformDollarsPerDay,
+    ).toBe(100);
+    expect(
+      loadConfig({ ...ENV, EDGE_LLM_PLATFORM_DOLLARS_PER_DAY: "0" }).llm.platformDollarsPerDay,
+    ).toBe(0);
+    for (const blank of ["", "   "]) {
+      expect(
+        loadConfig({ ...ENV, EDGE_LLM_PLATFORM_DOLLARS_PER_DAY: blank }).llm.platformDollarsPerDay,
+      ).toBe(0);
+    }
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_LLM_PLATFORM_DOLLARS_PER_DAY: "abc",
+      }),
+    ).toThrow(/EDGE_LLM_PLATFORM_DOLLARS_PER_DAY must be a non-negative number/);
+  });
+
+  it("parses EDGE_LLM_DEFAULT_DOLLARS_PER_DAY with the same rules as other gateway knobs", () => {
+    for (const bad of ["abc", "-1", "NaN", "Infinity"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: bad })).toThrow(
+        /EDGE_LLM_DEFAULT_DOLLARS_PER_DAY must be a non-negative number/,
+      );
+    }
+    expect(loadConfig({ ...ENV }).llm.defaultDollarsPerDay).toBe(50);
+    expect(
+      loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: "120" }).llm.defaultDollarsPerDay,
+    ).toBe(120);
+    expect(
+      loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: "0" }).llm.defaultDollarsPerDay,
+    ).toBe(0);
+    for (const blank of ["", "   "]) {
+      expect(
+        loadConfig({ ...ENV, EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: blank }).llm.defaultDollarsPerDay,
+      ).toBe(50);
+    }
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_LLM_DEFAULT_DOLLARS_PER_DAY: "abc",
+      }),
+    ).toThrow(/EDGE_LLM_DEFAULT_DOLLARS_PER_DAY must be a non-negative number/);
+  });
+
+  it("parses LLM concurrency caps and the call deadline", () => {
+    expect(loadConfig({ ...ENV }).llm.maxAppInFlight).toBe(10);
+    expect(loadConfig({ ...ENV }).llm.maxUserInFlight).toBe(3);
+    expect(loadConfig({ ...ENV }).llm.maxInFlight).toBe(200);
+    expect(loadConfig({ ...ENV }).llm.maxCallMs).toBe(600_000);
+    expect(loadConfig({ ...ENV, EDGE_LLM_MAX_APP_IN_FLIGHT: "0" }).llm.maxAppInFlight).toBe(0);
+    for (const [key, field] of [
+      ["EDGE_LLM_MAX_APP_IN_FLIGHT", "maxAppInFlight"],
+      ["EDGE_LLM_MAX_USER_IN_FLIGHT", "maxUserInFlight"],
+      ["EDGE_LLM_MAX_IN_FLIGHT", "maxInFlight"],
+    ] as const) {
+      for (const bad of ["-1", "2.5", "abc", "NaN", "Infinity"]) {
+        expect(() => loadConfig({ ...ENV, [key]: bad })).toThrow(
+          new RegExp(`${key} must be a non-negative integer`),
+        );
+      }
+      expect(loadConfig({ ...ENV, [key]: "12" }).llm[field]).toBe(12);
+    }
+    for (const bad of ["0", "-1", "abc"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_LLM_MAX_CALL_MS: bad })).toThrow(
+        /EDGE_LLM_MAX_CALL_MS must be a positive number/,
+      );
+    }
+    expect(() => loadConfig({ ...ENV, EDGE_LLM_MAX_CALL_MS: String(2_147_483_648) })).toThrow(
+      /EDGE_LLM_MAX_CALL_MS must be at most 2147483647/,
+    );
+    expect(loadConfig({ ...ENV, EDGE_LLM_MAX_CALL_MS: "2147483647" }).llm.maxCallMs).toBe(
+      2_147_483_647,
+    );
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_LLM_MAX_IN_FLIGHT: "2.5",
+      }),
+    ).toThrow(/EDGE_LLM_MAX_IN_FLIGHT must be a non-negative integer/);
+  });
+
+  it("parses fetch per-app concurrency cap", () => {
+    expect(loadConfig({ ...ENV }).fetch.maxAppInFlight).toBe(0);
+    expect(loadConfig({ ...ENV, EDGE_FETCH_MAX_APP_IN_FLIGHT: "5" }).fetch.maxAppInFlight).toBe(5);
+    for (const bad of ["-1", "2.5", "abc", "NaN", "Infinity"]) {
+      expect(() => loadConfig({ ...ENV, EDGE_FETCH_MAX_APP_IN_FLIGHT: bad })).toThrow(
+        /EDGE_FETCH_MAX_APP_IN_FLIGHT must be a non-negative integer/,
+      );
+    }
+    expect(() =>
+      loadDevGatewayConfig({
+        ...ENV,
+        EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+        EDGE_FETCH_MAX_APP_IN_FLIGHT: "abc",
+      }),
+    ).toThrow(/EDGE_FETCH_MAX_APP_IN_FLIGHT must be a non-negative integer/);
+  });
+
   // A hop count trusts by position, so it structurally ignores the peer address
   // and lets anyone reaching the origin directly spoof X-Forwarded-*
   // (GHSA-3m5p-2c4r-xxw2). Fastify 5.12.1 compiles a number to "trust nothing"
@@ -137,6 +276,74 @@ describe("loadConfig", () => {
   // login throttle and the audit hash — to the ingress address while everything
   // still read green. Fail the boot instead, the same posture the reconcile
   // interval takes above.
+  it("parses EDGE_IMG_SRC_ALLOW_ALL with allow polarity", () => {
+    expect(loadConfig({ ...ENV }).imgSrcAllowAll).toBe(false);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_ALLOW_ALL: "true" }).imgSrcAllowAll).toBe(true);
+    for (const bad of ["True", "1", "yes", " true"]) {
+      expect(loadConfig({ ...ENV, EDGE_IMG_SRC_ALLOW_ALL: bad }).imgSrcAllowAll).toBe(false);
+    }
+  });
+
+  it("parses EDGE_IMG_SRC_REPORT_ONLY with allow polarity", () => {
+    expect(loadConfig({ ...ENV }).imgSrcReportOnly).toBe(false);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_REPORT_ONLY: "true" }).imgSrcReportOnly).toBe(true);
+    for (const bad of ["True", "1", "yes", " true"]) {
+      expect(loadConfig({ ...ENV, EDGE_IMG_SRC_REPORT_ONLY: bad }).imgSrcReportOnly).toBe(false);
+    }
+  });
+
+  it("refuses boot when EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL are both true", () => {
+    expect(() =>
+      loadConfig({
+        ...ENV,
+        EDGE_IMG_SRC_REPORT_ONLY: "true",
+        EDGE_IMG_SRC_ALLOW_ALL: "true",
+      }),
+    ).toThrow(/EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL cannot both be true/);
+  });
+
+  it("parses EDGE_IMG_SRC_EXTRA", () => {
+    expect(loadConfig({ ...ENV }).imgSrcExtra).toEqual([]);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "" }).imgSrcExtra).toEqual([]);
+    expect(loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "   " }).imgSrcExtra).toEqual([]);
+    expect(
+      loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "https://a.example, https://b.example:8443" })
+        .imgSrcExtra,
+    ).toEqual(["https://a.example", "https://b.example:8443"]);
+    expect(
+      loadConfig({
+        ...ENV,
+        EDGE_IMG_SRC_EXTRA: "https://a.example,https://a.example",
+      }).imgSrcExtra,
+    ).toEqual(["https://a.example"]);
+    expect(() => loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "wss://live.example" })).toThrow(
+      /EDGE_IMG_SRC_EXTRA is not a list of https origins/,
+    );
+    expect(() => loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: "https://x;connect-src" })).toThrow(
+      /EDGE_IMG_SRC_EXTRA is not a list of https origins/,
+    );
+    for (const bad of [
+      "http://a.example",
+      "https:",
+      "*",
+      "https://*.a.example",
+      "https://a.example/path",
+      "https://a.example?x=1",
+      "https://u:p@a.example",
+      "not a url",
+    ]) {
+      expect(() => loadConfig({ ...ENV, EDGE_IMG_SRC_EXTRA: bad })).toThrow(
+        /EDGE_IMG_SRC_EXTRA is not a list of https origins/,
+      );
+    }
+    expect(() =>
+      loadConfig({
+        ...ENV,
+        EDGE_IMG_SRC_EXTRA: "https://good.example,https://a.example/path",
+      }),
+    ).toThrow(/EDGE_IMG_SRC_EXTRA is not a list of https origins/);
+  });
+
   it("refuses a hop count for EDGE_TRUST_PROXY instead of silently trusting nothing", () => {
     for (const hops of ["1", "2", " 3 "]) {
       expect(() => loadConfig({ ...ENV, EDGE_TRUST_PROXY: hops })).toThrow(
@@ -650,7 +857,7 @@ describe("publicOrigin", () => {
 
   it("builds https host URLs from config, omitting the default 443", () => {
     const dev = loadConfig({ ...ENV, EDGE_PUBLIC_PORT: "8080" });
-    expect(publicOrigin(dev, "auth")).toBe("https://auth.local.helix.azxlabs.io:8080");
+    expect(controlOrigin(dev, "auth")).toBe("https://auth.local.helix.azxlabs.io:8080");
     expect(publicOrigin(dev, "demo")).toBe("https://demo.local.helix.azxlabs.io:8080");
 
     // Production: ingress terminates TLS (no edge cert), public port 443, and
@@ -663,8 +870,91 @@ describe("publicOrigin", () => {
       EDGE_PUBLIC_PORT: "443",
       NODE_ENV: "production",
     });
-    expect(publicOrigin(prod, "auth")).toBe("https://auth.azx.helix.azxlabs.io");
+    expect(controlOrigin(prod, "auth")).toBe("https://auth.azx.helix.azxlabs.io");
     expect(publicOrigin(prod, null)).toBe("https://azx.helix.azxlabs.io");
+  });
+
+  it("refuses reserved control labels", () => {
+    const dev = loadConfig({ ...ENV, EDGE_PUBLIC_PORT: "8080" });
+    for (const label of RESERVED_SUBDOMAINS) {
+      expect(() => publicOrigin(dev, label)).toThrow(/controlOrigin/);
+    }
+    const split = loadConfig({
+      ...ENV,
+      EDGE_PUBLIC_PORT: "8080",
+      EDGE_BASE_DOMAIN: "helix-apps.localhost",
+      EDGE_CONTROL_DOMAIN: "local.helix.azxlabs.io",
+    });
+    for (const label of RESERVED_SUBDOMAINS) {
+      expect(() => publicOrigin(split, label)).toThrow(/controlOrigin/);
+    }
+  });
+});
+
+describe("resolveControlDomain / EDGE_CONTROL_DOMAIN boot validation", () => {
+  const ENV = {
+    DATABASE_URL: "postgresql://helix:helix@db:5432/helix",
+    EDGE_DATABASE_URL: "postgresql://helix_edge:helix_edge@db:5432/helix",
+    AZURE_STORAGE_CONNECTION_STRING: AZURITE_CS,
+    EDGE_TLS_CERT_FILE: "/certs/local-helix.pem",
+    EDGE_TLS_KEY_FILE: "/certs/local-helix-key.pem",
+    EDGE_DEV_DATABASE_URL: "postgresql://helix_dev:helix_dev@db:5432/helix",
+  };
+  const base = "local.helix.azxlabs.io";
+
+  it("unset, blank, or equal to base keeps legacy single-domain mode", () => {
+    for (const control of [undefined, "", "  ", base, base.toUpperCase()]) {
+      const cfg = loadConfig({
+        ...ENV,
+        ...(control !== undefined ? { EDGE_CONTROL_DOMAIN: control } : {}),
+      });
+      expect(cfg.controlDomain).toBe(base);
+      expect(cfg.baseDomain).toBe(base);
+    }
+  });
+
+  it("rejects a control subdomain of the apps domain", () => {
+    expect(() => loadConfig({ ...ENV, EDGE_CONTROL_DOMAIN: `ctl.${base}` })).toThrow(
+      /subdomain of EDGE_BASE_DOMAIN/,
+    );
+    expect(() => loadDevGatewayConfig({ ...ENV, EDGE_CONTROL_DOMAIN: `ctl.${base}` })).toThrow(
+      /subdomain of EDGE_BASE_DOMAIN/,
+    );
+  });
+
+  it.each([
+    ["http://x.test", /valid hostname/],
+    ["x.test:8443", /valid hostname/],
+    ["x", /valid hostname/],
+    [".x.test", /valid hostname/],
+    ["x_y.test", /valid hostname/],
+  ])("rejects malformed control domain %s", (control, pattern) => {
+    expect(() => loadConfig({ ...ENV, EDGE_CONTROL_DOMAIN: control })).toThrow(pattern);
+    expect(() => loadDevGatewayConfig({ ...ENV, EDGE_CONTROL_DOMAIN: control })).toThrow(pattern);
+  });
+
+  it("allows control parent of apps and lowercases input", () => {
+    const cfg = loadConfig({
+      ...ENV,
+      EDGE_BASE_DOMAIN: "apps.helix.customer.test",
+      EDGE_CONTROL_DOMAIN: "HELIX.CUSTOMER.TEST",
+    });
+    expect(cfg.controlDomain).toBe("helix.customer.test");
+    expect(classifyHost("auth.helix.customer.test", cfg.baseDomain, cfg.controlDomain)).toEqual({
+      kind: "auth",
+    });
+  });
+
+  it("rejects an apps domain on a reserved control label", () => {
+    const control = "example.test";
+    for (const base of [`auth.${control}`, `tenant.auth.${control}`, `portal.${control}`]) {
+      expect(() =>
+        loadConfig({ ...ENV, EDGE_BASE_DOMAIN: base, EDGE_CONTROL_DOMAIN: control }),
+      ).toThrow(/EDGE_BASE_DOMAIN/);
+      expect(() =>
+        loadDevGatewayConfig({ ...ENV, EDGE_BASE_DOMAIN: base, EDGE_CONTROL_DOMAIN: control }),
+      ).toThrow(/EDGE_BASE_DOMAIN/);
+    }
   });
 });
 

@@ -38,13 +38,26 @@ param imageTag = readEnvironmentVariable('HELIX_IMAGE_TAG', 'latest')
 // helix_dev role (README step 4) and the pre-deploy riders in the feature doc.
 param deployDevGateway = false
 
-// Egress firewall (ADR-0001/0005). true = deploy the Azure Firewall that enforces
-// the egress-only network zone (the PRIMARY SSRF/egress control). Secure default.
-// false skips it to save ~$900/mo but drops that control (a compromised edge can
-// then reach the internet; only the egress app-level denylist remains). Data
-// services stay private either way. Disable ONLY for dev/smoketest/trusted
-// installs — see README "Optional: the egress firewall".
+// Egress firewall (ADR-0001/0005). true = deploy the Azure Firewall FQDN-filtering
+// tier (stronger optional control). Baseline for every install: ssrf.ts + snet-egress
+// NSG. false skips it to save ~$900/mo (both subnets get default internet egress;
+// egress traffic still governed by ssrf.ts and the NSG). Data services stay private
+// either way. Disable ONLY for dev/smoketest/trusted installs — see README
+// "Optional: the egress firewall".
 param deployFirewall = true
+// param threatIntelMode = 'Alert'  // 'Deny' drops known-bad destinations; use 'Alert' to log only
+// egressFqdnMode only applies when deployFirewall is true. allowlist = product FQDNs plus platform
+// rules; any = * on 80/443 (template default — installs with their own param file keep any unless set).
+// param egressFqdnMode = 'allowlist'  // new firewall installs; existing installs stay on 'any' until `just infra egress-hosts` shows the list is complete
+// param egressAllowedFqdns = ['api.vendor.example']  // connection providers + approved fetch origins
+
+// Egress subnet NSG (layer 2). enforce = deny list + closing deny-all; deny-list-only =
+// safe first step on an existing install (no row 4000); off = no NSG. Unverified in
+// Azure whether a populated ACA subnet accepts NSG attachment as an update.
+// param egressNsgEnforce = 'off'  // existing installs: keep off until the scratch-copy test and net-verify pass
+// param egressNsgEnforce = 'enforce'  // new installs; existing installs keep the deny-list-only default until net-verify passes
+// param egressAllowedPorts = ['80', '443']  // non-standard approved-origin ports need values here
+// param netprobeClosingDenyTarget = 'origin.example:8443'  // optional; prove enforce closing deny with firewall off
 
 // Wildcard TLS automation (apps/certbot, ADR-0029). true = deploy the certbot
 // scheduled job that issues/renews *.appsDomain via ACME DNS-01 and binds the
@@ -62,6 +75,11 @@ param acmeServer = readEnvironmentVariable('HELIX_ACME_SERVER', 'https://acme-st
 // not readEnvironmentVariable this one — a set-but-blank env var renders ''
 // (= false), and the blank direction is the silent-wipe one.
 param wildcardTlsBound = false
+// Hosted apps on a separate domain (see the hostedAppsDomain description in main.bicep).
+// param hostedAppsDomain = 'apps.example.test'
+// param hostedAppsLive = false  // false = provision zone and certbot only; true = cut over app URLs
+// param hostedAppsTlsBound = false
+// param legacyAppRedirect = false
 
 // Portal access. false = internal ingress (secure default). true = expose the
 // control plane at portal.<appsDomain> on the public LB, gated by Entra OIDC
@@ -77,6 +95,9 @@ param portalExternal = false
 // ADR-0010 (anonymous shared writes) before enabling public apps.
 param allowPublicApps = false
 param allowPasswordApps = false
+// param imgSrcExtra = 'https://images.example.com'  // EDGE_IMG_SRC_EXTRA — operator-trusted image origins; never an image proxy
+// param imgSrcReportOnly = true  // existing installs: until you have read the Violations screen, set this before rolling the edge image or any full apply (see apps/docs deploy updates — tightened image policy step 0)
+// param imgSrcAllowAll = true  // one-org installs that accept the open https: image channel
 
 // Azure AI Foundry (ADR-0046) — LLM inference in this subscription instead of
 // first-party Anthropic/OpenAI. false (default) keeps the first-party vendors
@@ -99,11 +120,18 @@ param allowPasswordApps = false
 //    (+ llmAnthropicPath/llmOpenAiPath and the connection names) — see README
 //    "Azure AI Foundry".
 param deployFoundry = false
+// param deployNetprobe = true              // scheduled egress-subnet network probe job + log alerts; requires deployApps
+// param netprobeAllowedHost = 'mcr.microsoft.com'  // must stay on the egress platform firewall list
+// param netprobeCanaryHost = 'example.net' // public host not on any allow-list (firewall allow-list check)
+// param pinPrivateEndpointAddresses = true  // new installs: static snet-pe IPs for egress NSG rules; existing installs leave false until live addresses are listed
+// param privateEndpointAddresses = { kvConnections: '10.0.7.20' }  // optional overrides when pinning; defaults are .4-.7 of snet-pe
 // param foundryAccountName = ''            // default ${namePrefix}-foundry; must be globally unique
 // param foundryResourceGroupName = ''      // default ${namePrefix}-foundry-rg — the account's OWN group: the split that keeps LLM spend out of the platform budget (README "Azure AI Foundry")
 // param foundryLocation = 'eastus2'
 // param foundryAttestation = { organizationName: 'Contoso', countryCode: 'US', industry: 'technology' }
 // param llmMonthlyBudgetUsd = 1000         // notify-only LLM budget on the Foundry group; 0 = none. Default matches platformMonthlyUsdCap so the Azure mail and the portal watch line agree
+// param llmPlatformDollarsPerDay = -1      // enforced daily LLM ceiling on the edge (-1 = one tenth of platformMonthlyUsdCap; 0 = off)
+// param llmDefaultDollarsPerDay = 50      // enforced daily cap for apps with no manifest dollarsPerDay (EDGE_LLM_DEFAULT_DOLLARS_PER_DAY); 0 = unset is unlimited
 
 // Servable-model policy (ADR-0047) — what the portal catalogue / rendered
 // skill / model picker ADVERTISE. Empty allowlist = the seeded-secret

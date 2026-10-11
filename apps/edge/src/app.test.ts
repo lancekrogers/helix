@@ -12,6 +12,7 @@ const PREFIX = `apps/${APP_ID}/1/`;
 function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     databaseUrl: "postgresql://unused",
     blob: {
       provider: "azure",
@@ -27,6 +28,7 @@ function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
     allowUnauthenticated: true,
     allowPublicApps: true,
     allowPasswordApps: true,
+    legacyAppRedirect: false,
     publicScheme: "https",
     publicPort: 8080,
     tls: null,
@@ -42,14 +44,24 @@ function testConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
         path: "/v1/chat/completions",
         connection: "openai",
       },
+      defaultDollarsPerDay: 50,
+      platformDollarsPerDay: 0,
+      maxAppInFlight: 0,
+      maxUserInFlight: 0,
+      maxInFlight: 0,
+      maxCallMs: 600_000,
     },
     anonRateLimit: { max: 0, windowMs: 60_000 },
+    imgSrcExtra: [],
+    imgSrcReportOnly: false,
+    imgSrcAllowAll: false,
     trustProxy: false,
     fetch: {
       egressUrl: null,
       instructionSecret: null,
       timeoutMs: 30_000,
       maxBodyBytes: 10 * 1024 * 1024,
+      maxAppInFlight: 0,
     },
     internalSecret: null,
     portalUrl: null,
@@ -199,6 +211,25 @@ describe("the trust-proxy /health sub-check", () => {
   });
 });
 
+function expectEnforcedTightCsp(headers: { [key: string]: unknown }) {
+  const enforced = headers["content-security-policy"] as string;
+  expect(enforced).toBeDefined();
+  expect(enforced).toContain("img-src 'self' data: blob:");
+  expect(enforced).toContain("object-src 'none'");
+  expect(headers["content-security-policy-report-only"]).toBeUndefined();
+}
+
+function expectAppCspPair(headers: { [key: string]: unknown }) {
+  const enforced = headers["content-security-policy"] as string;
+  const reportOnly = headers["content-security-policy-report-only"] as string;
+  expect(enforced).toBeDefined();
+  expect(reportOnly).toBeDefined();
+  expect(enforced).toContain("img-src https:");
+  expect(enforced).not.toContain("object-src");
+  expect(reportOnly).toContain("object-src 'none'");
+  expect(reportOnly).toContain("img-src 'self' data: blob:");
+}
+
 describe("app hosts: asset serving", () => {
   it("serves an asset with forwarded headers and nosniff", async () => {
     const res = await edge.app.inject({ url: "/assets/app.js", headers: HOST });
@@ -211,6 +242,7 @@ describe("app hosts: asset serving", () => {
     expect(res.headers["cache-control"]).toBe("private, max-age=300");
     // …and still CSP'd — every app response carries the policy, because any
     // browser-active document type (SVG, XML) can execute script.
+    expectEnforcedTightCsp(res.headers);
     expect(res.headers["content-security-policy"]).toContain("connect-src 'self'");
   });
 
@@ -222,6 +254,7 @@ describe("app hosts: asset serving", () => {
     expect(csp).toContain("connect-src 'self'");
     expect(csp).toContain("form-action 'self'");
     expect(csp).toContain("frame-ancestors 'none'");
+    expectEnforcedTightCsp(res.headers);
   });
 
   it("refuses service-worker registration fetches (Service-Worker header)", async () => {
@@ -239,6 +272,7 @@ describe("app hosts: asset serving", () => {
     const res = await edge.app.inject({ url: "/", headers: HOST });
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain("demo");
+    expectEnforcedTightCsp(res.headers);
     expect(res.headers["content-security-policy"]).toContain("connect-src 'self'");
     expect(res.headers["cache-control"]).toBe("no-cache");
   });
@@ -258,6 +292,7 @@ describe("app hosts: asset serving", () => {
     expect(res.statusCode).toBe(304);
     expect(res.headers.etag).toBe('"js-1"');
     expect(res.body).toBe("");
+    expectEnforcedTightCsp(res.headers);
   });
 
   it("falls back to index.html for HTML-accepting misses (SPA deep links)", async () => {
@@ -267,7 +302,78 @@ describe("app hosts: asset serving", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain("demo");
-    expect(res.headers["content-security-policy"]).toBeDefined();
+    expectEnforcedTightCsp(res.headers);
+  });
+
+  it("widens enforced img-src with EDGE_IMG_SRC_EXTRA", async () => {
+    const local = buildTestEdge({ config: { imgSrcExtra: ["https://images.example"] } });
+    local.blob.set(`${PREFIX}index.html`, {
+      body: "<!doctype html><body>extra</body>",
+      contentType: "text/html; charset=utf-8",
+    });
+    await local.app.ready();
+    const res = await local.app.inject({ url: "/", headers: HOST });
+    const enforced = res.headers["content-security-policy"] as string;
+    expect(enforced).toContain("https://images.example");
+    const connect = enforced.split("; ").find((d) => d.startsWith("connect-src"));
+    expect(connect).not.toContain("images.example");
+    await local.app.close();
+  });
+
+  it("sends the open enforced policy and the tight Report-Only policy when imgSrcReportOnly is true", async () => {
+    const local = buildTestEdge({
+      config: { imgSrcReportOnly: true, imgSrcExtra: ["https://images.example"] },
+    });
+    local.blob.set(`${PREFIX}index.html`, {
+      body: "<!doctype html><body>measure</body>",
+      contentType: "text/html; charset=utf-8",
+    });
+    await local.app.ready();
+    const res = await local.app.inject({ url: "/", headers: HOST });
+    expectAppCspPair(res.headers);
+    const enforced = res.headers["content-security-policy"] as string;
+    const reportOnly = res.headers["content-security-policy-report-only"] as string;
+    expect(reportOnly).toContain("https://images.example");
+    expect(enforced).not.toContain("images.example");
+    await local.app.close();
+  });
+
+  it("restores open img-src when imgSrcAllowAll is true", async () => {
+    const local = buildTestEdge({ config: { imgSrcAllowAll: true } });
+    local.blob.set(`${PREFIX}index.html`, {
+      body: "<!doctype html><body>open</body>",
+      contentType: "text/html; charset=utf-8",
+    });
+    await local.app.ready();
+    const res = await local.app.inject({ url: "/", headers: HOST });
+    const enforced = res.headers["content-security-policy"] as string;
+    expect(enforced).toContain("img-src https:");
+    expect(enforced).toContain("object-src 'none'");
+    expect(res.headers["content-security-policy-report-only"]).toBeUndefined();
+    await local.app.close();
+  });
+
+  it("injects HTML with the enforced CSP when fetch.shim is enabled", async () => {
+    const shimApp = buildTestEdge({
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "demo",
+          blobPrefix: PREFIX,
+          fetch: { connections: new Map(), requestsPerDay: 0, shim: true },
+        }),
+      ]),
+    });
+    shimApp.blob.set(`${PREFIX}index.html`, {
+      body: "<!doctype html><html><head></head><body>shim</body></html>",
+      contentType: "text/html; charset=utf-8",
+    });
+    await shimApp.app.ready();
+    const res = await shimApp.app.inject({ url: "/", headers: HOST });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("helix/fetch-shim.js");
+    expectEnforcedTightCsp(res.headers);
+    await shimApp.app.close();
   });
 
   it("hard-404s non-HTML misses", async () => {

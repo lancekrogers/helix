@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { FETCH_ERROR_CODES, FetchErrorCodeSchema, FetchProxyErrorSchema } from "./fetch.js";
+import {
+  FETCH_ERROR_CODES,
+  FetchErrorCodeSchema,
+  FetchProxyErrorSchema,
+  RESPONSE_HEADER_BLOCKLIST,
+} from "./fetch.js";
 
 /** The pre-delegation vocabulary, in order — the widening may not disturb it. */
 const LEGACY_CODES = [
@@ -10,6 +15,7 @@ const LEGACY_CODES = [
   "too_large",
   "replay",
   "upstream_error",
+  "upstream_timeout",
 ] as const;
 
 const DELEGATED_CODES = [
@@ -17,6 +23,65 @@ const DELEGATED_CODES = [
   "provider_unavailable",
   "provider_misconfigured",
 ] as const;
+
+const POLICY_RESPONSE_HEADERS = [
+  "clear-site-data",
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "refresh",
+  "report-to",
+  "reporting-endpoints",
+  "nel",
+  "service-worker-allowed",
+  "alt-svc",
+] as const;
+
+describe("RESPONSE_HEADER_BLOCKLIST", () => {
+  it("pins the full list, in order", () => {
+    expect(RESPONSE_HEADER_BLOCKLIST).toEqual([
+      "set-cookie",
+      "set-cookie2",
+      "authorization",
+      "location",
+      "transfer-encoding",
+      "connection",
+      "keep-alive",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "trailer",
+      "upgrade",
+      ...POLICY_RESPONSE_HEADERS,
+    ]);
+  });
+
+  it("is entirely lowercase and has no duplicates", () => {
+    const set = new Set(RESPONSE_HEADER_BLOCKLIST);
+    expect(set.size).toBe(RESPONSE_HEADER_BLOCKLIST.length);
+    for (const name of RESPONSE_HEADER_BLOCKLIST) {
+      expect(name).toBe(name.toLowerCase());
+    }
+  });
+
+  it.each(POLICY_RESPONSE_HEADERS)("is in the list: %s", (name) => {
+    expect(RESPONSE_HEADER_BLOCKLIST).toContain(name);
+  });
+
+  it("leaves the headers apps rely on alone", () => {
+    const blocklist = new Set(RESPONSE_HEADER_BLOCKLIST);
+    for (const name of [
+      "etag",
+      "content-type",
+      "cache-control",
+      "retry-after",
+      "link",
+      "www-authenticate",
+      "x-ratelimit-remaining",
+      "x-ratelimit-reset",
+    ]) {
+      expect(blocklist.has(name)).toBe(false);
+    }
+  });
+});
 
 describe("FETCH_ERROR_CODES", () => {
   it("keeps every legacy code, in order, and widens by exactly the three delegated codes", () => {

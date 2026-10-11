@@ -5,6 +5,9 @@
 // portal.azx.helix.azxlabs.io. The wildcard + auth + portal records point at the apps
 // environment's public static IP (the edge takes external ingress there).
 //
+// A domain split uses two zones: the control zone (auth, portal, dev-api, asuid; wildcard
+// only while legacy redirect is on) and a hosted-apps zone (* and asuid only).
+//
 // TLS: the wildcard cert (*.azx.helix.azxlabs.io) and the ACA custom-domain bindings are
 // handled separately — issuance/renewal is the portal's ACME DNS-01 job
 // (deferred, M5 tail). `domainVerificationId`, when supplied, writes the asuid
@@ -28,12 +31,18 @@ param domainVerificationId string = ''
 @description('Add the dev-gateway host (dev-api) record. Off unless the opt-in surface is deployed.')
 param deployDevGateway bool = false
 
+@description('Add the control-plane records (auth, portal, dev-api). False for a hosted-apps zone, which holds only the wildcard and the verification record.')
+param hostsControlPlane bool = true
+
+@description('Add the wildcard record. False for a control zone once the legacy app redirect is off: auth, portal and dev-api have their own records.')
+param hostsWildcard bool = true
+
 resource zone 'Microsoft.Network/dnsZones@2018-05-01' = {
   name: appsDomain
   location: 'global'
 }
 
-resource wildcardRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = {
+resource wildcardRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = if (hostsWildcard) {
   parent: zone
   name: '*'
   properties: {
@@ -44,7 +53,7 @@ resource wildcardRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = {
   }
 }
 
-resource authRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = {
+resource authRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = if (hostsControlPlane) {
   parent: zone
   name: 'auth'
   properties: {
@@ -55,7 +64,7 @@ resource authRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = {
   }
 }
 
-resource portalRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = {
+resource portalRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = if (hostsControlPlane) {
   parent: zone
   name: 'portal'
   properties: {
@@ -70,7 +79,7 @@ resource portalRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = {
 // the control-plane base of this deployment, never an app subdomain, and shares
 // the apps env static IP (the dev-gateway takes external ingress there like the
 // edge). A CORS surface, so it is deliberately its own host.
-resource devApiRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = if (deployDevGateway) {
+resource devApiRecord 'Microsoft.Network/dnsZones/A@2018-05-01' = if (deployDevGateway && hostsControlPlane) {
   parent: zone
   name: 'dev-api'
   properties: {

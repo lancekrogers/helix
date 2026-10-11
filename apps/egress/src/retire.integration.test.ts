@@ -468,7 +468,7 @@ describe("CredentialRetirementSweep (helix_egress)", () => {
         },
         credentialStore: inner,
         delegatedStore: delegated,
-        dispatcher: makePinnedDispatcher(true, 1_000),
+        dispatcher: makePinnedDispatcher(true, 1_000, []),
         timeoutMs: 1_000,
         allowInsecureConnection: true,
       });

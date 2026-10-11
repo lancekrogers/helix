@@ -23,7 +23,7 @@ Inject a per-app CSP that permits `'unsafe-inline'`, `'unsafe-eval'`, `'wasm-uns
 
 ## Open question
 
-Consider SRI or versioned-script pinning for the CDN allowlist; add `object-src 'none'` (currently falls back to `default-src`). Decide whether the CDN list should be per-app/opt-in rather than global.
+Consider SRI or versioned-script pinning for the CDN allowlist. Decide whether the CDN list should be per-app/opt-in rather than global.
 
 ## Review notes (2026-06-25)
 
@@ -31,4 +31,20 @@ The relaxed stance is sound given the threat model; the un-hardened CDN allowlis
 
 ## Challenge outcome (2026-06-26)
 
-WEAKEN — the "app author is already hostile" reasoning misses a **different attacker**: anonymous third-party content written via shared-writes (ADR-0010, `putShared` runs for anonymous callers) is rendered by the app, so relaxed CSP voids real **stored-XSS protection for end users** on public / shared-write apps (tolerable only on SSO-gated apps). `connect-src` is locked but `img-src https:` / navigation remain exfil channels. Add `object-src 'none'` (marginal — already inherits `default-src 'self'`), and — more importantly — record the third-party-XSS exposure on public shared-write apps in the threat model.
+WEAKEN — the "app author is already hostile" reasoning misses a **different attacker**: anonymous third-party content written via shared-writes (ADR-0010, `putShared` runs for anonymous callers) is rendered by the app, so relaxed CSP voids real **stored-XSS protection for end users** on public / shared-write apps (tolerable only on SSO-gated apps). `connect-src` is locked but navigation and other residual channels remain exfil paths. Record the third-party-XSS exposure on public shared-write apps in the threat model.
+
+## Amendment (2026-10-10) — img-src tightened, object-src closed
+
+Enforced `img-src` is `'self' data: blob:` plus each app's approved `externalOrigins` plus
+operator `EDGE_IMG_SRC_EXTRA`. `object-src 'none'` is added on the enforced header. Per-install
+relaxations: `EDGE_IMG_SRC_ALLOW_ALL` restores `img-src https: data: blob:` (with `object-src 'none'`
+unchanged); `EDGE_IMG_SRC_REPORT_ONLY` keeps the measurement window (the previous open policy enforced, the tightened one as Report-Only) until
+the operator removes it. The CDN `script-src` allowlist is unchanged — narrowing it is a separate
+decision. Residual channels: top-level navigation, popups/`window.open`, approved origins, request
+URLs to permitted CDN hosts (Hypothesis), WebRTC, and DNS prefetch/preconnect hints (WebRTC and
+DNS-hint behavior under this policy is untested). The
+warning never to add a hash or nonce to `script-src` still holds.
+
+Proxied `/_api/fetch/*` responses carry `content-security-policy: default-src 'none'` on the edge,
+refuse worker and service-worker loads, and strip `Service-Worker-Allowed` from upstream headers so
+only the platform offline worker route may emit that header.

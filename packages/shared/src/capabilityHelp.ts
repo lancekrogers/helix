@@ -61,12 +61,14 @@ const ENTRIES: Record<string, CapabilityHelp> = {
   externalOrigins: {
     title: "Direct browser calls",
     grants:
-      "Allows the app's own JavaScript — running in each visitor's browser — to call the named host directly, by widening the page's Content-Security-Policy.",
+      "Allows the app's own JavaScript, running in each visitor's browser, to call the named host directly and to load images from it, by widening the page's Content-Security-Policy.",
     risks: [
       "Requests leave the visitor's browser, so any credential the app attaches is visible to the page and to the destination host.",
       "The destination host sees your colleagues' IPs and browsers, not the platform's.",
+      "An approved host can receive anything the page can read, one request at a time, including through image URLs.",
     ],
-    riskWhy: "A new browser-callable host is also a new place the page can send data.",
+    riskWhy:
+      "A new browser-callable host is also a new place the page can send data, as a request or as an image.",
   },
 
   "llm.models": {
@@ -82,10 +84,13 @@ const ENTRIES: Record<string, CapabilityHelp> = {
   "llm.dollarsPerDay": {
     title: "LLM spend budget",
     grants:
-      "Caps the app's daily LLM spend at the requested amount. Removing the cap means unlimited.",
-    risks: ["The cap is a ceiling, not a prediction — a runaway loop can burn up to it every day."],
+      "Caps the app's daily LLM spend at the requested amount. Removing the cap falls back to the install default (often $50/day, unless the operator changed it).",
+    risks: [
+      "The cap is a ceiling, not a prediction — a runaway loop can burn up to it every day.",
+      "Without a cap, spend is bounded only by that install default — which may be higher than $50/day or unlimited on some deployments.",
+    ],
     riskWhy:
-      "Spend above the $50/day baseline is a human accepting a larger worst-case daily bill.",
+      "Removing a cap can raise the worst-case daily bill above what was approved; spend above the $50/day baseline also needs a human look.",
   },
 
   "data.user": {

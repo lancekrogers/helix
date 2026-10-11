@@ -12,16 +12,64 @@ Container Apps. This is the `infra/` referenced in the project plan (§2) and th
 
 ## What it provisions
 
-| Layer    | Resources                                                                                                                                            |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Network  | VNet, 5 subnets, Azure Firewall + policy, 2 route tables (forced tunnel), private DNS zones                                                          |
-| Data     | Postgres Flexible Server (private), Storage (blob, private)                                                                                          |
-| Secrets  | `kv-platform` (infra config) + `kv-connections` (app connection secrets) + `kv-delegated` (user-delegated token material, egress-only) — all private |
-| Identity | 4 user-assigned managed identities + the least-privilege RBAC matrix (the 4th, dev-gateway, is idle unless `deployDevGateway`)                       |
-| Compute  | 2 ACA environments (`apps`, `egress`) + edge / portal / egress container apps, plus the opt-in dev-gateway (`deployDevGateway`)                      |
-| DNS      | public zone for the apps domain (`*`, `auth`, `portal`; `dev-api` when `deployDevGateway`)                                                           |
+| Layer    | Resources                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Network  | VNet, 5 subnets, Azure Firewall + policy, 2 route tables (forced tunnel), private DNS zones. The four private endpoints in `snet-pe` (three Key Vaults and Blob) keep **dynamic** addresses by default (`pinPrivateEndpointAddresses=false`, unchanged for existing installs). **New installs** should set `pinPrivateEndpointAddresses=true` so defaults `.4`–`.7` of that subnet (overridable via `privateEndpointAddresses`) let an egress NSG allow kv-connections, kv-delegated, and **kv-platform** (egress Key Vault references) by destination IP while denying Blob. When pinning is off, NSG rules fall back to the whole `snet-pe` prefix (`privateEndpointSubnetPrefix` output) |
+| Data     | Postgres Flexible Server (private), Storage (blob, private)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Secrets  | `kv-platform` (infra config) + `kv-connections` (app connection secrets) + `kv-delegated` (user-delegated token material, egress-only) — all private                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Identity | 4 user-assigned managed identities + the least-privilege RBAC matrix (the 4th, dev-gateway, is idle unless `deployDevGateway`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Compute  | 2 ACA environments (`apps`, `egress`) + edge / portal / egress container apps, plus the opt-in dev-gateway (`deployDevGateway`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| DNS      | public zone for the apps domain (`*`, `auth`, `portal`; `dev-api` when `deployDevGateway`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+
+Every install gets a network security group on `snet-egress` (`egressNsgEnforce`, default
+`deny-list-only`; set `enforce` on a new install, or on an existing one after `just infra net-verify`
+passes) loaded from `nsg-egress-rules.json`. The Azure Firewall remains the optional,
+costly tier (`deployFirewall`) for FQDN allow-listing on internet-bound traffic; the NSG
+works with the firewall off, which is the posture of the live installs.
+
+**Network probe.** When `deployNetprobe` is true (default), a scheduled Container Apps
+Job (`<prefix>-netprobe`) in the **egress** environment runs the egress image with
+`pnpm --filter @azx-pbc/egress probe`. It dials forbidden and required destinations
+from `snet-egress` and logs one JSON line per check plus an `egress.netprobe_result`
+summary to the egress Log Analytics workspace. Read the template's declared posture
+from the `netControls` deployment output (firewall, FQDN mode, NSG mode, allow-list,
+pinned private-endpoint addresses when enabled, probe expectations) next to the last
+probe result — `just infra net-verify` starts the job on demand and prints the
+outcome. **`ok: true` alone does not prove NSG deny rows** unless `denyProven` is
+true (pinned private-endpoint addresses so `blob-pe-443` is scored); the default
+unpinned install exits net-verify with code 3. **The probe tests outbound paths only**;
+a green result does not prove edge→egress inbound — run the check below after apply.
+Wire-server (`168.63.129.16`)
+and IMDS checks are informational only; there is no NSG deny on `168.63.129.16`
+(Microsoft says not to deny it on a Container Apps subnet), and `ssrf.ts` is the
+control for proxied traffic. Alerts in
+`alerts-netprobe.bicep` fire on a failed run or on missing recent success; whether
+the KQL matches real job console logs is unverified in Azure until an operator runs
+the job.
+
+### Verifying the network controls
+
+- **`just infra net-sim`** — on a host with Docker (not the dev container), applies
+  `nsg-egress-rules.json` as iptables rules on a probe container attached to
+  stand-in subnets and runs the same `netprobe` entry point as the Azure job.
+  `just infra net-sim --static` runs only the translator tests (`node --test
+infra/netsim/translate.test.mjs`, which also runs in the dev container). The simulation proves rule ordering and first-match logic, not
+  Azure NSG semantics, subnet attachment, or real platform-address behavior
+  (**unverified in Azure**).
+- **`just infra net-verify`** — operator step against a deployed install: starts
+  `<prefix>-netprobe`, waits for the execution, prints probe lines, exits 1 when
+  `ok` is false, 3 when the NSG is on but `denyProven` is false (unpinned PE
+  addresses). Warns when `enforce` is on but `closingDenyProven` is false — set
+  `netprobeClosingDenyTarget` with the firewall off to prove the closing deny.
+  **Unverified in Azure** by the recipe itself until an operator runs it.
 
 ### The security shape, in one diagram
+
+With `deployFirewall=true`, forced tunneling sends both app subnets through the
+firewall; with the firewall off, edge and portal use default internet egress
+while every install still gets the `snet-egress` NSG and the application SSRF
+filter. Posture for a given install is the `netControls` output plus the last
+`egress.netprobe_result`, not this diagram alone.
 
 ```
                  Internet
@@ -37,9 +85,12 @@ Container Apps. This is the `infra/` referenced in the project plan (§2) and th
        (app images pulled from public GHCR, not a private registry)
 ```
 
-- **edge** can be reached from the internet (public ingress) but **cannot reach
-  it** — its subnet's default route goes to the firewall, which denies.
-- **egress** is the only subnet the firewall lets out. It has no public ingress.
+- **edge** can be reached from the internet (public ingress). With the firewall
+  on, its subnet's default route goes to the firewall, which denies general
+  internet egress; with the firewall off, outbound internet is allowed by Azure's
+  default route.
+- **egress** is the only subnet the firewall lets out when the firewall is on. It
+  has no public ingress. The NSG on `snet-egress` applies either way.
 - **portal** is internal ingress only — not routable from app subdomains.
 - All data services are private-endpoint only; `publicNetworkAccess` is off.
 - The **edge identity has no role on `kv-connections`** — an edge RCE cannot read
@@ -60,44 +111,75 @@ Container Apps. This is the `infra/` referenced in the project plan (§2) and th
 
 ## Optional: the egress firewall (`deployFirewall`)
 
-The Azure Firewall (Standard tier) is the enforcement point for the egress-only
-network zone: it forces both app subnets' `0.0.0.0/0` through itself, **allows
-only `snet-egress` out** (to any FQDN) plus a narrow platform allow-list, and
-**denies the apps subnet** (edge/portal) by default. Per
-[ADR-0005](../../docs/adr/0005-ssrf-egress-controls.md) this network-zone
-allow-list is the **primary** SSRF/egress control; the egress app's own
-`ssrf.ts` IP validation + header filtering is explicitly _defense-in-depth_
-behind it (ADR [0001](../../docs/adr/0001-three-runtime-split.md),
-[0013](../../docs/adr/0013-egress-trust-model.md)).
+The Azure Firewall (Standard tier) is the stronger optional tier for the
+egress-only network zone when `deployFirewall=true`: it forces both app subnets'
+`0.0.0.0/0` through itself, applies a narrow **platform** allow-list per
+subnet (`aca-platform` in `modules/firewall.bicep`), and controls **egress
+internet** destinations with `egressFqdnMode`:
+
+| `egressFqdnMode`                                         | Egress subnet internet rule                                                                              | When to use                                                                      |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `any` (Bicep default)                                    | `targetFqdns: ['*']` on ports 80 and 443                                                                 | Existing firewall installs on template upgrade — behavior unchanged              |
+| `allowlist` (commented in reference `.bicepparam` files) | Named product FQDNs (`egressAllowedFqdnsEffective` output: LLM vendors + `egressAllowedFqdns`) on 80/443 | New firewall installs after `just infra egress-hosts` shows the list is complete |
+
+The apps subnet stays **deny-by-default** for general internet; only its
+platform list is allowed. Baseline for every install remains `ssrf.ts` plus the
+`snet-egress` NSG (`egressNsgEnforce`). See
+[ADR-0005](../../docs/adr/0005-ssrf-egress-controls.md).
+
+Threat intelligence defaults to `Deny` (`threatIntelMode`); set `Alert` to log
+without blocking if a vendor is false-positive-blocked. Firewall application-rule,
+network-rule, and threat-intelligence logs ship to the apps environment Log
+Analytics workspace via `modules/firewall-diagnostics.bicep`; an infra alert
+fires on application-rule **denials** sourced from `snet-egress` (table/column
+names are **unverified in Azure** until an operator confirms a row).
+
+The list is **not** generated from portal approvals (static Bicep +
+`egressAllowedFqdns`). When an admin approves a new fetch origin or a connection
+provider host changes, egress stays blocked until the operator adds the host and
+re-applies:
+
+1. Run `just infra egress-hosts -- --deployed-file <effective-list.json>` (or
+   `--deployed host1,host2`) where the deployed list matches
+   `egressAllowedFqdnsEffective` / your parameter file.
+2. Add every **MISSING** host to `egressAllowedFqdns` in your `.bicepparam`.
+3. Re-deploy the template.
+
+Postgres is private-endpoint-only, so the drift command cannot run from a
+laptop against production data. **Unverified in Azure:** run it inside the
+portal container replica (the image ships `pnpm` and `tsx`):
+
+```bash
+az containerapp exec -n <prefix>-portal -g <resource-group> \
+  --command "pnpm --filter @azx-pbc/portal egress:hosts -- --deployed-file -" \
+  <<< '["api.anthropic.com","api.openai.com"]'
+```
+
+Adjust the JSON array to your deployed allow-list. Do not paste connection
+secrets or database URLs into the command line.
+
+Operator rollout order, compatibility breaks, and the accepted-risk pointer live
+in [`docs/features/network-controls.md`](../../docs/features/network-controls.md).
 
 The Standard firewall deployment charge is approximately $900/month before data
-processing, as estimated for this deployment. It applies even when idle.
-`deployFirewall` defaults to true; operators can disable it with the security
+processing. `deployFirewall` defaults to true; operators can disable it with the
 trade-offs below.
 
 **What you lose when `deployFirewall=false`:**
 
-- The firewall and its forced-tunnel routes are not created; both app subnets get
-  **default internet egress**. A compromised **edge can now reach the internet**
-  directly, and the primary egress control is gone — only the egress app-level
-  denylist (defense-in-depth, a validation surface that must be kept current)
-  remains, and it only governs traffic that actually goes _through_ egress.
-- The isolation guarantee in the diagram above no longer holds; the
-  isolation-verification checks below invert (edge outbound **succeeds**).
+- No firewall or forced-tunnel routes; both app subnets get **default internet
+  egress**. A compromised **edge** can reach the internet directly. The egress
+  NSG and `ssrf.ts` still govern egress-plane traffic only.
+- Isolation-verification checks below invert (edge outbound **succeeds**).
 
-**What you keep either way:** all data services stay private — Postgres, Blob,
-and both Key Vaults remain private-endpoint-only (`publicNetworkAccess` disabled)
-regardless of this flag. Turning the firewall off does **not** expose them.
+**What you keep either way:** Postgres, Blob, and Key Vaults stay on private
+endpoints.
 
-**When off is acceptable:** dev, smoketest/integration scaffolding, or a trusted
-single-tenant install where you accept the app-level denylist as the outbound
-control. **When it is not:** production, or any install hosting untrusted /
-multi-tenant apps — keep the firewall (or your own equivalent network egress
-control). Cheaper options if you want _some_ always-on control: Azure Firewall
-**Basic** (~$290/mo, same FQDN model) or — losing FQDN filtering — NAT Gateway +
-NSGs. An NSG-only substitute cannot replicate the apps-subnet
-posture because the platform image pulls (GHCR/MCR) require **FQDN** rules NSGs
-can't express, which is why a firewall was chosen in the first place. For a
+**When off is acceptable:** dev, smoketest, or trusted single-tenant installs.
+**When it is not:** production or untrusted multi-tenant hosting. Cheaper
+options: Azure Firewall **Basic** (~$290/mo, same FQDN model) or NAT Gateway +
+NSGs (no FQDN filtering). NSGs alone cannot express GHCR/MCR image pulls on the
+apps subnet. For a
 temporary install, `az network firewall deallocate` also stops the hourly charge
 between test sessions without losing config.
 
@@ -266,11 +348,17 @@ Two scope notes:
   [microsoft/azure-container-apps#1804](https://github.com/microsoft/azure-container-apps/issues/1804)),
   so the migrate job keeps its runtime read of `postgres-admin-password` with its
   own managed identity. Do not move it to references until that bug closes.
-- On an environment whose egress is UDR'd through the firewall
-  (`deployFirewall=true`), reference resolution needs the `AzureKeyVault`
-  service tag and `login.microsoft.com` on the allow list (managed-identity
-  token issuance needs the Entra endpoint generally). Neither install runs the
-  firewall today; add these before it comes back.
+- On an environment whose traffic is UDR'd through the firewall
+  (`deployFirewall=true`), the template now carries per-subnet platform FQDN
+  rules plus a network rule for the `AzureKeyVault` service tag (Key Vault
+  reference resolution) and `login.microsoft.com` (managed-identity token
+  issuance). The apps subnet list also includes `graph.microsoft.com` (portal
+  directory client, `packages/directory/src/entra.ts`), `management.azure.com`
+  and the ACME directory host from `acmeServer` (certbot,
+  `apps/certbot/issue-and-bind.sh`), and `login.microsoftonline.com` for Entra
+  OIDC. **Unverified in Azure:** whether service tags work in firewall network
+  rules, and whether every host is sufficient at runtime. Neither live install
+  runs the firewall today; validate on a scratch deploy before turning it on.
 
 `kv-platform` is written at deploy (ARM management-plane, bypasses the firewall)
 and is the canonical store. **Connection** secrets are different: they stay in
@@ -369,7 +457,37 @@ silent-wipe one).
 **The canary for the gate's state:** a what-if on a gated install must never show
 `Delete properties.configuration.ingress.customDomains`. If it does, **the gate is
 off — stop, do not apply.** (On a gated install the declarative set matches the
-live bindings, so that Delete line is impossible unless the flag is wrong.)
+live bindings, so that Delete line is impossible unless the flag is wrong.) With
+`hostedAppsDomain` set, the edge carries **two** wildcard bindings — run the same
+check for both; **unverified in Azure** that two wildcard custom domains on
+different certificates bind on one Container App.
+
+### Two domains (`hostedAppsDomain`)
+
+When `hostedAppsDomain` is non-empty, `appsDomain` is the **control** domain (`auth.`,
+`portal.`, `dev-api.`) and apps live at `<slug>.<hostedAppsDomain>`. The template instantiates
+`dns.bicep` and `certbot.bicep` twice:
+
+- **Control zone** — wildcard `*` (while `legacyAppRedirect` is on), `auth`, `portal`, `dev-api`,
+  `asuid`. Cert name `wildcard-<control with dashes>`. Job `<namePrefix>-certbot`. Gate
+  `wildcardTlsBound`.
+- **Apps zone** — wildcard `*` and `asuid` only. Cert name `wildcard-<hostedAppsDomain with
+dashes>`. Job `<namePrefix>-ap-certbot` (half-hour cron offset from the control job). Gate
+  `hostedAppsTlsBound`. Portal and dev-gateway bindings stay on the control cert.
+
+**New install** order: deploy with both gates false → run control certbot → flip `wildcardTlsBound`
+→ run apps certbot → flip `hostedAppsTlsBound`. Each cert name is computed once in `main.bicep` and
+passed to its job and its declarative edge binding (ADR-0044 per cert). On an **existing** install,
+`wildcardTlsBound` is already true — do not set it false (that strips `auth.` TLS on the next apply);
+follow [Deploying updates](../../apps/docs/src/deploy/updates.md#upgrading-to-hosted-app-containment) for the staged
+`hostedAppsLive` cutover instead. **Unverified in Azure** for the full two-binding path.
+
+| Parameter        | Default | Role                                                                                                                                                                                                     |
+| ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hostedAppsLive` | `false` | With `hostedAppsDomain` set: `false` = provision zone, second certbot job, and apps TLS binding only; `true` = move app URLs and emit split edge/portal/dev-gateway env. Default fails toward no cutover |
+
+Deployment output `hostedDnsNameServers` lists the apps zone name servers when `hostedAppsDomain` is
+set (control zone: `dnsNameServers`).
 
 ## Container shutdown (graceful drain)
 
@@ -428,11 +546,12 @@ know this install's domain at build time — there are deliberately no `VITE_*`
 build args. It reads the topology at runtime from the public
 `GET /api/v1/config`, which the template feeds via three portal env vars:
 
-| Env var                    | Set from                                                                 | Absent means                                           |
-| -------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------ |
-| `APP_PUBLIC_BASE`          | `https://<appsDomain>`                                                   | **Boot failure** — the portal refuses to start in prod |
-| `DEV_API_PUBLIC_BASE`      | `https://dev-api.<appsDomain>`, or `''` when `deployDevGateway` is false | The SPA says dev mode isn't enabled on this deployment |
-| `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` (default `1000`)                                 | No spend watch line on the admin Activity page         |
+| Env var                    | Set from                                                                 | Absent means                                                                                                                               |
+| -------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `APP_PUBLIC_BASE`          | `https://<hostedAppsDomain>` when set, else `https://<appsDomain>`       | **Boot failure** — the portal refuses to start in prod                                                                                     |
+| `CONTROL_PUBLIC_BASE`      | `https://<appsDomain>` when `hostedAppsDomain` is set                    | Absent in single-domain layout. When split: **boot failure** if invalid; vendor OAuth callback fails at the vendor if only one side is set |
+| `DEV_API_PUBLIC_BASE`      | `https://dev-api.<appsDomain>`, or `''` when `deployDevGateway` is false | The SPA says dev mode isn't enabled on this deployment                                                                                     |
+| `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` (default `1000`)                                 | No spend watch line on the admin Activity page                                                                                             |
 
 `APP_PUBLIC_BASE` also drives the `url` field on every app the API returns, so a
 redeployment onto a different `appsDomain` needs no client or image change.
@@ -498,10 +617,13 @@ the param rather than by hand on a container app. The default of 25 matches the
 ```
 main.bicep            orchestrator (resourceGroup scope)
 main.bicepparam       parameters (resource names + secrets via env vars)
+nsg-egress-rules.json shared NSG rule table (Bicep + local net simulation)
 modules/
   network.bicep       VNet + subnets + delegations
+  nsg.bicep           egress subnet NSG (rules from nsg-egress-rules.json)
   routing.bicep       2 empty route tables (routes added by firewall.bicep)
   firewall.bicep      Azure Firewall + policy + default routes
+  firewall-diagnostics.bicep  firewall logs to Log Analytics + egress denial alert
   privatedns.bicep    private DNS zones + VNet links
   private-endpoint.bicep  reusable PE + DNS zone group
   storage.bicep       storage account + app-bundles container + PE
@@ -513,6 +635,9 @@ modules/
   foundry.bicep       Azure AI Foundry account + model deployments (invoked by foundry-rg.bicep)
   aca-environment.bicep   reusable managed environment (called twice)
   containerapp.bicep  reusable container app (edge/portal/egress + opt-in dev-gateway)
+  migrate-job.bicep   manual Prisma migration job (apps env)
+  netprobe-job.bicep  scheduled network posture probe (egress env)
+  alerts-netprobe.bicep  log alerts on probe failure / no recent success (egress workspace)
   dns.bicep           public DNS zone + records (incl. opt-in dev-api)
 ```
 
@@ -844,19 +969,19 @@ existed pick it up on their own; nothing needs restarting.
 
 ### 7. DNS + TLS
 
-- Delegate `azx.helix.azxlabs.io` (a subdomain of `azxlabs.io`) by adding NS
-  records for `azx.helix` in the parent `azxlabs.io` Cloudflare zone, pointing at
-  the deployment output `dnsNameServers` — not at the registrar.
-- Bind the wildcard cert (`*.azx.helix.azxlabs.io`) and ACA custom domains — the
-  `deployCertbot` job does this (see "Wildcard TLS"). Supply
-  `domainVerificationId` to write the `asuid` TXT record ACA needs.
-  A custom-domain binding is **per container app**, so the job binds each plane
-  that has its own external ingress: the edge wildcard always, plus
-  `portal.<appsDomain>` when `portalExternal` and `dev-api.<appsDomain>` when
-  `deployDevGateway`. Nothing to bind by hand.
-- **Delegation must exist before the first certbot run** — Let's Encrypt has to
-  resolve the DNS-01 TXT in the Azure zone publicly, so a cert issued before the
-  NS records propagate will fail validation.
+- Delegate the control zone (`appsDomain` in the params file — your control domain when
+  `hostedAppsDomain` is set) using output `dnsNameServers`. With a split, also delegate
+  `hostedAppsDomain` as a second zone using output `hostedDnsNameServers`; both need NS records at
+  the parent before any certbot run (**unverified in Azure** for the two-zone path).
+- Bind the wildcard cert (`*.<zone>`) and ACA custom domains — the `deployCertbot` job(s) do this
+  (see "Wildcard TLS"). Supply `domainVerificationId` to write the `asuid` TXT record ACA needs.
+  A custom-domain binding is **per container app**, so the job binds each plane that has its own
+  external ingress: the edge wildcard always, plus `portal.<controlDomain>` when `portalExternal`
+  and `dev-api.<controlDomain>` when `deployDevGateway`. A split adds a second edge wildcard on
+  `*.<hostedAppsDomain>`. Nothing to bind by hand.
+- **Delegation must exist before the first certbot run** — Let's Encrypt has to resolve the DNS-01
+  TXT in the Azure zone publicly, so a cert issued before the NS records propagate will fail
+  validation.
 
 ## Telemetry (ADR-0037)
 
@@ -961,11 +1086,12 @@ per execution; five locations every five minutes is ~43k executions/month per
 URL, which is what `availabilityTestFrequencySeconds` and
 `availabilityTestLocations` control.
 
-| Probed                                    | When                                                                      |
-| ----------------------------------------- | ------------------------------------------------------------------------- |
-| `https://auth.<appsDomain>/health`        | always                                                                    |
-| `https://portal.<appsDomain>/health`      | `portalExternal=true`                                                     |
-| whatever `availabilityExtraTargets` lists | e.g. a real hosted app, which is the only way to cover Blob asset serving |
+| Probed                                    | When                                                                                                                                    |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `https://auth.<appsDomain>/health`        | always                                                                                                                                  |
+| `https://portal.<appsDomain>/health`      | `portalExternal=true`                                                                                                                   |
+| `https://www.<hostedAppsDomain>/health`   | `hostedAppsTlsBound=true` with `hostedAppsDomain` set (`edge-health-apps`; platform JSON on a reserved label)                           |
+| whatever `availabilityExtraTargets` lists | e.g. a real hosted app, which is the only way to cover Blob asset serving — update these URLs when app hosts move to `hostedAppsDomain` |
 
 Three things about that table are load-bearing:
 
@@ -1037,7 +1163,12 @@ A monthly consumption budget on this resource group, notifying at 80% actual,
 **not** gated on `deployApps`: the expensive resources exist after phase 1, so it
 is worth having before any app is deployed. It **notifies and does not enforce** —
 Azure will not stop a resource when a budget is crossed. The real limits are the
-per-app daily token budgets.
+per-app daily LLM budgets and the **enforced platform daily ceiling** on the edge
+(`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`, Bicep `llmPlatformDollarsPerDay`, default
+`max(platformMonthlyUsdCap / 10, 3 × llmDefaultDollarsPerDay)` per day). That ceiling is not this
+Azure budget — it is spend refused at
+the gateway when the day's ledger sum crosses the install setting. Operator rollout:
+`apps/docs/src/deploy/updates.md` ("Upgrading to the LLM spend controls").
 
 **LLM spend is a separate axis and is never in this budget.** With vendor-direct
 keys it is not in Azure at all; with `deployFoundry` it bills into the Foundry
@@ -1094,6 +1225,20 @@ different number measuring a different thing, and reading it here produced a
 budget that sat _below_ expected spend whenever the firewall was on. The deploy
 echoes both `costBudgetUsd` and `expectedMonthlyUsd` so the pair can be checked
 after any deploy that flips the firewall.
+
+**Enforced LLM ceiling (separate from this budget).** `llmPlatformDollarsPerDay`
+(default `-1`) becomes `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` on the **edge only**
+(not the dev gateway). When unset (`-1`), the effective value is
+`max(one tenth of platformMonthlyUsdCap, 3 × llmDefaultDollarsPerDay)` — `150`
+with the stock `1000` / `50` defaults; when `platformMonthlyUsdCap` is `0` the
+monthly tenth is `100` before that floor. An explicit parameter value is kept
+as set. Set `0` to switch the ceiling off (one-organization installs,
+ADR-0028). The edge warns at boot (`platform_ceiling.below_app_default_multiple`)
+when the ceiling is on and below `3 × llmDefaultDollarsPerDay`. Apply the
+`platform_llm_spend_micro_usd` migration before deploying an edge image that
+enforces it. `modules/alerts.bicep` includes a rule on
+`helix.gateway.admission_denied` with `reason = platform_ceiling` (KQL unverified
+in Azure).
 
 ### Verifying it, which you must do explicitly
 
@@ -1305,36 +1450,58 @@ if a deploy misbehaves:
 
 ## Verifying the isolation (post-deploy)
 
-> Assumes `deployFirewall=true` (the default). With the firewall **off**, the
-> edge outbound check below **succeeds** instead of failing — the egress-only
-> zone is not enforced (see "Optional: the egress firewall"). The private
-> data-services checks hold regardless of the flag.
+**Start with declared posture and the probe.** After deploy, read the `netControls`
+output from the same deployment and compare it to the latest
+`egress.netprobe_result` in the egress Log Analytics workspace. On demand:
 
 ```bash
-# the images carry no curl/wget, and exec needs a TTY — probe with node over a
-# pseudo-TTY (script(1) supplies it)
+just infra net-verify <resource-group> [namePrefix]
+```
 
-# from an edge replica: outbound internet must FAIL, egress must succeed
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-edge --command \
-  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
-# expect: ERR (blocked)
+The recipe starts `<prefix>-netprobe`, waits for the job execution, and prints
+`egress.netprobe_check` / `egress.netprobe_result` lines. Read `denyProven` and
+`closingDenyProven` in the summary next to `netControls.probe.denyProvable`.
+Interpreting them against your NSG and firewall settings is **unverified in Azure**
+until you have run it on that install. Local rule-order checks (no Azure semantics):
+`just infra net-sim` on a Docker host — see "Verifying the network controls"
+above.
 
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-edge --command \
+**Edge→egress inbound** is not exercised by the probe (it dials from inside the
+egress environment). Keep this check after any full apply that changes
+`egressNsgEnforce` or the NSG rule table (`nsg-egress-rules.json`):
+
+```bash
+script -q /dev/null az containerapp exec -g <rg> -n <prefix>-edge --command \
   "node -e \"fetch(process.env.EDGE_EGRESS_URL+'/health').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
 # expect: 200
-
-# edge -> portal rides EDGE_PORTAL_URL — probe it before trusting the
-# connections surfaces, the same way
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-edge --command \
-  "node -e \"fetch(process.env.EDGE_PORTAL_URL+'/health').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
-# expect: 200
-
-# from an egress replica: outbound internet must SUCCEED
-script -q /dev/null az containerapp exec -g <rg> -n helix-prod-egress --command \
-  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
-# expect: 200
-
-# data services are private — confirm publicNetworkAccess is Disabled
-az postgres flexible-server show -g <rg> -n helix-prod-pg --query network
-az keyvault show -n helix-prod-kvc --query properties.publicNetworkAccess
 ```
+
+With `pinPrivateEndpointAddresses=true` and the NSG on, the probe expects
+`kv-platform-443` **reachable** (positive control for egress Key Vault references)
+and `blob-pe-443` **blocked**; see `docs/features/network-controls.md`.
+
+**Firewall on vs off.** With `deployFirewall=true`, an edge replica's fetch to
+`https://example.com` should fail (forced tunnel denies apps subnet internet).
+With the firewall **off**, that same fetch **succeeds** — only the egress NSG
+and application filter govern egress paths; the edge has default internet egress.
+The egress NSG still applies in both cases.
+
+```bash
+# edge outbound internet — outcome depends on deployFirewall (see above)
+script -q /dev/null az containerapp exec -g <rg> -n <prefix>-edge --command \
+  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
+
+# egress outbound internet — expect reachability when NSG mode allows (probe covers this)
+script -q /dev/null az containerapp exec -g <rg> -n <prefix>-egress --command \
+  "node -e \"fetch('https://example.com').then(r=>console.log(r.status)).catch(e=>console.log('ERR',e.cause?.code))\"" < /dev/null
+```
+
+**Data services stay private** regardless of `deployFirewall`:
+
+```bash
+az postgres flexible-server show -g <rg> -n <prefix>-pg --query network
+az keyvault show -n <prefix>-kvc --query properties.publicNetworkAccess
+```
+
+Optional: edge→portal via `EDGE_PORTAL_URL` the same way as edge→egress. Full
+rollout steps: [`docs/features/network-controls.md`](../../docs/features/network-controls.md).

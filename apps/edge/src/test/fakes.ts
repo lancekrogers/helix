@@ -160,8 +160,17 @@ export class FakeLlmProvider implements LlmProvider {
     cacheCreationInputTokens: 0,
   };
   stopReason = "end_turn";
+  /** When set, yielded before the first delta (Anthropic `message_start` shape). */
+  earlyUsage?: LlmUsage;
+  /** When set, thrown after all deltas instead of yielding `done`. */
+  errorAfterDeltas: Error | null = null;
   /** When set, stream() throws before yielding anything. */
   error: Error | null = null;
+  /**
+   * When set, blocks until the handler aborts the call, then throws this error
+   * (simulates a silent upstream past request dispatch).
+   */
+  hangUntilAbort: Error | null = null;
   /** Awaited before each delta — a hook for interleaving/observation. */
   onDelta?: (index: number) => Promise<void> | void;
   /** Set when the handler's abort signal fired while the stream was open. */
@@ -170,6 +179,15 @@ export class FakeLlmProvider implements LlmProvider {
   async *stream(req: LlmChatRequest, opts: { signal: AbortSignal }): AsyncIterable<LlmStreamEvent> {
     this.calls.push(req);
     if (this.error) throw this.error;
+    if (this.hangUntilAbort) {
+      await new Promise<void>((_resolve, reject) => {
+        if (opts.signal.aborted) {
+          reject(this.hangUntilAbort);
+          return;
+        }
+        opts.signal.addEventListener("abort", () => reject(this.hangUntilAbort!), { once: true });
+      });
+    }
     if (opts.signal.aborted) this.sawAbort = true;
     else {
       opts.signal.addEventListener(
@@ -179,6 +197,9 @@ export class FakeLlmProvider implements LlmProvider {
         },
         { once: true },
       );
+    }
+    if (this.earlyUsage) {
+      yield { type: "usage", usage: this.earlyUsage };
     }
     let index = 0;
     for (const text of this.deltas) {
@@ -192,6 +213,7 @@ export class FakeLlmProvider implements LlmProvider {
       await this.onDelta?.(index++);
       yield { type: "delta", text };
     }
+    if (this.errorAfterDeltas) throw this.errorAfterDeltas;
     yield { type: "done", stopReason: this.stopReason, usage: this.usage };
   }
 
@@ -206,6 +228,12 @@ export class FakeUsageStore implements UsageStore {
   spendTodayMicro?: number;
   /** Override to force the rolling-hour burst gate (micro-USD); else summed live. */
   spendHourMicro?: number;
+  /** Override platform-wide today spend (micro-USD); else sum of every `llm` record. */
+  platformSpendTodayMicro?: number;
+  /** Override platform-wide hour spend (micro-USD); else same default as today. */
+  platformSpendHourMicro?: number;
+  /** When set, `platformLlmSpendMicroUsd` rejects with this error. */
+  platformReadError?: Error;
 
   async llmSpendMicroUsd(): Promise<LlmSpend> {
     const summed = this.records
@@ -214,6 +242,17 @@ export class FakeUsageStore implements UsageStore {
     return {
       todayMicro: this.spendTodayMicro ?? summed,
       hourMicro: this.spendHourMicro ?? summed,
+    };
+  }
+
+  async platformLlmSpendMicroUsd(env: Env): Promise<LlmSpend> {
+    if (this.platformReadError) throw this.platformReadError;
+    const summed = this.records
+      .filter((r) => r.capability === "llm" && r.env === env)
+      .reduce((n, r) => n + (r.costMicroUsd ?? 0), 0);
+    return {
+      todayMicro: this.platformSpendTodayMicro ?? summed,
+      hourMicro: this.platformSpendHourMicro ?? summed,
     };
   }
 

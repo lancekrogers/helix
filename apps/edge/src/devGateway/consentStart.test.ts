@@ -11,7 +11,8 @@ import { SPAN_CONSENT_START_DEV } from "@azx-pbc/shared/telemetry";
 import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { buildDevGateway } from "./app.js";
 import type { DevTokenRow, DevTokenStore } from "./devTokenStore.js";
-import { testDevGatewayConfig } from "../test/config.js";
+import { controlOrigin } from "../config.js";
+import { splitDevGatewayConfig, testDevGatewayConfig } from "../test/config.js";
 import { FakeAppDataStore, FakeRegistry, FakeUsageStore, registryEntry } from "../test/fakes.js";
 import type {
   PortalProvider,
@@ -383,5 +384,43 @@ describe("the dev consent-start span", () => {
     } finally {
       await recording.restore();
     }
+  });
+
+  it("split layout: popup and callback URLs use the control domain", async () => {
+    const cfg = splitDevGatewayConfig({ internalSecret: Buffer.alloc(32, 7) });
+    const portal = new FakeConsultPortal();
+    const tokens = new FakeDevTokenStore();
+    tokens.add(DEV_BEARER, liveTokenRow());
+    const app = buildDevGateway({
+      config: cfg,
+      registry: new FakeRegistry([
+        registryEntry({ appId: APP_ID, slug: SLUG, blobPrefix: "apps/a/1/" }),
+      ]),
+      devTokens: tokens,
+      appData: new FakeAppDataStore(),
+      usage: new FakeUsageStore(),
+      llmProvider: null,
+      egress: null,
+      instructionKey: null,
+      portal,
+    });
+    const h = { app, portal, tokens };
+    h.portal.response = { outcome: "started", authorizeUrl: "https://vendor.example/authorize" };
+    const devApiHost = new URL(controlOrigin(cfg, "dev-api")).host;
+    const res = await app.inject({
+      method: "POST",
+      url: START_URL,
+      headers: {
+        host: devApiHost,
+        authorization: `Bearer ${DEV_BEARER}`,
+        origin: DEV_ORIGIN,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = consultRequest(h);
+    expect(body.callbackUrl).toBe(`${controlOrigin(cfg, "auth")}/connections/callback`);
+    const popupUrl = res.json<{ popupUrl: string }>().popupUrl;
+    expect(new URL(popupUrl).origin).toBe(controlOrigin(cfg, "auth"));
+    await h.app.close();
   });
 });

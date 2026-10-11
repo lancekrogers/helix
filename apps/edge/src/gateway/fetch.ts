@@ -25,6 +25,7 @@ import {
   ATTR_CONNECTION,
   ATTR_METHOD,
   ATTR_PROVIDER_REF,
+  ATTR_REASON,
   ATTR_TARGET_ORIGIN,
   ATTR_TARGET_PATH,
   ROUTE_FETCH,
@@ -34,10 +35,12 @@ import { withRootSpan } from "../telemetry.js";
 import {
   errorDetailOf,
   fetchPathOf,
+  meterAdmissionDenied,
   meterGatewayCall,
   type GatewayOutcome,
   type UsageStore,
 } from "./usage.js";
+import type { AcquireResult, LeaseStore } from "./leaseStore.js";
 
 /**
  * `/_api/fetch/<url>` — the fetch-proxy policy plane (fetch-proxy design §7).
@@ -67,11 +70,16 @@ export interface FetchGatewayRuntime {
   usage: UsageStore | null;
   /** null ⇒ HELIX_INSTRUCTION_SECRET unset; the capability 503s. */
   instructionKey: Buffer | null;
+  /** Per-app in-flight cap via leases; null (or maxAppInFlight 0) disables it. */
+  concurrency: { leases: LeaseStore; maxAppInFlight: number } | null;
 }
 
 const REQUEST_SAFE = new Set(REQUEST_HEADER_SAFELIST);
 const RESPONSE_BLOCKED = new Set([...RESPONSE_HEADER_BLOCKLIST, OUTCOME_HEADER, "content-length"]);
 const BODYLESS = new Set(["GET", "HEAD"]);
+
+/** Fetch has no wall-clock deadline; idle timeouts bound calls. TTL is the backstop. */
+const FETCH_LEASE_TTL_MS = 10 * 60_000;
 
 function sendFetchError(
   reply: FastifyReply,
@@ -293,6 +301,46 @@ export function makeFetchHandler(rt: FetchGatewayRuntime) {
       }
     }
 
+    const conc = rt.concurrency;
+    if (conc && conc.maxAppInFlight > 0) {
+      let acquired: AcquireResult;
+      try {
+        acquired = await conc.leases.acquire(
+          [{ scope: `fetch:app:${entry.appId}`, cap: conc.maxAppInFlight }],
+          FETCH_LEASE_TTL_MS,
+        );
+      } catch (err) {
+        req.log.warn({ err, event: "gateway.lease_unavailable" }, "lease acquire failed");
+        sendFetchError(reply, 503, "upstream_error", "fetch concurrency check unavailable");
+        return;
+      }
+      if (!acquired.ok) {
+        meterAdmissionDenied({
+          appId: entry.appId,
+          capability: "fetch",
+          reason: "concurrency_app",
+        });
+        trace.getActiveSpan()?.setAttribute(ATTR_REASON, "concurrency_app");
+        sendFetchError(reply, 429, "rate_limited", "too many concurrent requests for this app");
+        return;
+      }
+      let released = false;
+      const releaseLease = (): void => {
+        if (released) return;
+        released = true;
+        void conc.leases
+          .release(acquired.leaseId)
+          .catch((err: unknown) =>
+            req.log.warn({ err, event: "gateway.lease_release_failed" }, "lease release failed"),
+          );
+      };
+      // 'close' fires after the response finishes and after a hang-up: the right moment
+      // to free the slot. A finally block would free it at the headers, because the
+      // streamed body outlives this function's return.
+      reply.raw.once("close", releaseLease);
+      if (reply.raw.destroyed && !reply.raw.writableEnded) releaseLease();
+    }
+
     // Mint the attested instruction and forward to egress.
     const instruction = await mintInstruction(
       {
@@ -406,6 +454,8 @@ export function makeFetchHandler(rt: FetchGatewayRuntime) {
       for (const [k, v] of Object.entries(res.headers)) {
         if (!RESPONSE_BLOCKED.has(k) && v !== undefined) reply.header(k, v);
       }
+      // Backstop for any non-fetch() consumer (worker script, misclassified load).
+      reply.header("content-security-policy", "default-src 'none'");
       // Count the response bytes on the way to the app: egress already caps, but
       // the edge caps independently (defense-in-depth — the two hops don't trust
       // each other). Status + headers are committed, so a trip truncates the

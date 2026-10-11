@@ -87,3 +87,57 @@ Entra login host), live in the operator's private deployments repo. The
 the present live one.
 
 **Perf note (Resolved):** egress originally built a **fresh undici `Agent` per request** because the dispatcher carried the per-request pinned IP + `servername` (SNI), which defeated cross-request connection pooling (a TCP+TLS handshake per outbound call) — an accepted simplicity-for-isolation trade. This is now **optimized**: `makeProxyHandler` holds **one long-lived shared `Agent`** (closed on app teardown via a Fastify `onClose` hook) whose connector — built with `buildConnector` — runs `resolveAndValidate` and **pins the socket to the validated IP on every new connection**, then hands off to the default connector with `servername` pinned to the real hostname. The request dials the **real origin** (undici pools by origin and derives Host/SNI from it), so keep-alive is recovered (a `proxy.test.ts` case asserts one TCP connection across six requests). The IP-pin is unweakened: validation runs per *new* socket, a pooled/keep-alive socket is already bonded to a validated IP (so reuse can't reach a rebound address and the next fresh socket re-validates), and a blocked/unresolvable host throws `SsrfBlockedError` from the connector, which undici propagates verbatim to the `request()` rejection where the handler maps it to `403 blocked` — preserving the old upfront-check semantics.
+
+## Amendment (2026-10-10): network controls behind the SSRF filter
+
+### Baseline
+
+Four layers stack behind the per-request controls in this ADR:
+
+1. **Application filter** — `apps/egress/src/ssrf.ts`: private/loopback/IMDS and documentation ranges, install-specific `EGRESS_EXTRA_BLOCKED_CIDRS`, validated-IP dial, no redirect-follow. Registry completeness is checked by `apps/egress/src/ssrfRegistry.test.ts` against a dated IANA snapshot.
+2. **Subnet NSG** — `snet-egress` only (`egressNsgEnforce`: `off`, `deny-list-only`, or `enforce`; default `deny-list-only`). Rules load from `infra/azure/nsg-egress-rules.json`.
+3. **Azure Firewall (optional)** — when `deployFirewall` is true: per-subnet platform lists, `egressFqdnMode` (`any` or `allowlist`), `threatIntelMode` (default `Deny`). Stronger than the NSG alone; costs ~$900/mo.
+4. **Network probe** — scheduled/demand Container Apps Job running `apps/egress/src/netprobe.ts`; evidence lands in the egress workspace as `egress.netprobe_check` / `egress.netprobe_result` (summary includes `denyProven` and `closingDenyProven`). A green `ok` proves scored checks matched; NSG deny rows are proven only when `denyProven` is true (`blob-pe-443` with pinned endpoint addresses). On unpinned installs the scheduled job stays `ok: true` with `denyProven: false`; `just infra net-verify` exits 3. The closing deny is proven only with `netprobeClosingDenyTarget` and the firewall off. Read declared posture from the `netControls` deployment output (`probe.denyProvable`) next to the last probe result (`just infra net-verify`). **Unverified in Azure** until recorded in the probe table below.
+
+Layers 1–2 apply to every install. Layer 3 applies only when the firewall is deployed. Layer 4 is on by default (`deployNetprobe`).
+
+### What the old text means now
+
+The **primary control** wording in the Challenge outcome (line 43) and the Deployment note (lines 66–77) describes the **reference posture** with `deployFirewall=true` and, when used, `egressFqdnMode=allowlist`. It is not a claim about every live install. Present posture for an install is the `netControls` output plus the latest `egress.netprobe_result`, not prose in this file.
+
+### The accepted-risk record
+
+The block at lines 79–87 is unchanged. Those installs hold an exception of: firewall off, application filter on, NSG on once an operator has applied it (`egressNsgEnforce` not `off`), trusted single-tenant, with the probe result as the standing evidence. Update the operator's deployments-repo acceptance to point at `netControls` and the last successful `egress.netprobe_result` instead of restating posture here.
+
+NSG rows still **unverified in Azure** until an operator records probe results below include: platform-flow allows (MCR, Front Door, Entra, Azure Monitor, load-balancer paths), whether `deny-cgnat` (`100.64.0.0/10`, enforce-only) breaks ingress, ILB backend ports for edge→egress, service-tag membership, and static private-endpoint addressing when `pinPrivateEndpointAddresses` is true.
+
+### Host-node paths (documented Azure behavior)
+
+There is no NSG deny row on `168.63.129.16` — Microsoft says not to explicitly deny that address on a Container Apps subnet ([Securing a Virtual Network in Azure Container Apps](https://learn.microsoft.com/en-us/azure/container-apps/firewall-integration)). Microsoft documents that traffic to `168.63.129.16` on ports 80/tcp and 32526/tcp is not subject to configured NSG rules. DNS to that address is not filtered unless the rule targets the `AzurePlatformDNS` service tag ([What is IP address 168.63.129.16?](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)). Instance metadata at `169.254.169.254` is similarly exempt unless the `AzurePlatformIMDS` tag is used ([Network security groups overview — Azure platform considerations](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview)). `ssrf.ts` is therefore the only control on `168.63.129.16` and on IMDS for proxied egress traffic. What a Container Apps replica actually sees at those addresses remains **unverified in Azure** until recorded in the probe table.
+
+### New ranges
+
+The filter now also blocks: `168.63.129.16/32`, IPv4 documentation `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, deprecated 6to4 relay `192.88.99.0/24`, IPv6 documentation `3fff::/20`, segment-routing `5f00::/16`, and embedded IPv4 in the IPv4-translated form `::ffff:0:0:0/96`, plus any additional non-forwardable range the IANA registry snapshot test requires (for example `100:0:0:1::/64` from RFC 9780). `EGRESS_EXTRA_BLOCKED_CIDRS` adds the install VNet prefix (and the template adds the Container Apps infrastructure slice) at boot.
+
+### The honest limit
+
+The NSG and firewall cannot protect Postgres or the Key Vault private endpoints egress legitimately uses (`kv-connections`, `kv-delegated`, and **kv-platform** for egress's own Key Vault references): the rule table must allow them. The egress identity holds Key Vault Secrets User on the whole kv-platform vault, so the network layer cannot stop an egress compromise from reading platform secrets; narrowing that grant (per-secret role assignments or a separate egress-only vault) is deferred in `TODO.md`. A bare HTTP request without an injected credential is still limited by the application filter; exfiltration with a stolen instruction is a separate trust-boundary problem (ADR-0013).
+
+### Probe results
+
+Fill this in on a real install after `just infra net-verify`. Until then every row is **not yet run on a real install**.
+
+| Hypothesis | Source | Result | Date | Operator |
+| --- | --- | --- | --- | --- |
+| What does a replica see at `168.63.129.16` (ports 80, 32526, 53)? | `netprobe` wire-server checks (informational) | not yet run on a real install | | |
+| What does a replica see at `169.254.169.254`? | `netprobe` IMDS check (informational) | not yet run on a real install | | |
+| Can a populated Container Apps subnet accept an NSG as an update? | Operator rollout / Azure support | not yet run on a real install | | |
+| Which platform flows the NSG must allow (MCR, Front Door, Entra, Monitor, ILB) | `nsg-egress-rules.json` rows marked hypothesis | not yet run on a real install | | |
+| Does the `100.64.0.0/10` deny break ingress? | NSG row `deny-cgnat` (enforce mode only) | not yet run on a real install | | |
+| Do edge and portal reach egress through the internal load balancer on 31080 and 31443 with the NSG on? | Inbound ILB backend ports (`allow-apps-subnet`) | not yet run on a real install | | |
+| What source address does the NSG see for edge→egress traffic? | Inbound ILB rule hypothesis | not yet run on a real install | | |
+| Are static private-endpoint addresses accepted when pinning is on? | `pinPrivateEndpointAddresses` + PE rows | not yet run on a real install | | |
+| Does Basic firewall SKU support threat-intel `Deny`? | `threatIntelMode` (template uses Standard) | not yet run on a real install | | |
+| Does a firewall application rule drop after the TCP handshake (TLS probe)? | `netprobe` public-host TLS checks | not yet run on a real install | | |
+| Do firewall diagnostic table/column names match (`AZFWApplicationRule`, etc.)? | `firewall-diagnostics.bicep` alert | not yet run on a real install | | |
+| Is an `AzurePlatformIMDS` service-tag deny safe on the Container Apps subnet (managed identity keeps working)? | Not in template — documented alternative to prefix deny | not yet run on a real install | | |

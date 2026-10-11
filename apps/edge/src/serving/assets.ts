@@ -1,14 +1,14 @@
 import { extname } from "node:path";
 import type { Readable } from "node:stream";
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { publicOrigin, type EdgeConfig } from "../config.js";
+import { controlOrigin, publicOrigin, type EdgeConfig } from "../config.js";
 import type { BlobReader, BlobGetResult } from "../blob/client.js";
 import type { RegistryEntry, RegistryReader } from "../registry/projection.js";
 import type { SessionGate } from "../auth/gate.js";
 import { visibilityModeAllowed } from "../auth/validate.js";
 import { sendForbidden, sendGone, sendNotFound, sendUnavailable } from "../errors.js";
 import { normalizeRequestPath } from "./paths.js";
-import { buildAppCsp } from "./csp.js";
+import { applyAppCsp } from "./csp.js";
 import { buildShimScript, injectHeadScripts } from "./shim.js";
 import { buildConnectScript } from "./connectHelper.js";
 import { buildRegistrationSnippet } from "./serviceWorker.js";
@@ -110,8 +110,6 @@ export function makeAssetHandler(deps: AssetHandlerDeps) {
     const method = req.method === "HEAD" ? "HEAD" : "GET";
     const relPath = path === "/" ? "index.html" : path.slice(1);
     const ifNoneMatch = firstHeader(req.headers["if-none-match"]);
-    // Per-app CSP: baseline widened with this app's approved external origins.
-    const csp = buildAppCsp(entry.externalOrigins);
 
     // Serve-time HTML rewrites: the fetch-proxy shim (§3.2), the connect
     // helper's opt-in grant (only the manifest's
@@ -176,7 +174,8 @@ export function makeAssetHandler(deps: AssetHandlerDeps) {
     if (recordVisit && documentServed && isDocumentLoad(req)) recordVisit(req, entry.appId);
 
     if (result.kind === "not-modified") {
-      reply.status(304).header("cache-control", "no-cache").header("content-security-policy", csp);
+      reply.status(304).header("cache-control", "no-cache");
+      applyAppCsp(reply, entry.externalOrigins, config);
       if (result.etag) reply.header("etag", result.etag);
       reply.send();
       return;
@@ -200,7 +199,7 @@ export function makeAssetHandler(deps: AssetHandlerDeps) {
       if (wantsConnect) {
         scripts.push(
           buildConnectScript({
-            platformOrigins: [publicOrigin(config, slug), publicOrigin(config, "auth")],
+            platformOrigins: [publicOrigin(config, slug), controlOrigin(config, "auth")],
           }),
         );
       }
@@ -211,8 +210,8 @@ export function makeAssetHandler(deps: AssetHandlerDeps) {
         .header("content-type", result.contentType ?? "text/html; charset=utf-8")
         .header("cache-control", "no-cache")
         .header("x-content-type-options", "nosniff")
-        .header("content-security-policy", csp)
         .header("content-length", Buffer.byteLength(injected));
+      applyAppCsp(reply, entry.externalOrigins, config);
       await reply.send(injected);
       return;
     }
@@ -221,10 +220,10 @@ export function makeAssetHandler(deps: AssetHandlerDeps) {
       .status(200)
       .header("content-type", result.contentType ?? "application/octet-stream")
       .header("cache-control", cacheControl)
-      .header("x-content-type-options", "nosniff")
-      // On EVERY response, not just HTML: any browser-active document type
-      // (SVG, XML, …) can carry script, and CSP on inert assets is harmless.
-      .header("content-security-policy", csp);
+      .header("x-content-type-options", "nosniff");
+    // On EVERY response, not just HTML: any browser-active document type
+    // (SVG, XML, …) can carry script, and CSP on inert assets is harmless.
+    applyAppCsp(reply, entry.externalOrigins, config);
     if (result.contentLength) reply.header("content-length", result.contentLength);
     if (result.etag) reply.header("etag", result.etag);
     if (result.lastModified) reply.header("last-modified", result.lastModified);

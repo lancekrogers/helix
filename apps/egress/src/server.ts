@@ -329,6 +329,7 @@ try {
       ),
       managedIdentityResource: config.managedIdentityResource,
       allowPrivate: config.allowPrivate,
+      extraBlockedCidrCount: config.extraBlockedCidrs.length,
       allowInsecureConnection: config.allowInsecureConnection,
       telemetry: telemetry.enabled,
     },
@@ -336,6 +337,9 @@ try {
   );
   if (config.allowPrivate) {
     app.log.warn("EGRESS_ALLOW_PRIVATE is set — private/loopback targets are NOT blocked");
+    if (config.extraBlockedCidrs.length > 0) {
+      app.log.warn("EGRESS_EXTRA_BLOCKED_CIDRS is set but EGRESS_ALLOW_PRIVATE bypasses it");
+    }
   }
   // A sub-three-label suffix (azure.com, co.uk) is a public-suffix-class pin —
   // technically valid, practically a shared-zone grant. Warn, don't refuse: the

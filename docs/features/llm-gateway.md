@@ -1,12 +1,19 @@
 # LLM gateway
 
-> **Related ADRs:** [ADR-0008](../adr/0008-llm-key-via-egress.md) (LLM key via egress) · [ADR-0021](../adr/0021-metering-ledger.md) (metering ledger) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0033](../adr/0033-openai-compatible-gateway-surface.md) (OpenAI-compatible surface + multi-provider routing) · [ADR-0034](../adr/0034-structured-output-on-the-llm-gateway.md) (structured output).
+> **Related ADRs:** [ADR-0008](../adr/0008-llm-key-via-egress.md) (LLM key via egress) · [ADR-0021](../adr/0021-metering-ledger.md) (metering ledger) · [ADR-0051](../adr/0051-llm-admission-control.md) (admission: default budget, platform ceiling, in-flight caps) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0033](../adr/0033-openai-compatible-gateway-surface.md) (OpenAI-compatible surface + multi-provider routing) · [ADR-0034](../adr/0034-structured-output-on-the-llm-gateway.md) (structured output).
 
 `POST /_api/llm/chat` sends a language-model request through the platform.
 The edge resolves the caller, checks the request origin and app's model allowlist,
-enforces its daily budget, and records usage. Egress supplies the vendor
-credential and makes the outbound call. The vendor-neutral request and response
-schemas are in `packages/shared/src/llm.ts` (architecture §6.1, project plan §4 M4).
+enforces admission controls (daily budget, optional platform ceiling, in-flight caps,
+call deadline), and records usage. Egress supplies the vendor credential and makes the
+outbound call. The vendor-neutral request and response schemas are in
+`packages/shared/src/llm.ts` (architecture §6.1, project plan §4 M4).
+
+**Spend leak scope (corrected).** A client hang-up after the upstream response headers arrive
+already tore the vendor connection down; the gaps were the **pre-header** window (egress now
+aborts upstream on edge hang-up), cut streams that wrote **$0** before charging was fixed, and
+approved apps with no manifest `dollarsPerDay` being unlimited at the gateway. ADR-0051 records
+the full decision set.
 
 Handler: `apps/edge/src/gateway/llm.ts` (`makeLlmHandler`). Route wiring:
 `apps/edge/src/app.ts` (`POST /_api/llm/chat`). App hosts only — `sendNotFound` elsewhere.
@@ -32,24 +39,73 @@ Handler: `apps/edge/src/gateway/llm.ts` (`makeLlmHandler`). Route wiring:
 
 ### Quota (block-new, finish-in-flight)
 
-If `entry.llm.dollarsPerDay` is set, the budget is checked **once at admission** against the
-frozen `costMicroUsd` ledger column, over two windows: the calendar day (`429 quota_exceeded`)
-and a rolling hour at a fraction of it (`429 rate_limited`, the burst/availability control, so
-one actor can't drain the day in a spike). Either way a `quota_blocked` row is recorded. An admitted request always runs to completion even if it tips the app over —
-the **next** request is the one that gets blocked (`apps/edge/src/gateway/llm.ts`). The
-alternative (cutting an in-flight stream at the byte that crosses the line) buys nothing — the
-tokens are already spent upstream — and would corrupt the response mid-sentence. Block-new keeps
-the budget a coarse daily ceiling, not a hard per-token cap, and the blocked call **is** audited
-(a `quota_blocked` row, distinct from the calls that record nothing — see below). An **unset**
-`dollarsPerDay` means unlimited: the edge only enforces a defined budget, so the most-permissive
-state is no number at all (this is why the approval classifier treats removing a cap as a
-privilege *increase* — see [capabilities-and-manifests.md](./capabilities-and-manifests.md)).
+The budget is checked **once at admission** against the frozen `costMicroUsd` ledger column,
+over two windows: the calendar day (`429 quota_exceeded`) and a rolling hour at a fraction of
+it (`429 rate_limited`, the burst/availability control, so one actor can't drain the day in a
+spike). Either way a `quota_blocked` row is recorded, throttled per app and env (20 per minute
+per replica) so a flood of refusals cannot become a ledger write flood; the
+`helix.gateway.admission_denied` counter still counts every refusal. The effective daily cap is
+`entry.llm.dollarsPerDay` when set, otherwise `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` (default
+$50/day, matching the approval baseline). Setting that install knob to `0` makes an unset
+manifest budget unlimited again. An admitted request always runs to completion even if it tips
+the app over — the **next** request is the one that gets blocked
+(`apps/edge/src/gateway/llm.ts`). The alternative (cutting an in-flight stream at the byte that
+crosses the line) buys nothing — the tokens are already spent upstream — and would corrupt the
+response mid-sentence. Block-new keeps the budget a coarse daily ceiling, not a hard per-token
+cap, and the blocked call **is** audited (a `quota_blocked` row, distinct from the calls that
+record nothing — see below). The approval classifier cannot see
+`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`, so removing an explicit LLM cap is elevated even though the
+edge will enforce the install default — that default may be above the $50 baseline or unlimited
+(`0`). See [capabilities-and-manifests.md](./capabilities-and-manifests.md) for the full rules.
+
+When `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` is positive, the edge also refuses new LLM calls
+platform-wide once the day's summed `costMicroUsd` across all apps reaches that ceiling
+(`503 capability_unavailable`, message "platform LLM budget exhausted for today"), with
+`retry-after` set to seconds until the next local midnight (the same `date_trunc('day', now())`
+window as the per-app gate). The check runs after the per-app gate so an app over its own
+budget still gets `429`. Denials record `quota_blocked` with `errorDetail = platform_ceiling`,
+throttled like other quota refusals, and increment `helix.gateway.admission_denied` with reason
+`platform_ceiling`. Spend is read through a `SECURITY DEFINER` aggregate, cached per edge
+replica for five seconds — overshoot is at most the ceiling plus calls admitted before the
+cache catches up. A failed read fails closed (`503`, `retry-after: 5`). `0` or unset disables
+the ceiling locally; deployed installs receive a Bicep-derived default.
+
+### Concurrency and the call deadline
+
+Before a call is admitted, the edge enforces three optional in-flight limits plus a
+per-replica socket guard. Cross-replica caps use Postgres leases on scopes
+`llm:app:<appId>` (`EDGE_LLM_MAX_APP_IN_FLIGHT`, default 10) and, for authenticated
+callers only, `llm:user:<appId>:<userOid>` (`EDGE_LLM_MAX_USER_IN_FLIGHT`, default 3).
+Anonymous visitors on `public` apps share one metering identity, so they are covered by
+the app scope and the existing per-IP limiter, not a per-user lease.
+`EDGE_LLM_MAX_IN_FLIGHT` (default 200) is checked in-process on each replica before the
+lease round trip; effective cluster concurrency is at most that value times the replica
+count. Setting any cap to `0` disables it. A refusal returns `503 capability_unavailable`
+with `retry-after: 1`, increments `helix.gateway.admission_denied` (reason
+`concurrency_app`, `concurrency_user`, or `concurrency_replica`), and writes no ledger
+row. Lease acquire failures fail closed (`503`, `retry-after: 5`). Overshoot past a
+daily budget is bounded by at most `appCap × worst-case call cost` while calls are
+in flight.
+
+Each admitted call also gets a wall-clock deadline (`EDGE_LLM_MAX_CALL_MS`, default ten
+minutes). The upstream `AbortSignal` is the client hang-up signal or that timeout,
+whichever comes first. The edge→egress hop timeout is set above that deadline so the
+abort fires first; egress uses a separate `EGRESS_LLM_TIMEOUT_MS` on vendor calls (above
+the edge deadline, derived from the same Bicep parameter). A deadline abort is charged
+like a partial stream (ledger `error` with `deadline_exceeded;usage=…`), not a quota cut.
+A transport idle timeout after the request was dispatched is charged as a cut with
+`upstream_timeout;usage=…`. Lease TTL is the deadline plus a one-minute grace period so
+a live call does not lose its slot before it finishes.
+The lease is released only after the ledger row is written. Spend is still read **before** the
+lease is taken, so a newly admitted call may not see a row from a call that just finished; overshoot
+past the per-app cap is bounded by roughly **`appCap` concurrent calls** at worst-case cost, not zero.
 
 ### Provider seam + streaming
 
 `apps/edge/src/gateway/provider.ts` defines a vendor-agnostic `LlmProvider`:
 `stream(req, {signal, appId, userOid, requestId}) → AsyncIterable<LlmStreamEvent>`, where events
-are `{type: "delta", text}` then a final `{type: "done", stopReason, usage}`. It is a deliberate
+are `{type: "delta", text}`, optional interim `{type: "usage", usage}` events as the vendor
+reports token counts, then a final `{type: "done", stopReason, usage}`. It is a deliberate
 **seam, not a cloned vendor API namespace** — the app speaks the platform's own
 `packages/shared/src/llm.ts` wire contract, and the gateway translates. That indirection is what
 keeps the key out of reach: there is no edge surface that echoes the upstream request, so the app
@@ -91,6 +147,16 @@ Every call records exactly once (`recordOnce`) into `gateway_calls` via
 `apps/edge/src/gateway/usage.ts`: `{appId, userOid, userName, userEmail, capability: "llm", model,
 inputTokens, outputTokens, outcome}` where outcome is `ok` / `error` / `quota_blocked` (the column
 also admits `refusal`, reserved for content-policy stops; M4 emits the three above).
+
+**Cut and failed streams** (a client hang-up, or an error after the upstream answered `200` with at
+least one stream event) still write `outcome: error`, but freeze a best-effort charge in
+`costMicroUsd` and mark the row in `errorDetail` with a trailing `;usage=measured`, `;usage=estimated`,
+or `;usage=mixed`. `stopReason` is `null` on those rows — not the default `end_turn`, which would
+claim a call that never finished. Per field: input is the measured count when a `usage` event (or
+`done`) delivered one, else a byte estimate of the prompt; output is `max(measured, estimate)` from
+relayed delta bytes. An upstream `4xx`/`5xx` before any event still records `costMicroUsd: 0` with no
+marker. **Residuals:** reasoning tokens billed but never streamed are not estimated; an edge crash
+mid-stream writes no row at all.
 
 `userOid` and the two label columns are the **identity half and the display half** of the caller,
 and the split is the point. `userOid` is the Entra `oid` claim since ADR-0048 (a pairwise `sub` on
@@ -319,6 +385,11 @@ holds an API key. See [examples.md](./examples.md).
 
 ## Planned / not yet built
 
+- **Admission residuals (ADR-0051).** Reasoning tokens billed upstream but never streamed are not
+  estimated; an edge crash mid-stream writes no ledger row; byte estimates can be tens of percent
+  off; platform `retry-after` assumes the edge and database share a time zone; abort propagation
+  through Container Apps ingress is **unverified in Azure**; pre-charge with a settling second row
+  remains the option if edge-crash orphan spend becomes material.
 - **Tool calling** on both surfaces — `tools`/`tool_calls` translation needs the neutral-seam
   changes structured output did *not* (a tool call is a non-text content block, so it needs new
   `LlmStreamEvent` variants and new codec framing); deferred (ADR-0033/0034). Other modalities

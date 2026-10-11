@@ -1,19 +1,102 @@
 import { type Pool } from "pg";
 
-import { type Env, type GatewayOutcome } from "@azx-pbc/shared";
-
-import { createEdgePool, type EdgePoolOpts } from "../db/pool.js";
-import { withPartition } from "../db/partition.js";
-import type { PrincipalKind } from "@azx-pbc/shared";
-import { USER_EMAIL_MAX, USER_NAME_MAX, truncate } from "../auth/identity.js";
+import { type Env, type GatewayOutcome, type PrincipalKind } from "@azx-pbc/shared";
 import {
   ATTR_APP_ID,
   ATTR_CAPABILITY,
   ATTR_OUTCOME,
+  ATTR_REASON,
+  ATTR_USAGE_BASIS,
   capTargetPath,
   TARGET_PATH_MAX,
+  type AdmissionDenialReason,
+  type CutChargeBasis,
 } from "@azx-pbc/shared/telemetry";
+
+import { USER_EMAIL_MAX, USER_NAME_MAX, truncate } from "../auth/identity.js";
+import { createEdgePool, type EdgePoolOpts } from "../db/pool.js";
+import { withPartition } from "../db/partition.js";
 import { instruments } from "../telemetry.js";
+
+/** Default TTL for cached platform LLM spend reads (per edge replica). */
+export const PLATFORM_SPEND_CACHE_MS = 5_000;
+
+export interface PgUsageStoreOpts extends EdgePoolOpts {
+  /** Platform spend cache TTL; `0` disables caching (tests). */
+  platformCacheMs?: number;
+}
+
+/** Boot self-test and integration tests share this catalog query (ADR-0002). */
+export const PLATFORM_SPEND_CHECK_SQL = `
+SELECT
+  p.proname = 'platform_llm_spend_micro_usd' AS fn_name_ok,
+  p.prosecdef AS security_definer,
+  EXISTS (
+    SELECT 1 FROM unnest(COALESCE(p.proconfig, ARRAY[]::text[])) AS cfg
+    WHERE cfg LIKE 'search_path=%'
+  ) AS search_path_pinned,
+  pg_get_userbyid(p.proowner) AS function_owner,
+  pol.policyname = 'gateway_calls_owner_read' AS policy_name_ok,
+  pol.cmd = 'SELECT' AS policy_cmd_ok,
+  pol.roles @> ARRAY[pg_get_userbyid(p.proowner)]::name[] AS policy_admits_owner
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+LEFT JOIN pg_policies pol
+  ON pol.tablename = 'gateway_calls'
+ AND pol.policyname = 'gateway_calls_owner_read'
+WHERE p.proname = 'platform_llm_spend_micro_usd'
+  AND pg_get_function_identity_arguments(p.oid) = 'p_env text'
+`;
+
+export type PlatformSpendCheck =
+  | { status: "ok" }
+  | { status: "misconfigured"; problem: string }
+  | { status: "unreachable"; error: unknown };
+
+export type PlatformSpendCheckRow = {
+  fn_name_ok: boolean;
+  security_definer: boolean;
+  search_path_pinned: boolean;
+  policy_name_ok: boolean;
+  policy_cmd_ok: boolean;
+  policy_admits_owner: boolean;
+};
+
+export function classifyPlatformSpendCheck(
+  rows: PlatformSpendCheckRow[],
+): Exclude<PlatformSpendCheck, { status: "unreachable" }> {
+  const row = rows[0];
+  if (!row?.fn_name_ok) {
+    return { status: "misconfigured", problem: "platform_llm_spend_micro_usd is missing" };
+  }
+  if (!row.security_definer) {
+    return {
+      status: "misconfigured",
+      problem: "platform_llm_spend_micro_usd is not SECURITY DEFINER",
+    };
+  }
+  if (!row.search_path_pinned) {
+    return {
+      status: "misconfigured",
+      problem: "platform_llm_spend_micro_usd does not pin search_path",
+    };
+  }
+  if (!row.policy_name_ok || !row.policy_cmd_ok || !row.policy_admits_owner) {
+    return {
+      status: "misconfigured",
+      problem: "gateway_calls_owner_read does not admit the function owner",
+    };
+  }
+  return { status: "ok" };
+}
+
+function postgresErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
 
 /**
  * The gateway call ledger (architecture §6.1/§6.3, §8) — metering + audit and
@@ -87,7 +170,7 @@ export interface GatewayCallRecord {
 }
 
 /** Max length of the `errorDetail` ledger string, before the ellipsis. */
-const ERROR_DETAIL_MAX = 300;
+export const ERROR_DETAIL_MAX = 300;
 
 /**
  * Max length of the `path` ledger column, before the ellipsis.
@@ -240,6 +323,11 @@ export interface UsageStore {
    */
   llmSpendMicroUsd(appId: string, env: Env): Promise<LlmSpend>;
   /**
+   * Platform-wide LLM spend (micro-USD) for one env, from the definer aggregate.
+   * Cached per store instance; throws when the read fails.
+   */
+  platformLlmSpendMicroUsd(env: Env): Promise<LlmSpend>;
+  /**
    * Count of successful app-data **write** calls today (app-data design §7) —
    * the per-app `writesPerDay` budget window. Writes are the put/append verbs
    * (`user.put`, `collection.append`, `shared.put`); reads and quota-blocks
@@ -281,14 +369,75 @@ export const DATA_WRITE_VERBS = ["user.put", "collection.append", "shared.put"] 
 
 export class PgUsageStore implements UsageStore {
   #pool: Pool;
+  #platformCacheMs: number;
+  #platformCache = new Map<Env, { at: number; value: LlmSpend }>();
+  #platformInflight = new Map<Env, Promise<LlmSpend>>();
 
-  constructor(databaseUrl: string, opts: EdgePoolOpts = {}) {
+  constructor(databaseUrl: string, opts: PgUsageStoreOpts = {}) {
     // Spread, don't re-list — see the note in auth/sessions.ts.
     this.#pool = createEdgePool(databaseUrl, {
       ...opts,
       max: opts.max ?? 10,
       label: opts.label ?? "usage",
     });
+    this.#platformCacheMs = opts.platformCacheMs ?? PLATFORM_SPEND_CACHE_MS;
+  }
+
+  peekPlatformSpend(env: Env): LlmSpend | null {
+    return this.#platformCache.get(env)?.value ?? null;
+  }
+
+  async platformLlmSpendMicroUsd(env: Env): Promise<LlmSpend> {
+    if (this.#platformCacheMs > 0) {
+      const hit = this.#platformCache.get(env);
+      if (hit && Date.now() - hit.at < this.#platformCacheMs) return hit.value;
+    }
+    let read = this.#platformInflight.get(env);
+    if (!read) {
+      read = this.#readPlatform(env)
+        .then((value) => {
+          if (this.#platformCacheMs > 0) {
+            this.#platformCache.set(env, { at: Date.now(), value });
+          }
+          return value;
+        })
+        .finally(() => this.#platformInflight.delete(env));
+      this.#platformInflight.set(env, read);
+    }
+    return read;
+  }
+
+  async #readPlatform(env: Env): Promise<LlmSpend> {
+    // Straight on the pool, not withPartition: the function takes the env itself, and a
+    // partition would set an app GUC that means nothing here.
+    const result = await this.#pool.query(
+      "SELECT today, hour FROM platform_llm_spend_micro_usd($1)",
+      [env],
+    );
+    const row = result.rows[0] as { today: string | number; hour: string | number } | undefined;
+    return { todayMicro: row ? Number(row.today) : 0, hourMicro: row ? Number(row.hour) : 0 };
+  }
+
+  async checkPlatformSpendFunction(): Promise<PlatformSpendCheck> {
+    try {
+      const catalog = await this.#pool.query(PLATFORM_SPEND_CHECK_SQL);
+      const classified = classifyPlatformSpendCheck(catalog.rows as PlatformSpendCheckRow[]);
+      if (classified.status === "misconfigured") return classified;
+      await this.#pool.query(`SELECT * FROM platform_llm_spend_micro_usd('prod')`);
+      return { status: "ok" };
+    } catch (err) {
+      const code = postgresErrorCode(err);
+      if (code === "42501" || code === "42883") {
+        return {
+          status: "misconfigured",
+          problem:
+            code === "42501"
+              ? "helix_edge cannot execute platform_llm_spend_micro_usd"
+              : "platform_llm_spend_micro_usd is not callable",
+        };
+      }
+      return { status: "unreachable", error: err };
+    }
   }
 
   async llmSpendMicroUsd(appId: string, env: Env): Promise<LlmSpend> {
@@ -395,6 +544,18 @@ export class PgUsageStore implements UsageStore {
   }
 }
 
+export function meterAdmissionDenied(call: {
+  appId: string;
+  capability: string;
+  reason: AdmissionDenialReason;
+}): void {
+  instruments().gatewayAdmissionDenied.add(1, {
+    [ATTR_APP_ID]: call.appId,
+    [ATTR_CAPABILITY]: call.capability,
+    [ATTR_REASON]: call.reason,
+  });
+}
+
 /**
  * Record the operational metrics for one gateway terminal (ADR-0037 decision 8).
  *
@@ -447,4 +608,11 @@ export function meterGatewayCall(call: {
       [ATTR_OUTCOME]: call.outcome,
     });
   }
+}
+
+export function meterCutCharge(call: { appId: string; basis: CutChargeBasis }): void {
+  instruments().gatewayCutCharges.add(1, {
+    [ATTR_APP_ID]: call.appId,
+    [ATTR_USAGE_BASIS]: call.basis,
+  });
 }

@@ -1,6 +1,9 @@
 import { z } from "zod";
 
+import { BASELINE_DOLLARS_PER_DAY } from "@azx-pbc/shared";
 import { DEFAULT_STATEMENT_TIMEOUT_MS } from "./db/pool.js";
+import { RESERVED_SUBDOMAINS } from "./routing/hosts.js";
+import { isCspSafeHostname } from "./serving/csp.js";
 
 /**
  * Edge configuration, resolved once at boot from the environment (project plan
@@ -114,6 +117,8 @@ export interface AuthConfig {
 export interface GatewayConfig {
   /** Apps are served on `<slug>.<baseDomain>` (architecture §4.1). */
   baseDomain: string;
+  /** Control hosts (`auth.`, `portal.`, `dev-api.`) live on this domain. Equal to `baseDomain` in the single-domain layout. */
+  controlDomain: string;
   /**
    * Edge-terminated TLS (mkcert in dev). **Required outside production** — the
    * platform is HTTPS-only (`__Host-` cookies need Secure; app crypto APIs
@@ -195,6 +200,39 @@ export interface GatewayConfig {
       /** Name of the `platform`-scoped secret holding the OpenAI key. */
       connection: string;
     };
+    /**
+     * Daily LLM budget applied to an app whose manifest sets none
+     * (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`). Defaults to the approval baseline.
+     * Not clamped to it: an operator who raises it enforces more than the
+     * classifier showed the approver. `0` means an unset budget is unlimited.
+     */
+    defaultDollarsPerDay: number;
+    /**
+     * Platform-wide daily LLM spend ceiling in USD (`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`).
+     * `0` or unset disables enforcement on this process. The dev gateway ignores it
+     * (`helix_dev` has no `EXECUTE` on the aggregate function).
+     */
+    platformDollarsPerDay: number;
+    /**
+     * Max concurrent LLM calls per app across all edge replicas (`EDGE_LLM_MAX_APP_IN_FLIGHT`).
+     * `0` disables.
+     */
+    maxAppInFlight: number;
+    /**
+     * Max concurrent LLM calls per authenticated user per app (`EDGE_LLM_MAX_USER_IN_FLIGHT`).
+     * Anonymous callers are not bucketed by user. `0` disables.
+     */
+    maxUserInFlight: number;
+    /**
+     * Max concurrent LLM calls on this replica (`EDGE_LLM_MAX_IN_FLIGHT`). Per replica by
+     * design; cross-replica limits use Postgres leases. `0` disables.
+     */
+    maxInFlight: number;
+    /**
+     * Wall-clock deadline for one upstream LLM call in ms (`EDGE_LLM_MAX_CALL_MS`). Also bounds
+     * lease TTL (deadline plus a grace period). Must be positive — there is no off value.
+     */
+    maxCallMs: number;
   };
   /**
    * Fetch-proxy wiring (M4.5). The policy plane authorizes a `/_api/fetch` call
@@ -215,6 +253,13 @@ export interface GatewayConfig {
      * Mirrors egress's `EGRESS_MAX_BODY_BYTES` so both hops cap independently.
      */
     maxBodyBytes: number;
+    /**
+     * Max concurrent fetch-proxy calls per app across all edge replicas
+     * (`EDGE_FETCH_MAX_APP_IN_FLIGHT`). `0` disables — no lease is taken. Lease TTL
+     * is ten minutes; a call that outlives it stops counting (at most one residual
+     * slot per such call).
+     */
+    maxAppInFlight: number;
   };
   /**
    * The edge↔portal internal-JWT key (HELIX_INTERNAL_SECRET):
@@ -286,6 +331,12 @@ export interface EdgeConfig extends GatewayConfig {
    * "allow"/default-off polarity as {@link allowPublicApps}.
    */
   allowPasswordApps: boolean;
+  /**
+   * When true (split layout only), GET/HEAD to `<slug>.<controlDomain>` for a live
+   * permitted app answer 307 to the same path on the apps origin. Default off;
+   * with `controlDomain === baseDomain` the effective value is always false.
+   */
+  legacyAppRedirect: boolean;
   /** Per-IP rate limit for the anonymous tier on `public` apps (app-data design §7). Caps every anonymous `/_api/*` gateway call, keyed per IP+app within a
    * fixed window — the anonymous writer/visitor has no per-user budget to
    * charge, so this is the only per-source cap on an open public surface.
@@ -293,6 +344,24 @@ export interface EdgeConfig extends GatewayConfig {
    * budgets). `max: 0` disables the limiter.
    */
   anonRateLimit: { max: number; windowMs: number };
+  /**
+   * Origins appended to every app's img-src (EDGE_IMG_SRC_EXTRA). Operator-trusted
+   * image hosts, so owners need no per-app approval for them. Never connect-src.
+   * Do not list a host that fetches attacker-chosen URLs: that is a sink.
+   */
+  imgSrcExtra: string[];
+  /**
+   * EDGE_IMG_SRC_REPORT_ONLY: the measurement window before the default takes
+   * effect (the previous open `img-src` enforced, the tightened policy Report-Only).
+   * Parsed with `=== "true"`.
+   */
+  imgSrcReportOnly: boolean;
+  /**
+   * EDGE_IMG_SRC_ALLOW_ALL: put `https:` back in every app's img-src. For
+   * installs on the one-org model that accept the open image channel. Default
+   * false (tight); object-src stays 'none' either way.
+   */
+  imgSrcAllowAll: boolean;
 }
 
 /**
@@ -593,6 +662,52 @@ const isDottedNetmaskCidr = (part: string): boolean =>
   /^\d+\.\d+\.\d+\.\d+\/\d+\.\d+\.\d+\.\d+$/.test(part);
 
 /**
+ * Parse EDGE_IMG_SRC_EXTRA: comma-separated https origins widened into every
+ * app's `img-src` (enforced by default; Report-Only only during measurement).
+ * Refuse boot on any part that is not a bare
+ * origin — paths, queries, credentials, wildcards, and http: are all errors.
+ */
+export function parseImgSrcExtra(raw: string | undefined): string[] {
+  const v = (raw ?? "").trim();
+  if (!v) return [];
+  const out: string[] = [];
+  for (const part of v.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    let url: URL;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      throw new Error(
+        `EDGE_IMG_SRC_EXTRA is not a list of https origins (bad: ${JSON.stringify(trimmed)}). ` +
+          `Each comma-separated part must look like "https://images.example.com" or ` +
+          `"https://images.example.com:8443": no path, query, credentials or wildcard.`,
+      );
+    }
+    const normalized = trimmed.replace(/\/$/, "");
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.hostname.includes("*") ||
+      !isCspSafeHostname(url.hostname) ||
+      url.search !== "" ||
+      url.hash !== "" ||
+      url.pathname !== "/" ||
+      normalized !== url.origin
+    ) {
+      throw new Error(
+        `EDGE_IMG_SRC_EXTRA is not a list of https origins (bad: ${JSON.stringify(trimmed)}). ` +
+          `Each comma-separated part must look like "https://images.example.com" or ` +
+          `"https://images.example.com:8443": no path, query, credentials or wildcard.`,
+      );
+    }
+    if (!out.includes(url.origin)) out.push(url.origin);
+  }
+  return out;
+}
+
+/**
  * Parse EDGE_TRUST_PROXY: unset/blank means false; true/false select booleans;
  * otherwise accept a comma-separated list of IPs, CIDRs, or proxy-addr presets.
  * Reject invalid values before Fastify starts. An incorrect trusted address
@@ -681,13 +796,42 @@ function parseTrustProxy(raw: string | undefined): boolean | string {
  * succeeding. Note `??` only catches `undefined`/`null`, so an empty-string env
  * var (`Number("") === 0`) needs the same guard.
  */
-function requirePositiveMs(raw: string | undefined, fallback: number, name: string): number {
+/** Largest timer value Node accepts without clamping to 1 ms (`setTimeout` / `AbortSignal.timeout`). */
+export const MAX_POSITIVE_MS = 2_147_483_647;
+
+function requirePositiveMs(
+  raw: string | undefined,
+  fallback: number,
+  name: string,
+  maxMs?: number,
+): number {
   if (raw === undefined || raw.trim() === "") return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(
       `${name} must be a positive number of milliseconds (got ${JSON.stringify(raw)})`,
     );
+  }
+  if (maxMs !== undefined && value > maxMs) {
+    throw new Error(`${name} must be at most ${maxMs} milliseconds (got ${JSON.stringify(raw)})`);
+  }
+  return value;
+}
+
+function requireNonNegativeNumber(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative number (got ${JSON.stringify(raw)})`);
+  }
+  return value;
+}
+
+function requireNonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    throw new Error(`${name} must be a non-negative integer (got ${JSON.stringify(raw)})`);
   }
   return value;
 }
@@ -710,6 +854,38 @@ function llmPath(value: string | undefined, fallback: string, envKey: string): s
     );
   }
   return path;
+}
+
+const HOSTNAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+/** Resolve and validate the control domain pair against the apps base domain. */
+export function resolveControlDomain(baseDomain: string, raw: string | undefined): string {
+  const control = raw?.trim().toLowerCase();
+  if (!control || control === baseDomain) return baseDomain; // today's layout
+  for (const [name, value] of [
+    ["EDGE_CONTROL_DOMAIN", control],
+    ["EDGE_BASE_DOMAIN", baseDomain],
+  ] as const) {
+    if (!HOSTNAME.test(value)) {
+      throw new Error(`${name} is not a valid hostname: ${value}`);
+    }
+  }
+  if (control.endsWith(`.${baseDomain}`)) {
+    throw new Error(
+      `EDGE_CONTROL_DOMAIN (${control}) must not be a subdomain of EDGE_BASE_DOMAIN (${baseDomain}): ` +
+        "an app could set a Domain= cookie that reaches the control hosts. Refusing to start.",
+    );
+  }
+  for (const label of ["auth", "portal", "dev-api"] as const) {
+    const onLabel = `${label}.${control}`;
+    if (baseDomain === onLabel || baseDomain.endsWith(`.${onLabel}`)) {
+      throw new Error(
+        `EDGE_BASE_DOMAIN (${baseDomain}) must not be on or under ${onLabel} (EDGE_CONTROL_DOMAIN ${control}): ` +
+          "an app could set a Domain= cookie that reaches the control hosts. Refusing to start.",
+      );
+    }
+  }
+  return control;
 }
 
 /**
@@ -741,8 +917,12 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
     );
   }
 
+  const baseDomain = (env.EDGE_BASE_DOMAIN ?? "local.helix.azxlabs.io").toLowerCase();
+  const controlDomain = resolveControlDomain(baseDomain, env.EDGE_CONTROL_DOMAIN);
+
   return {
-    baseDomain: (env.EDGE_BASE_DOMAIN ?? "local.helix.azxlabs.io").toLowerCase(),
+    baseDomain,
+    controlDomain,
     tls,
     reconcileIntervalMs: requirePositiveMs(
       env.EDGE_RECONCILE_INTERVAL_MS,
@@ -761,16 +941,47 @@ function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
         path: llmPath(env.EDGE_LLM_OPENAI_PATH, "/v1/chat/completions", "EDGE_LLM_OPENAI_PATH"),
         connection: env.EDGE_LLM_OPENAI_CONNECTION ?? "openai",
       },
+      defaultDollarsPerDay: requireNonNegativeNumber(
+        env.EDGE_LLM_DEFAULT_DOLLARS_PER_DAY,
+        BASELINE_DOLLARS_PER_DAY,
+        "EDGE_LLM_DEFAULT_DOLLARS_PER_DAY",
+      ),
+      platformDollarsPerDay: requireNonNegativeNumber(
+        env.EDGE_LLM_PLATFORM_DOLLARS_PER_DAY,
+        0,
+        "EDGE_LLM_PLATFORM_DOLLARS_PER_DAY",
+      ),
+      maxAppInFlight: requireNonNegativeInt(
+        env.EDGE_LLM_MAX_APP_IN_FLIGHT,
+        10,
+        "EDGE_LLM_MAX_APP_IN_FLIGHT",
+      ),
+      maxUserInFlight: requireNonNegativeInt(
+        env.EDGE_LLM_MAX_USER_IN_FLIGHT,
+        3,
+        "EDGE_LLM_MAX_USER_IN_FLIGHT",
+      ),
+      maxInFlight: requireNonNegativeInt(env.EDGE_LLM_MAX_IN_FLIGHT, 200, "EDGE_LLM_MAX_IN_FLIGHT"),
+      maxCallMs: requirePositiveMs(
+        env.EDGE_LLM_MAX_CALL_MS,
+        600_000,
+        "EDGE_LLM_MAX_CALL_MS",
+        MAX_POSITIVE_MS,
+      ),
     },
     fetch: {
       egressUrl: env.EDGE_EGRESS_URL || null,
       instructionSecret: loadInstructionSecret(env),
-      // 120s, not 30s: egress holds its response headers until the vendor's
-      // first byte, and a reasoning LLM (gpt-5-nano et al.) can easily think
-      // longer than 30s before streaming anything — the edge's headersTimeout
-      // was the failure that surfaced, not the vendor's own speed.
+      // Non-LLM `/_api/fetch` hops only. LLM calls set per-request hop timeouts
+      // to `EDGE_LLM_MAX_CALL_MS` plus `LLM_EGRESS_HOP_TIMEOUT_MARGIN_MS` so the
+      // edge deadline abort wins first; fetch stays at 120s by default.
       timeoutMs: Number(env.EDGE_FETCH_TIMEOUT_MS ?? 120_000),
       maxBodyBytes: Number(env.EDGE_FETCH_MAX_BODY_BYTES ?? 10 * 1024 * 1024),
+      maxAppInFlight: requireNonNegativeInt(
+        env.EDGE_FETCH_MAX_APP_IN_FLIGHT,
+        0,
+        "EDGE_FETCH_MAX_APP_IN_FLIGHT",
+      ),
     },
     internalSecret: loadInternalSecret(env),
     portalUrl: env.EDGE_PORTAL_URL || null,
@@ -817,8 +1028,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     throw new Error("EDGE_DEV_ALLOW_UNAUTHENTICATED is a dev bypass and is refused in production");
   }
 
+  const imgSrcReportOnly = env.EDGE_IMG_SRC_REPORT_ONLY === "true";
+  const imgSrcAllowAll = env.EDGE_IMG_SRC_ALLOW_ALL === "true";
+  if (imgSrcReportOnly && imgSrcAllowAll) {
+    throw new Error(
+      "EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL cannot both be true: report-only is the " +
+        "measurement window before enforcing the tightened img-src, while allow-all restores the open " +
+        "channel — pick one posture per install.",
+    );
+  }
+
+  const gateway = loadGatewayConfig(env);
+
   return {
-    ...loadGatewayConfig(env),
+    ...gateway,
     databaseUrl,
     blob,
     auth: loadAuthConfig(env),
@@ -828,10 +1051,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     // EdgeConfig); a deployment opts a surface back in per environment.
     allowPublicApps: env.EDGE_ALLOW_PUBLIC_APPS === "true",
     allowPasswordApps: env.EDGE_ALLOW_PASSWORD_APPS === "true",
+    // Allow-polarity, default off. Meaningful only in the split layout; with one domain the old and
+    // new hosts are the same host, so the flag is forced off rather than left to confuse the log.
+    legacyAppRedirect:
+      env.EDGE_LEGACY_APP_REDIRECT === "true" && gateway.controlDomain !== gateway.baseDomain,
     anonRateLimit: {
       max: Number(env.EDGE_ANON_RATE_LIMIT ?? 60),
       windowMs: Number(env.EDGE_ANON_RATE_WINDOW_MS ?? 60_000),
     },
+    imgSrcExtra: parseImgSrcExtra(env.EDGE_IMG_SRC_EXTRA),
+    imgSrcReportOnly,
+    imgSrcAllowAll,
   };
 }
 
@@ -887,15 +1117,28 @@ function loadInternalSecret(env: NodeJS.ProcessEnv): Buffer | null {
 }
 
 /**
- * The externally visible origin for a given host label + base domain —
- * redirect targets, cookie URLs, and the dev journey's popup URL are always
- * built from config, never from request headers. Scheme-default ports are
- * omitted. Takes the shared {@link GatewayConfig} because the dev-gateway
- * builds public URLs too (the popup URL's auth host) and structurally omits
- * the edge-only fields.
+ * Builds app origins (`<slug>.<baseDomain>`). Control-plane labels (`auth`,
+ * `portal`, …) must use {@link controlOrigin} — passing them here throws so an
+ * unmigrated call site fails in tests instead of emitting `auth.<appsDomain>`.
  */
 export function publicOrigin(config: GatewayConfig, hostLabelOrNull: string | null): string {
+  if (hostLabelOrNull !== null && RESERVED_SUBDOMAINS.has(hostLabelOrNull)) {
+    throw new Error(
+      `publicOrigin() builds app origins; "${hostLabelOrNull}" is a control host, use controlOrigin()`,
+    );
+  }
   const host = hostLabelOrNull ? `${hostLabelOrNull}.${config.baseDomain}` : config.baseDomain;
+  return originFor(config, host);
+}
+
+export type ControlLabel = "auth" | "portal" | "dev-api";
+
+/** Origin for a control-plane host on {@link GatewayConfig.controlDomain}. */
+export function controlOrigin(config: GatewayConfig, label: ControlLabel): string {
+  return originFor(config, `${label}.${config.controlDomain}`);
+}
+
+function originFor(config: GatewayConfig, host: string): string {
   // HTTPS-only: omit the port only when it is the https default (443).
   const port = config.publicPort === 443 ? "" : `:${config.publicPort}`;
   return `${config.publicScheme}://${host}${port}`;

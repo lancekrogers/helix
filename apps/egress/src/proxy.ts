@@ -45,7 +45,7 @@ import {
 } from "@azx-pbc/shared/telemetry";
 import { instruments, tracer } from "./telemetry.js";
 import { egressSpanAttributes } from "./spanAttributes.js";
-import { SsrfBlockedError, makeValidatingConnector } from "./ssrf.js";
+import { SsrfBlockedError, makeValidatingConnector, type ParsedCidr } from "./ssrf.js";
 
 /**
  * `POST /proxy` — the one route that touches plaintext secrets and the public
@@ -61,9 +61,11 @@ export interface ProxyDeps {
   resolver: SecretResolver | null;
   /** null ⇒ replay protection disabled (tests only); prod always sets it. */
   burnStore: InstructionBurnStore | null;
-  limits: { maxBodyBytes: number; timeoutMs: number };
+  limits: { maxBodyBytes: number; timeoutMs: number; llmTimeoutMs: number };
   /** Dev/test seam — permit private/loopback targets (false in prod & adversarial tests). */
   allowPrivate: boolean;
+  /** Deployment-supplied SSRF block ranges (from `EGRESS_EXTRA_BLOCKED_CIDRS`). */
+  extraBlockedCidrs: readonly ParsedCidr[];
   /** Dev/test seam — permit secret injection into a cleartext http target (false in prod). */
   allowInsecureConnection: boolean;
   /**
@@ -256,8 +258,23 @@ type AuthOutcome =
 
 export interface ProxyHandler {
   handler: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
-  /** The shared dispatcher — close it on app teardown to drain pooled sockets. */
+  /** Fetch-path dispatcher — close on app teardown to drain pooled sockets. */
   dispatcher: Agent;
+  /** LLM vendor dispatcher — closed alongside {@link ProxyHandler.dispatcher}. */
+  llmDispatcher: Agent;
+}
+
+// Timeouts after the request reached the upstream. A connect timeout is not
+// here: nothing was sent, so the edge must not charge for it.
+const UPSTREAM_IDLE_TIMEOUT_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+
+function isUpstreamIdleTimeout(err: unknown): boolean {
+  for (let cur: unknown = err, depth = 0; depth < 8 && cur instanceof Error; depth += 1) {
+    const code = (cur as Error & { code?: string }).code;
+    if (typeof code === "string" && UPSTREAM_IDLE_TIMEOUT_CODES.has(code)) return true;
+    cur = cur.cause;
+  }
+  return false;
 }
 
 export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
@@ -268,15 +285,32 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
   // interceptor is composed onto the dispatcher, and we compose none — a plain
   // Agent returns the 3xx verbatim (belt-and-suspenders, `Location` is also
   // stripped by the response blocklist so the browser can't chase it — issue #10).
-  const dispatcher = new Agent({
-    connect: makeValidatingConnector(deps.allowPrivate, deps.limits.timeoutMs),
+  const fetchDispatcher = new Agent({
+    connect: makeValidatingConnector(
+      deps.allowPrivate,
+      deps.limits.timeoutMs,
+      deps.extraBlockedCidrs,
+    ),
     headersTimeout: deps.limits.timeoutMs,
     bodyTimeout: deps.limits.timeoutMs,
+  });
+  const llmDispatcher = new Agent({
+    // The connect budget stays on the normal bound: only the vendor's silence
+    // after the request is sent needs the longer LLM timeout. Same SSRF pin and
+    // extra block list as the fetch dispatcher: an LLM hop is still an outbound
+    // call to a host this plane resolves.
+    connect: makeValidatingConnector(
+      deps.allowPrivate,
+      deps.limits.timeoutMs,
+      deps.extraBlockedCidrs,
+    ),
+    headersTimeout: deps.limits.llmTimeoutMs,
+    bodyTimeout: deps.limits.llmTimeoutMs,
   });
 
   // The delegated resolution, built against the shared
   // dispatcher so the renewer's vendor calls ride the same pinned transport.
-  const delegated = deps.delegated?.(dispatcher) ?? null;
+  const delegated = deps.delegated?.(fetchDispatcher) ?? null;
 
   /**
    * Header reads + instruction verification, and nothing else.
@@ -323,6 +357,27 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
     authenticated: AuthenticatedRequest,
   ): Promise<void> {
     const { instruction, targetRaw, method } = authenticated;
+
+    // The edge hangs up (its own client left, or it hit its deadline): stop waiting for
+    // the vendor. Watch the response, not the request: req.raw 'close' fires once the
+    // inbound body is drained. writableEnded, not writableFinished: light-my-request never
+    // settles the latter.
+    const abort = new AbortController();
+    let clientGone = false;
+    let requestCapTripped = false;
+    const onClose = (): void => {
+      // A request-cap trip destroys req.raw, which may close this socket too. That is our
+      // own cut, not a hang-up, and the catch below must still answer 413.
+      if (reply.raw.writableEnded || requestCapTripped) return;
+      clientGone = true;
+      abort.abort();
+    };
+    reply.raw.once("close", onClose);
+    // proxyHandler awaits authenticate() before this function runs, so the socket can
+    // already be gone and 'close' will never fire again. A destroyed response with no
+    // end() is the same hang-up. Verified with a scratch script on Node 24 (not a unit test:
+    // no deterministic way to hang up in the gap before this listener is attached).
+    if (reply.raw.destroyed && !reply.raw.writableEnded) onClose();
 
     // One-time use: burn the jti before doing any work, so a captured
     // instruction re-POSTed inside its TTL is refused before the secret is
@@ -592,7 +647,6 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
     // Count the request bytes on the way out: a chunked / CL-absent / lying-CL
     // upload can't stream unbounded egress-billed bandwidth past the cap. A trip
     // destroys req.raw and errors the undici upload → the catch maps it to 413.
-    let requestCapTripped = false;
     const requestBody = BODYLESS.has(method)
       ? undefined
       : capBody(req.raw, deps.limits.maxBodyBytes, "request", () => {
@@ -603,11 +657,13 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
       // Dial the real origin: undici pools by origin (keep-alive), derives the
       // Host header and TLS SNI from it, and the connector rewrites the socket
       // target to the validated IP.
+      const hopDispatcher = instruction.capability === "llm" ? llmDispatcher : fetchDispatcher;
       const upstream = await request(target.href, {
         method,
         headers,
         body: requestBody,
-        dispatcher,
+        dispatcher: hopDispatcher,
+        signal: abort.signal,
       });
 
       // Response cap, fast-path: a truthful oversized content-length is rejected
@@ -691,6 +747,15 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
       });
       return reply.send(cappedBody);
     } catch (err) {
+      // The close listener can lose a race to undici rejecting on `abort.signal`; the same
+      // writableEnded / requestCapTripped guards apply.
+      const disconnected =
+        clientGone || (!requestCapTripped && abort.signal.aborted && !reply.raw.writableEnded);
+      if (disconnected) {
+        // Normal event, not a failure: nothing to write to a dead socket and nothing worth a warn.
+        instruments().upstreamAborts.add(1, { [ATTR_CAPABILITY]: instruction.capability });
+        return;
+      }
       if (requestCapTripped) {
         return fail(reply, 413, "too_large", "request body exceeds the size cap");
       }
@@ -698,6 +763,9 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
       // undici propagates it verbatim, so the old upfront-check semantics hold.
       if (err instanceof SsrfBlockedError) {
         return fail(reply, 403, "blocked", err.message);
+      }
+      if (isUpstreamIdleTimeout(err)) {
+        return fail(reply, 502, "upstream_timeout", "upstream request timed out");
       }
       // Everything else — a transport failure, a timeout, or undici refusing a
       // header it considers invalid — reaches the app as an opaque 502, which
@@ -779,7 +847,17 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
       // false. Read naively that records "a successful 200 the app hung up on"
       // — a plausible, complete fiction, on the one plane where "the client
       // gave up" and "we broke" send an operator down different paths.
-      const outcome = threw ? "error" : String(reply.getHeader(OUTCOME_HEADER) ?? "ok");
+      const clientDisconnected = !threw && !reply.raw.writableEnded;
+      const headersCommitted = reply.raw.headersSent;
+      let outcome: string | undefined = threw
+        ? "error"
+        : String(reply.getHeader(OUTCOME_HEADER) ?? "ok");
+      // Fastify's default statusCode is 200 and the default outcome is `ok` even when
+      // nothing was written — omit both when the client left before any upstream
+      // response was committed.
+      if (clientDisconnected && !headersCommitted) {
+        outcome = undefined;
+      }
 
       // A refusal returns normally through `fail()`, so the `catch` above never
       // sees it and the span would otherwise end UNSET — including on a 5xx.
@@ -794,16 +872,17 @@ export function makeProxyHandler(deps: ProxyDeps): ProxyHandler {
           [ATTR_OUTCOME]: outcome,
           // Omitted rather than guessed when we threw — the status the caller
           // will actually see is written by the error handler, later.
-          [ATTR_UPSTREAM_STATUS]: threw ? undefined : reply.statusCode,
-          [ATTR_CLIENT_DISCONNECTED]: !threw && !reply.raw.writableEnded ? true : undefined,
+          [ATTR_UPSTREAM_STATUS]:
+            threw || (clientDisconnected && !headersCommitted) ? undefined : reply.statusCode,
+          [ATTR_CLIENT_DISCONNECTED]: clientDisconnected ? true : undefined,
         }),
       );
-      instruments().proxyDuration.record(performance.now() - startedAt, {
-        [ATTR_OUTCOME]: outcome,
-      });
+      const durationAttrs: Record<string, string> = {};
+      if (outcome !== undefined) durationAttrs[ATTR_OUTCOME] = outcome;
+      instruments().proxyDuration.record(performance.now() - startedAt, durationAttrs);
       span.end();
     }
   }
 
-  return { handler: proxyHandler, dispatcher };
+  return { handler: proxyHandler, dispatcher: fetchDispatcher, llmDispatcher };
 }

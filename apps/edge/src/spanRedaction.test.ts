@@ -1,22 +1,42 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import { DataCapabilitySchema, INTERNAL_AUTH_HEADER } from "@azx-pbc/shared";
 import { hashDevToken } from "@azx-pbc/shared/devToken";
 import { spanUrlAttributes } from "@azx-pbc/shared/logging";
-import { FORBIDDEN_URL_ATTRS } from "@azx-pbc/shared/telemetry";
-import { SPAN_CONSENT_STATUS_DEV, SPAN_CONSENT_STATUS_EDGE } from "@azx-pbc/shared/telemetry";
+import {
+  ATTR_REASON,
+  ATTR_USAGE_BASIS,
+  CUT_CHARGE_BASES,
+  FORBIDDEN_URL_ATTRS,
+  SPAN_CONSENT_STATUS_DEV,
+  SPAN_CONSENT_STATUS_EDGE,
+  SPAN_FETCH,
+  SPAN_LLM,
+  SPAN_LEGACY_APP_REDIRECT,
+  ATTR_APP_ID,
+  ATTR_OUTCOME,
+} from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "./telemetry.js";
 import { buildApp } from "./app.js";
 import { buildDevGateway } from "./devGateway/app.js";
 import type { DevTokenStore } from "./devGateway/devTokenStore.js";
 import { SESSION_COOKIE } from "./auth/cookies.js";
 import { hashSessionToken, newSessionToken } from "./auth/sessions.js";
-import { testAuthConfig, testDevGatewayConfig, testEdgeConfig } from "./test/config.js";
+import {
+  SPLIT_CONTROL_DOMAIN,
+  splitEdgeConfig,
+  testAuthConfig,
+  testDevGatewayConfig,
+  testEdgeConfig,
+} from "./test/config.js";
+import { until } from "./test/socket.js";
 import {
   FakeAppDataStore,
   FakeBlobReader,
+  FakeLlmProvider,
   FakeOidcClient,
   FakePortalProvider,
   FakeRegistry,
@@ -24,6 +44,10 @@ import {
   FakeUsageStore,
   registryEntry,
 } from "./test/fakes.js";
+import { LlmProviderError } from "./gateway/provider.js";
+import { InMemoryLeaseStore } from "./gateway/leaseStore.js";
+import { deriveInstructionKey } from "./gateway/instruction.js";
+import type { EgressProvider, EgressResponse } from "./gateway/egressProvider.js";
 
 /**
  * ADR-0037 decision 10's redaction case — the direct sibling of
@@ -311,6 +335,52 @@ describe("span attributes never carry a credential", () => {
       // And the route is still identifiable — `url.path` only, no query.
       const routeSpan = recording.spans().find((s) => s.name === "helix.auth.connections.proxy");
       expect(routeSpan?.attributes["url.path"]).toBe("/connections/callback");
+    });
+  });
+
+  describe("the legacy app host redirect", () => {
+    const PLANTED_SLUG = "planted-legacy-slug";
+    const PLANTED_TOKEN = "PLANTED-LEGACY-REDIRECT-TOKEN";
+    const PLANTED_CODE = "PLANTED-LEGACY-REDIRECT-CODE";
+    const APP_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    it("records only bounded attributes and never the query, host, slug or path", async () => {
+      const app = buildApp({
+        config: splitEdgeConfig({ legacyAppRedirect: true }),
+        registry: new FakeRegistry([
+          registryEntry({
+            appId: APP_ID,
+            slug: PLANTED_SLUG,
+            blobPrefix: "apps/b/1/",
+          }),
+        ]),
+        blob: new FakeBlobReader(),
+      });
+      const res = await app.inject({
+        method: "GET",
+        url: `/secret-path?token=${PLANTED_TOKEN}&code=${PLANTED_CODE}`,
+        headers: { host: `${PLANTED_SLUG}.${SPLIT_CONTROL_DOMAIN}` },
+      });
+      expect(res.statusCode).toBe(307);
+      await app.close();
+
+      const span = recording.spans().find((s) => s.name === SPAN_LEGACY_APP_REDIRECT);
+      expect(span).toBeDefined();
+      expect(Object.keys(span?.attributes ?? {}).sort()).toEqual([
+        ATTR_APP_ID,
+        ATTR_OUTCOME,
+        "http.route",
+      ]);
+      const dump = JSON.stringify(recording.spans().map((s) => s.attributes));
+      for (const secret of [
+        PLANTED_TOKEN,
+        PLANTED_CODE,
+        PLANTED_SLUG,
+        "secret-path",
+        SPLIT_CONTROL_DOMAIN,
+      ]) {
+        expect(dump, `leaked ${secret}`).not.toContain(secret);
+      }
     });
   });
 
@@ -641,5 +711,540 @@ describe("span attributes never carry a credential", () => {
         }
       }
     });
+  });
+});
+
+describe("LLM admission denials", () => {
+  const APP_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const HOST = "deny.local.helix.azxlabs.io";
+  const ORIGIN = `https://${HOST}:8080`;
+  const MODEL = "claude-opus-4-8";
+  const PLANTED_PROMPT = "PLANTED-PROMPT-FRAGMENT-admission-deny";
+  const PLANTED_OID = "oid-planted-admission-deny";
+
+  it("never leaks prompt, oid, or URL on spans or admission-denied metrics", async () => {
+    const sessions = new FakeSessionStore();
+    const usage = new FakeUsageStore();
+    usage.spendTodayMicro = 1_000_000;
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "deny",
+          blobPrefix: "apps/e/3/",
+          llm: { models: [MODEL], dollarsPerDay: 1 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: new FakeLlmProvider(),
+      usage,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+      },
+    });
+    expect(res.statusCode).toBe(429);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump, "leaked the planted prompt").not.toContain(PLANTED_PROMPT);
+      expect(dump, "leaked the planted oid").not.toContain(PLANTED_OID);
+      expect(dump, "leaked a URL query").not.toContain("?");
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(llmSpan?.attributes[ATTR_REASON]).toBe("app_budget_day");
+  });
+
+  it("never leaks prompt, oid, or URL on a platform ceiling refusal", async () => {
+    const sessions = new FakeSessionStore();
+    const usage = new FakeUsageStore();
+    usage.platformSpendTodayMicro = 2_000_000;
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({
+        auth: testAuthConfig(),
+        allowUnauthenticated: false,
+        llm: {
+          endpoint: "https://api.anthropic.com",
+          path: "/v1/messages",
+          anthropicVersion: "2023-06-01",
+          connection: "anthropic",
+          openai: {
+            endpoint: "https://api.openai.com",
+            path: "/v1/chat/completions",
+            connection: "openai",
+          },
+          defaultDollarsPerDay: 50,
+          platformDollarsPerDay: 1,
+          maxAppInFlight: 0,
+          maxUserInFlight: 0,
+          maxInFlight: 0,
+          maxCallMs: 600_000,
+        },
+      }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "deny",
+          blobPrefix: "apps/e/3/",
+          llm: { models: [MODEL], dollarsPerDay: 10 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: new FakeLlmProvider(),
+      usage,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+      },
+    });
+    expect(res.statusCode).toBe(503);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_PROMPT);
+      expect(dump).not.toContain(PLANTED_OID);
+      expect(dump).not.toContain("?");
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(llmSpan?.attributes[ATTR_REASON]).toBe("platform_ceiling");
+  });
+
+  it("never leaks prompt, oid, or lease scope on a concurrency cap refusal", async () => {
+    const sessions = new FakeSessionStore();
+    const leases = new InMemoryLeaseStore();
+    let resume!: () => void;
+    const hold = new Promise<void>((r) => {
+      resume = r;
+    });
+    const provider = new FakeLlmProvider();
+    provider.onDelta = async () => {
+      await hold;
+    };
+    const usage = new FakeUsageStore();
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({
+        auth: testAuthConfig(),
+        allowUnauthenticated: false,
+        llm: {
+          endpoint: "https://api.anthropic.com",
+          path: "/v1/messages",
+          anthropicVersion: "2023-06-01",
+          connection: "anthropic",
+          openai: {
+            endpoint: "https://api.openai.com",
+            path: "/v1/chat/completions",
+            connection: "openai",
+          },
+          defaultDollarsPerDay: 50,
+          platformDollarsPerDay: 0,
+          maxAppInFlight: 1,
+          maxUserInFlight: 0,
+          maxInFlight: 0,
+          maxCallMs: 600_000,
+        },
+      }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "deny",
+          blobPrefix: "apps/e/3/",
+          llm: { models: [MODEL], dollarsPerDay: 10 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: provider,
+      usage,
+      leases,
+    });
+
+    void app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+        stream: true,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+      },
+    });
+    resume();
+    expect(res.statusCode).toBe(503);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_PROMPT);
+      expect(dump).not.toContain(PLANTED_OID);
+      expect(dump).not.toContain("llm:user:");
+      expect(dump).not.toContain("?");
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(llmSpan?.attributes[ATTR_REASON]).toBe("concurrency_app");
+  });
+});
+
+describe("fetch admission denials", () => {
+  const APP_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const HOST = "demo.local.helix.azxlabs.io";
+  const ORIGIN = `https://${HOST}:8080`;
+  const PLANTED_PATH = "PLANTED-FETCH-PATH-SEGMENT";
+  const PLANTED_OID = "oid-planted-fetch-deny";
+  const FETCH_URL = `/_api/fetch/https://api.github.com/${PLANTED_PATH}`;
+
+  class SlowEgress implements EgressProvider {
+    calls = 0;
+    delayMs = 300;
+    async proxy(): Promise<EgressResponse> {
+      this.calls += 1;
+      await new Promise((r) => setTimeout(r, this.delayMs));
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Readable.from([Buffer.from("{}")]),
+        outcome: "ok",
+      };
+    }
+    async close(): Promise<void> {}
+  }
+
+  it("never leaks oid, scope, or path content on a concurrency cap refusal", async () => {
+    const sessions = new FakeSessionStore();
+    const leases = new InMemoryLeaseStore();
+    const egress = new SlowEgress();
+    const instructionKey = deriveInstructionKey(randomBytes(32));
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Deny",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({
+        auth: testAuthConfig(),
+        allowUnauthenticated: false,
+        fetch: {
+          egressUrl: "http://egress.test",
+          instructionSecret: randomBytes(32),
+          timeoutMs: 30_000,
+          maxBodyBytes: 10 * 1024 * 1024,
+          maxAppInFlight: 1,
+        },
+      }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "demo",
+          blobPrefix: "apps/f/1/",
+          visibilityMode: "public",
+          fetch: {
+            connections: new Map([["https://api.github.com", { kind: "keyless" }]]),
+            requestsPerDay: null,
+            shim: false,
+          },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      usage: new FakeUsageStore(),
+      egress,
+      instructionKey,
+      leases,
+    });
+
+    const headers = {
+      host: HOST,
+      "sec-fetch-mode": "cors",
+      origin: ORIGIN,
+      cookie: `${SESSION_COOKIE}=${token}`,
+    };
+    const first = app.inject({ method: "GET", url: FETCH_URL, headers });
+    await new Promise((r) => setTimeout(r, 50));
+    await until(() => egress.calls === 1, "first fetch in flight");
+    const res = await app.inject({ method: "GET", url: FETCH_URL, headers });
+    expect(res.statusCode).toBe(429);
+    await first;
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_OID);
+      expect(dump).not.toContain("fetch:app:");
+      expect(dump).not.toContain("?");
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    const fetchSpan = recording.spans().find((s) => s.name === SPAN_FETCH);
+    expect(fetchSpan?.attributes[ATTR_REASON]).toBe("concurrency_app");
+  });
+});
+
+describe("cut and failed LLM gateway calls", () => {
+  const APP_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const HOST = "cut.local.helix.azxlabs.io";
+  const ORIGIN = `https://${HOST}:8080`;
+  const MODEL = "claude-opus-4-8";
+  const PLANTED_PROMPT = "PLANTED-PROMPT-FRAGMENT-cut-charge";
+  const PLANTED_OID = "oid-planted-cut-charge";
+
+  it("never leaks prompt, oid, URL, or scope on spans or cut-charge metrics", async () => {
+    const sessions = new FakeSessionStore();
+    const provider = new FakeLlmProvider();
+    provider.errorAfterDeltas = new LlmProviderError("openai stream ended without a usage block");
+    provider.deltas = ["x"];
+    const usage = new FakeUsageStore();
+    const id = randomUUID();
+    await sessions.createPending({
+      id,
+      appId: APP_ID,
+      user: {
+        oid: PLANTED_OID,
+        displayName: "Cut Charge",
+        name: null,
+        email: null,
+        kind: "user",
+        groups: [],
+      },
+      refreshDueAt: new Date(Date.now() + 60_000),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    const token = newSessionToken();
+    await sessions.redeem(id, APP_ID, hashSessionToken(token));
+
+    const app = buildApp({
+      config: testEdgeConfig({ auth: testAuthConfig(), allowUnauthenticated: false }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "cut",
+          blobPrefix: "apps/d/2/",
+          llm: { models: [MODEL], dollarsPerDay: 1 },
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+      sessions,
+      oidc: new FakeOidcClient(),
+      llmProvider: provider,
+      usage,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/_api/llm/chat",
+      headers: {
+        host: HOST,
+        "sec-fetch-mode": "cors",
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${SESSION_COOKIE}=${token}`,
+      },
+      payload: {
+        model: MODEL,
+        messages: [{ role: "user", content: PLANTED_PROMPT }],
+        stream: true,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump, "leaked the planted prompt").not.toContain(PLANTED_PROMPT);
+      expect(dump, "leaked the planted oid").not.toContain(PLANTED_OID);
+      expect(dump, "leaked a URL query").not.toContain("?");
+      expect(dump, "leaked a lease scope").not.toMatch(/llm:(app|user):/);
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    const llmSpan = recording.spans().find((s) => s.name === SPAN_LLM);
+    expect(CUT_CHARGE_BASES).toContain(llmSpan?.attributes[ATTR_USAGE_BASIS]);
+  });
+});
+
+describe("POST /_csp-report", () => {
+  const PLANTED_CSP_SECRET = "PLANTED-CSP-SECRET";
+  const PLANTED_DOC = "PLANTED-CSP-DOC-URI";
+  const APP_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+  it("never records blocked or document URIs on spans or metrics", async () => {
+    recording.reset();
+    const app = buildApp({
+      config: testEdgeConfig({ allowUnauthenticated: true }),
+      registry: new FakeRegistry([
+        registryEntry({
+          appId: APP_ID,
+          slug: "csp",
+          blobPrefix: "apps/csp/1/",
+        }),
+      ]),
+      blob: new FakeBlobReader(),
+    });
+    await app.inject({
+      method: "POST",
+      url: "/_csp-report",
+      headers: { host: "csp.local.helix.azxlabs.io", "content-type": "application/csp-report" },
+      payload: JSON.stringify({
+        "csp-report": {
+          "effective-directive": "img-src",
+          "blocked-uri": `https://x.example/?token=${PLANTED_CSP_SECRET}`,
+          "document-uri": `https://csp.local.helix.azxlabs.io/?doc=${PLANTED_DOC}`,
+        },
+      }),
+    });
+    await app.close();
+
+    const spanDump = JSON.stringify(recording.spans().map((s) => s.attributes));
+    const metricDump = JSON.stringify((await recording.metrics()).map((p) => p.attributes));
+    for (const dump of [spanDump, metricDump]) {
+      expect(dump).not.toContain(PLANTED_CSP_SECRET);
+      expect(dump).not.toContain(PLANTED_DOC);
+    }
+    for (const span of recording.spans()) {
+      for (const key of Object.keys(span.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
+    for (const point of await recording.metrics()) {
+      for (const key of Object.keys(point.attributes)) {
+        expect(FORBIDDEN_URL_ATTRS, `${key} is a whole-URL attribute`).not.toContain(key);
+      }
+    }
   });
 });

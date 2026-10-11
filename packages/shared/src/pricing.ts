@@ -59,7 +59,14 @@ export interface ModelPrice {
    * per-model fact rather than a per-provider one.
    */
   structuredOutputs?: boolean;
+  /** Max input tokens the upstream accepts in one request (context window). */
+  contextWindowTokens: number;
+  /** Max output tokens the upstream can bill in one request (vendor limit). */
+  maxOutputTokens: number;
 }
+
+/** Output cap Anthropic requests use when the client omits `maxTokens` (edge provider). */
+export const ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 1024;
 
 /**
  * Current catalog rates (USD / 1M tokens). Update here on a pricing change and
@@ -98,18 +105,24 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     provider: "anthropic",
     cacheReadMultiplier: 0.025,
     structuredOutputs: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 64_000,
   },
   "claude-fable-5": {
     inputPerMTok: 10,
     outputPerMTok: 50,
     provider: "anthropic",
     structuredOutputs: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 64_000,
   },
   "claude-opus-5": {
     inputPerMTok: 5,
     outputPerMTok: 25,
     provider: "anthropic",
     structuredOutputs: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 64_000,
   },
   // Sonnet 5's $2/$10 was introductory pricing through 2026-08-31; Anthropic made
   // it the standard price and cancelled the scheduled rise to $3/$15. This is now
@@ -119,16 +132,38 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     outputPerMTok: 10,
     provider: "anthropic",
     structuredOutputs: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 64_000,
   },
   "claude-opus-4-8": {
     inputPerMTok: 5,
     outputPerMTok: 25,
     provider: "anthropic",
     structuredOutputs: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 64_000,
   },
-  "claude-opus-4-7": { inputPerMTok: 5, outputPerMTok: 25, provider: "anthropic" },
-  "claude-opus-4-6": { inputPerMTok: 5, outputPerMTok: 25, provider: "anthropic" },
-  "claude-sonnet-4-6": { inputPerMTok: 3, outputPerMTok: 15, provider: "anthropic" },
+  "claude-opus-4-7": {
+    inputPerMTok: 5,
+    outputPerMTok: 25,
+    provider: "anthropic",
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 8192,
+  },
+  "claude-opus-4-6": {
+    inputPerMTok: 5,
+    outputPerMTok: 25,
+    provider: "anthropic",
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 8192,
+  },
+  "claude-sonnet-4-6": {
+    inputPerMTok: 3,
+    outputPerMTok: 15,
+    provider: "anthropic",
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 8192,
+  },
   // Near-term churn: haiku-4-5's only two Foundry versions both stop serving
   // 2026-10-19 (measured eastus2 2026-09-16). Not a cut — first-party serving
   // is unaffected — but expect the Foundry deployments to need a successor.
@@ -137,6 +172,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     outputPerMTok: 5,
     provider: "anthropic",
     structuredOutputs: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 64_000,
   },
   // OpenAI. Every model here resolves to a snapshot new enough for `response_format`
   // json_schema (that floor is `gpt-4o-2024-08-06`), so `structuredOutputs` is set
@@ -154,6 +191,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   "gpt-5.6-sol": {
     inputPerMTok: 4,
@@ -162,6 +201,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   "gpt-5.6-terra": {
     inputPerMTok: 2,
@@ -170,6 +211,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   "gpt-5.6-luna": {
     inputPerMTok: 0.2,
@@ -178,6 +221,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   "gpt-5.1": {
     inputPerMTok: 1.25,
@@ -186,6 +231,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   "gpt-5-mini": {
     inputPerMTok: 0.25,
@@ -194,6 +241,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   "gpt-5-nano": {
     inputPerMTok: 0.05,
@@ -202,6 +251,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
     reasoning: true,
     minCompletionTokens: 25_000,
     structuredOutputs: true,
+    contextWindowTokens: 400_000,
+    maxOutputTokens: 128_000,
   },
   // Previous generations, kept curated so a deployed app's manifest keeps working.
   // Rates re-verified 2026-09-14 and unchanged.
@@ -212,19 +263,37 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // they could never ride the one-flag Foundry path, and the current generation
   // covers their price points first-party. A manifest still naming one gets the
   // edge's `model_not_allowed` (no price configured) — the cut is the break.
-  "gpt-4o": { inputPerMTok: 2.5, outputPerMTok: 10, provider: "openai", structuredOutputs: true },
-  "gpt-4.1": { inputPerMTok: 2, outputPerMTok: 8, provider: "openai", structuredOutputs: true },
+  "gpt-4o": {
+    inputPerMTok: 2.5,
+    outputPerMTok: 10,
+    provider: "openai",
+    structuredOutputs: true,
+    contextWindowTokens: 128_000,
+    maxOutputTokens: 16_384,
+  },
+  "gpt-4.1": {
+    inputPerMTok: 2,
+    outputPerMTok: 8,
+    provider: "openai",
+    structuredOutputs: true,
+    contextWindowTokens: 1_047_576,
+    maxOutputTokens: 32_768,
+  },
   "gpt-4.1-mini": {
     inputPerMTok: 0.4,
     outputPerMTok: 1.6,
     provider: "openai",
     structuredOutputs: true,
+    contextWindowTokens: 1_047_576,
+    maxOutputTokens: 32_768,
   },
   "gpt-4.1-nano": {
     inputPerMTok: 0.1,
     outputPerMTok: 0.4,
     provider: "openai",
     structuredOutputs: true,
+    contextWindowTokens: 1_047_576,
+    maxOutputTokens: 32_768,
   },
 };
 
@@ -237,9 +306,50 @@ export const CACHE_READ_MULTIPLIER = 0.1;
 /** Cache-write tokens bill at 1.25x the base input rate (5-minute TTL — our default). */
 export const CACHE_WRITE_MULTIPLIER = 1.25;
 
+/** Default floor for reasoning models' `max_completion_tokens` (see `openAiRequestBody`). */
+export const REASONING_MIN_COMPLETION_TOKENS_DEFAULT = 25_000;
+
 /** Look up the rate for a model; undefined when unpriced (UI flags rather than showing $0). */
 export function priceForModel(model: string): ModelPrice | undefined {
   return MODEL_PRICING[model];
+}
+
+/** Context and output limits for a priced model; undefined when the model is not in the catalog. */
+export function limitsForModel(
+  model: string,
+): Pick<ModelPrice, "contextWindowTokens" | "maxOutputTokens"> | undefined {
+  const price = MODEL_PRICING[model];
+  if (!price) return undefined;
+  return {
+    contextWindowTokens: price.contextWindowTokens,
+    maxOutputTokens: price.maxOutputTokens,
+  };
+}
+
+/**
+ * Output tokens a cut-call estimate may bill when `maxTokens` is unset — mirrors the
+ * gateway's request builders so a hang-up is never charged more than a completed call.
+ */
+export function outputTokenCapForEstimate(model: string, maxTokens?: number): number {
+  const price = priceForModel(model);
+  if (!price) return maxTokens ?? 0;
+  const limits = limitsForModel(model)!;
+  if (price.reasoning) {
+    const floor = price.minCompletionTokens ?? REASONING_MIN_COMPLETION_TOKENS_DEFAULT;
+    const authorized = Math.max(maxTokens ?? floor, floor);
+    return Math.min(authorized, limits.maxOutputTokens);
+  }
+  if (maxTokens !== undefined) {
+    return Math.min(maxTokens, limits.maxOutputTokens);
+  }
+  if (price.provider === "anthropic") {
+    return Math.min(ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS, limits.maxOutputTokens);
+  }
+  if (price.reasoning) {
+    const floor = price.minCompletionTokens ?? REASONING_MIN_COMPLETION_TOKENS_DEFAULT;
+    return Math.min(floor, limits.maxOutputTokens);
+  }
+  return limits.maxOutputTokens;
 }
 
 /**

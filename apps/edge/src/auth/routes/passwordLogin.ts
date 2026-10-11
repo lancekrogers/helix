@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { AuthConfig, EdgeConfig } from "../../config.js";
-import { publicOrigin } from "../../config.js";
+import { controlOrigin } from "../../config.js";
 import type { RegistryEntry, RegistryReader } from "../../registry/projection.js";
 import { sendNotFound } from "../../errors.js";
 import { resolveServingEntry } from "./appHost.js";
@@ -58,7 +58,7 @@ const LOGIN_CSP = `${AUTH_PAGE_CSP}; form-action 'self'`;
 
 /** The OIDC start URL for this app — a password app also admits any SSO user. */
 function ssoStartUrl(rt: PasswordLoginRuntime, slug: string, rd: string): string {
-  const url = new URL(`${publicOrigin(rt.config, "auth")}/start`);
+  const url = new URL(`${controlOrigin(rt.config, "auth")}/start`);
   url.searchParams.set("app", slug);
   url.searchParams.set("rd", rd);
   return url.toString();

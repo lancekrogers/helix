@@ -71,6 +71,7 @@ import { appPageHtml } from "./appFixture.js";
  */
 
 const BASE = "local.helix.azxlabs.io";
+const APPS = process.env.HELIX_APPS_DOMAIN?.trim().toLowerCase() || BASE;
 const AUTH_HOST = `auth.${BASE}`;
 /** The app user: a dev-IdP fixture identity, so the portal login and the edge
  * session agree on one `oid` (the cross-plane principal, ADR-0048). */
@@ -287,15 +288,15 @@ export class LaneWorld {
     return this.#idp.issuer;
   }
 
-  /** The callback URL every plane derives: the edge builds it from its config
-   * (publicOrigin(config, "auth")), the portal from APP_PUBLIC_BASE — the lane
-   * sets both to this one value. */
+  /** The callback URL every plane derives: the edge builds it with
+   * `controlOrigin(config, "auth")`; the portal builds it from
+   * `CONTROL_PUBLIC_BASE`. */
   get callbackUrl(): string {
     return `https://${AUTH_HOST}:${this.edgeTlsPort}${CONNECTIONS_CALLBACK_PATH}`;
   }
 
   appHost(slug: string): string {
-    return `${slug}.${BASE}`;
+    return `${slug}.${APPS}`;
   }
 
   appOrigin(slug: string): string {
@@ -417,10 +418,11 @@ export class LaneWorld {
     }
 
     // ── The one lane TLS cert: the edge's dev hosts + the vendor fronts ──
+    const appsSan = APPS !== BASE ? `,DNS:*.${APPS},DNS:${APPS}` : "";
     execSync(
       `openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 2 -nodes ` +
         `-subj "/CN=local.helix.azxlabs.io" ` +
-        `-addext "subjectAltName=DNS:*.local.helix.azxlabs.io,DNS:local.helix.azxlabs.io,DNS:localhost"`,
+        `-addext "subjectAltName=DNS:*.local.helix.azxlabs.io,DNS:local.helix.azxlabs.io,DNS:localhost${appsSan}"`,
       { cwd: this.#certDir, stdio: "pipe" },
     );
 
@@ -478,7 +480,10 @@ export class LaneWorld {
     process.env.PORTAL_SECRET ??= "lane-portal-secret-lane-portal-secret-32b";
     process.env.HELIX_INTERNAL_SECRET ??= internalSecret().toString("utf8");
     process.env.HELIX_EXCHANGE_SECRET ??= exchangeSecret().toString("utf8");
-    process.env.APP_PUBLIC_BASE = `https://${BASE}:${this.edgeTlsPort}`;
+    process.env.APP_PUBLIC_BASE = `https://${APPS}:${this.edgeTlsPort}`;
+    if (APPS !== BASE) {
+      process.env.CONTROL_PUBLIC_BASE = `https://${BASE}:${this.edgeTlsPort}`;
+    }
     process.env.EDGE_PUBLIC_PORT = String(this.edgeTlsPort);
 
     // ── Egress: the delegated wiring on the helix_egress role ──
@@ -501,9 +506,10 @@ export class LaneWorld {
         retireSweepIntervalMs: 60_000,
         instructionSecret: this.instructionSecret,
         exchangeSecret: exchangeSecret(),
-        limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 10_000 },
+        limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 10_000, llmTimeoutMs: 60_000 },
         managedIdentityConnections: [],
         allowPrivate: true,
+        extraBlockedCidrs: [],
         allowInsecureConnection: true,
       },
       resolver: null,
@@ -565,6 +571,8 @@ export class LaneWorld {
     this.#sessionStore = new PgSessionStore(roleUrl("helix_edge"), { max: 4 });
     const edge = buildEdgeApp({
       config: testEdgeConfig({
+        baseDomain: APPS,
+        controlDomain: BASE,
         auth: testAuthConfig({ allowInsecureIdp: true }),
         allowUnauthenticated: false,
         publicPort: this.edgeTlsPort,
@@ -573,6 +581,7 @@ export class LaneWorld {
           instructionSecret: this.instructionSecret,
           timeoutMs: 10_000,
           maxBodyBytes: 1024 * 1024,
+          maxAppInFlight: 0,
         },
         internalSecret: internalSecret(),
         portalUrl: `http://127.0.0.1:${this.#portalPort}`,
@@ -612,6 +621,7 @@ export class LaneWorld {
     await this.#idp?.close();
     delete process.env.PORTAL_EGRESS_URL;
     delete process.env.APP_PUBLIC_BASE;
+    delete process.env.CONTROL_PUBLIC_BASE;
     delete process.env.EDGE_PUBLIC_PORT;
     rmSync(this.#certDir, { recursive: true, force: true });
     try {

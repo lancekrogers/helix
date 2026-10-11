@@ -87,14 +87,23 @@ services:
       # `*.local.helix.azxlabs.io` is a platform-owned wildcard that resolves to
       # 127.0.0.1 (see the DNS note in the repo docs) — a controlled replacement
       # for the third-party `localtest.me`. The mkcert wildcard cert below matches.
-      EDGE_BASE_DOMAIN: local.helix.azxlabs.io
+      # Optional HELIX_APPS_DOMAIN (read by Compose when the dev container is
+      # created — export it in the shell that starts the container, or put it in
+      # `.devcontainer/.env`; `.env.local` is only an env_file and does not feed
+      # substitution) moves hosted apps to a second loopback domain while the
+      # control plane stays on `local.helix.azxlabs.io`. Unset means single-domain
+      # dev unchanged.
+      HELIX_APPS_DOMAIN: ${HELIX_APPS_DOMAIN:-}
+      EDGE_BASE_DOMAIN: ${HELIX_APPS_DOMAIN:-local.helix.azxlabs.io}
+      EDGE_CONTROL_DOMAIN: ${HELIX_APPS_DOMAIN:+local.helix.azxlabs.io}
       # The portal half of the same topology, served to the prebuilt SPA at
       # runtime by GET /api/v1/config (and used for the `url` on every app the
       # API returns). Set here so local dev exercises the real path rather than
       # the built-in fallback. The dev gateway is a separate process on :8082
       # (`pnpm dev:devgw`) — blank this out to see the "dev mode isn't enabled"
       # state the SPA shows when a deployment skips it.
-      APP_PUBLIC_BASE: https://local.helix.azxlabs.io:8080
+      APP_PUBLIC_BASE: https://${HELIX_APPS_DOMAIN:-local.helix.azxlabs.io}:8080
+      CONTROL_PUBLIC_BASE: ${HELIX_APPS_DOMAIN:+https://local.helix.azxlabs.io:8080}
       DEV_API_PUBLIC_BASE: https://dev-api.local.helix.azxlabs.io:8082
       # M3 edge app-user auth, against the local dev IdP (`pnpm dev:idp`).
       # Dev-only well-known values, mirrored in apps/dev-idp fixtures.
@@ -109,8 +118,8 @@ services:
       # (crypto.randomUUID, SubtleCrypto) need a secure context. In-container
       # Node trusts the CA via NODE_EXTRA_CA_CERTS; the host browser sees a
       # self-signed cert — accept it once (or trust certs/caroot/rootCA.pem).
-      EDGE_TLS_CERT_FILE: /workspace/.devcontainer/certs/local-helix.pem
-      EDGE_TLS_KEY_FILE: /workspace/.devcontainer/certs/local-helix-key.pem
+      EDGE_TLS_CERT_FILE: /workspace/.devcontainer/certs/local-helix${HELIX_APPS_DOMAIN:+-split}.pem
+      EDGE_TLS_KEY_FILE: /workspace/.devcontainer/certs/local-helix${HELIX_APPS_DOMAIN:+-split}-key.pem
       NODE_EXTRA_CA_CERTS: /workspace/.devcontainer/certs/caroot/rootCA.pem
       # M4.5 helix-egress mechanism plane (`pnpm dev:egress`, :8081). It connects
       # as the least-privilege helix_egress role (created by db-init/01-roles.sql)

@@ -7,6 +7,7 @@ import type { BlobReader } from "./blob/client.js";
 import type { RegistryFreshnessReader, RegistryReader } from "./registry/projection.js";
 import { registryFreshnessCheck } from "./registry/health.js";
 import { classifyHost, type HostClass } from "./routing/hosts.js";
+import { makeLegacyRedirectHook } from "./routing/legacyRedirect.js";
 import { trustProxyCheck, wireTrustProxyHealth } from "./routing/trustProxyHealth.js";
 import { makeAssetHandler } from "./serving/assets.js";
 import { makeVisitRecorder, type VisitStore } from "./serving/visits.js";
@@ -28,6 +29,8 @@ import {
 import { LoginThrottle } from "./auth/loginThrottle.js";
 import { IpRateLimiter } from "./gateway/ipRateLimiter.js";
 import { InMemoryCounterStore } from "./gateway/counterStore.js";
+import { InMemoryLeaseStore, type LeaseStore } from "./gateway/leaseStore.js";
+import { ReplicaGate } from "./gateway/replicaGate.js";
 import { makeCallerResolver, makeSessionGate } from "./auth/gate.js";
 import { makeSameOriginCheck } from "./auth/validate.js";
 import { makeLlmHandler } from "./gateway/llm.js";
@@ -44,7 +47,8 @@ import { makeConnectionStatusHandler } from "./routing/connectionStatus.js";
 import type { PortalProvider } from "./routing/portalProvider.js";
 import { deriveInternalKey } from "./internalJwt.js";
 import { makeCspReportHandler, type CspReportStore } from "./serving/cspReport.js";
-import { CSP_REPORT_PATH, buildAppCsp } from "./serving/csp.js";
+import { CspReportInsertThrottle } from "./serving/cspReportThrottle.js";
+import { CSP_REPORT_PATH, applyAppCsp } from "./serving/csp.js";
 import {
   SW_PATH,
   SW_SCOPE_PARAM,
@@ -98,12 +102,16 @@ export interface EdgeDeps {
   instructionKey?: Buffer | null;
   /** CSP-violation report sink (§6.2); null = accept-and-drop. */
   cspReports?: CspReportStore | null;
+  /** Per-app report INSERT cap; tests inject a low-threshold one. */
+  cspReportInsertThrottle?: CspReportInsertThrottle | null;
   /** Visit sink for the owner's Visitors view (ADR-0050); null = not recorded. */
   visits?: VisitStore | null;
   /** Shared-password login throttle; tests inject a low-threshold one. */
   loginThrottle?: LoginThrottle | null;
   /** Anonymous-tier per-IP gateway limiter; tests inject a low-threshold one. */
   anonRateLimiter?: IpRateLimiter | null;
+  /** In-flight LLM lease store; server injects PG-backed, tests may override. */
+  leases?: LeaseStore | null;
   /** Dev TLS material (server.ts reads the mkcert files); tests omit it. */
   https?: { cert: Buffer; key: Buffer } | null;
 }
@@ -211,12 +219,14 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
   // single-process dev / tests working without a DB (both fallbacks share it —
   // keys are namespaced, so no collision).
   const fallbackCounters = new InMemoryCounterStore();
+  const fallbackLeases = new InMemoryLeaseStore();
   const anonRateLimiter =
     deps.anonRateLimiter ?? new IpRateLimiter(config.anonRateLimit, fallbackCounters);
   // Always in-memory, including in prod (see the class docblock): this damps
   // ledger write amplification, it is not a security budget, so a per-replica
   // count is fine and a DB round-trip on the abusive path would be self-defeating.
   const denialThrottle = new DenialThrottle(fallbackCounters);
+  const cspReportInsertThrottle = new CspReportInsertThrottle(fallbackCounters);
   const recordVisit = deps.visits
     ? makeVisitRecorder({
         store: deps.visits,
@@ -266,6 +276,15 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
           anonLimiter: anonRateLimiter,
           provider: deps.llmProvider ?? null,
           usage: deps.usage ?? null,
+          denialThrottle,
+          platformCeilingDollars: config.llm.platformDollarsPerDay,
+          concurrency: {
+            leases: deps.leases ?? fallbackLeases,
+            gate: new ReplicaGate(config.llm.maxInFlight),
+            maxAppInFlight: config.llm.maxAppInFlight,
+            maxUserInFlight: config.llm.maxUserInFlight,
+          },
+          maxCallMs: config.llm.maxCallMs,
         }
       : null;
   const handleLlmChat = llmRuntime ? makeLlmHandler(llmRuntime) : null;
@@ -302,6 +321,10 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
           egress: deps.egress ?? null,
           usage: deps.usage ?? null,
           instructionKey: deps.instructionKey ?? null,
+          concurrency: {
+            leases: deps.leases ?? fallbackLeases,
+            maxAppInFlight: config.fetch.maxAppInFlight,
+          },
         })
       : null;
   // The CSP report sink is unauthenticated (browsers send no credentials with
@@ -309,6 +332,7 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
   const handleCspReport = makeCspReportHandler({
     registry: deps.registry,
     store: deps.cspReports ?? null,
+    insertThrottle: deps.cspReportInsertThrottle ?? cspReportInsertThrottle,
   });
 
   // The auth-host `/connections/*` reverse proxy. The
@@ -369,8 +393,17 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
 
   app.decorateRequest("hostClass");
   app.addHook("onRequest", async (req) => {
-    req.hostClass = classifyHost(req.headers.host, config.baseDomain);
+    req.hostClass = classifyHost(
+      req.headers.host,
+      config.baseDomain,
+      config.controlDomain,
+      config.legacyAppRedirect,
+    );
   });
+
+  if (config.legacyAppRedirect) {
+    app.addHook("onRequest", makeLegacyRedirectHook({ config, registry: deps.registry }));
+  }
 
   // The trust-proxy self-report (ADR-0011): watch whether the forwarded walk
   // ever moves, so a well-formed EDGE_TRUST_PROXY pointed at the wrong network
@@ -788,9 +821,10 @@ export function buildApp(deps: EdgeDeps): FastifyInstance {
       // own execution context — served bare, its fetch() would be unbounded by
       // `connect-src 'self'`. This keeps the worker inside the same data-flow
       // containment as the page it serves.
-      reply.header("content-security-policy", buildAppCsp(entry.externalOrigins));
-      // The one route on the platform that emits this. The script lives at
-      // `/_helix/`, so its default max scope is `/_helix/` — controlling the
+      applyAppCsp(reply, entry.externalOrigins, config);
+      // The one route on the platform that emits this for app hosts (proxied
+      // vendor responses strip it — see RESPONSE_HEADER_BLOCKLIST). The script
+      // lives at `/_helix/`, so its default max scope is `/_helix/` — controlling the
       // app's prefix requires widening it explicitly. Here the value is the
       // *granted* scope, which the projection already re-validated (never root,
       // never a `_` namespace); the claimed scope only had to match it.

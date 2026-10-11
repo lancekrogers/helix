@@ -24,6 +24,11 @@ Its outputs (`edgeOidcClientId`, `portalOidcAudience`, `azxWebClientId`,
 `azxCliClientId`) are exactly the params the `../azure` stack needs — deploy this
 first, capture the outputs, pass them in.
 
+A **new** install's `edgeRedirectUris` use the **control** domain
+(`https://auth.<control domain>/callback`); the portal SPA uses `portal.<control domain>`. An
+existing install that adds `hostedAppsDomain` later does **not** change Entra registrations —
+sign-in and vendor callbacks stay on the control domain.
+
 ## Why each non-obvious property is there
 
 Every one of these is a gotcha we hit by hand (see the runbook for the war

@@ -68,11 +68,15 @@ credential rotations arbitrate the same way: the loser's sealed material is
 released, not stranded.
 
 **The fixed callback URL.** The providers list shows the deployment's single
-OAuth callback — `https://auth.<apps base>/connections/callback` — with a copy
-button and the instruction to register that exact value with the vendor. The
-portal derives it at runtime from the apps base by the reserved-subdomain
-convention; it is never a build-time variable, and one value serves every
-provider (ADR-0031 decision 10).
+OAuth callback — `https://auth.<control base>/connections/callback`, from
+`CONTROL_PUBLIC_BASE` (defaulting to the apps base in single-domain layout) —
+with a copy button and the instruction to register that exact value with the
+vendor. One configured value serves every provider (ADR-0031 decision 10).
+
+After a domain-split cutover, confirm `callbackUrl` in `GET /api/v1/providers`
+matches `https://auth.<EDGE_CONTROL_DOMAIN>/connections/callback` on the edge.
+That check is the only way to spot an edge/portal mismatch before vendor OAuth
+fails (**unverified in Azure** until you run it on your install).
 
 ## JSON import / export
 

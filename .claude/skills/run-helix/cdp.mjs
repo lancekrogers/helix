@@ -34,25 +34,39 @@ export function findChrome() {
  * Launch headless Chromium and attach one page session.
  * Returns a handle with navigate/evaluate/screenshot plus captured page errors.
  */
-export async function launchBrowser({ port = 9411 } = {}) {
+export async function launchBrowser({
+  port = 9411,
+  ignoreCertErrors = false,
+  baseDomain,
+  hostRules,
+} = {}) {
   const bin = findChrome();
   if (!bin) throw new Error("no cached Chromium found (set HELIX_SMOKE_CHROME)");
 
-  const child = spawn(
-    bin,
-    [
-      "--headless=new",
-      "--no-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-      "--hide-scrollbars",
-      "--window-size=1280,720",
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${mkdtempSync(join(tmpdir(), "helix-smoke-"))}`,
-      "about:blank",
-    ],
-    { stdio: "ignore" },
-  );
+  const rules = hostRules ?? (baseDomain ? [baseDomain] : []).filter(Boolean);
+
+  const chromeArgs = [
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--hide-scrollbars",
+    "--window-size=1280,720",
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${mkdtempSync(join(tmpdir(), "helix-smoke-"))}`,
+    "about:blank",
+  ];
+  if (ignoreCertErrors) {
+    chromeArgs.push("--ignore-certificate-errors");
+  }
+  if (rules.length) {
+    const resolver = rules
+      .flatMap((domain) => [`MAP *.${domain} 127.0.0.1`, `MAP ${domain} 127.0.0.1`])
+      .join(", ");
+    chromeArgs.push(`--host-resolver-rules=${resolver}`);
+  }
+
+  const child = spawn(bin, chromeArgs, { stdio: "ignore" });
 
   let version;
   for (let i = 0; i < 80; i++) {
@@ -113,9 +127,23 @@ export async function launchBrowser({ port = 9411 } = {}) {
   // Collected per-navigation; the caller clears between routes.
   const errors = [];
   const failedRequests = [];
+  const cspReportPosts = [];
+  const sent = new Map();
+  const extra = new Map();
+  const reqHeaders = new Map();
+  const pushHop = (m, k, v) => m.set(k, [...(m.get(k) ?? []), v]);
   listeners.add((msg) => {
     if (msg.sessionId !== sessionId) return;
-    if (msg.method === "Runtime.exceptionThrown") {
+    if (msg.method === "Network.requestWillBeSent") {
+      const url = msg.params?.request?.url ?? "";
+      pushHop(sent, msg.params.requestId, url);
+      pushHop(reqHeaders, msg.params.requestId, msg.params?.request?.headers ?? {});
+      if (url.includes("/_csp-report") && msg.params.request.postData) {
+        cspReportPosts.push(msg.params.request.postData);
+      }
+    } else if (msg.method === "Network.requestWillBeSentExtraInfo") {
+      pushHop(extra, msg.params.requestId, msg.params.headers ?? {});
+    } else if (msg.method === "Runtime.exceptionThrown") {
       const d = msg.params.exceptionDetails;
       errors.push(d.exception?.description ?? d.text);
     } else if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
@@ -147,9 +175,24 @@ export async function launchBrowser({ port = 9411 } = {}) {
   return {
     errors,
     failedRequests,
+    cspReportPosts,
     reset() {
       errors.length = 0;
       failedRequests.length = 0;
+      cspReportPosts.length = 0;
+      sent.clear();
+      extra.clear();
+      reqHeaders.clear();
+    },
+    requestLog() {
+      const lower = (h = {}) =>
+        Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]));
+      return [...sent].flatMap(([id, urls]) =>
+        urls.map((url, i) => ({
+          url,
+          headers: lower(extra.get(id)?.[i] ?? reqHeaders.get(id)?.[i]),
+        })),
+      );
     },
     async navigate(url, settleMs = 2000) {
       const loaded = waitForLoad();

@@ -1,10 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { SignJWT } from "jose";
 import { request as undiciRequest } from "undici";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { startRecordingTelemetry, type RecordingTelemetry } from "@azx-pbc/telemetry/testing";
 import {
   INSTRUCTION_AUDIENCE,
   INSTRUCTION_HEADER,
@@ -13,11 +14,13 @@ import {
   OUTCOME_HEADER,
   TARGET_HEADER,
 } from "@azx-pbc/shared";
+import { ATTR_CAPABILITY, INSTR_EGRESS_UPSTREAM_ABORTS } from "@azx-pbc/shared/telemetry";
 import { buildApp } from "./app.js";
 import type { EgressConfig } from "./config.js";
 import { deriveInstructionKey } from "./instruction.js";
 import type { ResolvedConnection, SecretResolver } from "./secrets.js";
 import { InMemoryBurnStore, type InstructionBurnStore } from "./burn.js";
+import { parseCidrList } from "./ssrf.js";
 
 /**
  * The adversarial pass the fetch-proxy demands (fetch-proxy design §6): SSRF to
@@ -100,10 +103,12 @@ function makeApp(
   allowPrivate: boolean,
   allowInsecureConnection = true,
   burnStore: InstructionBurnStore | null = null,
+  extraBlockedCidrs: EgressConfig["extraBlockedCidrs"] = [] as EgressConfig["extraBlockedCidrs"],
 ) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000 },
+    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5000, llmTimeoutMs: 30_000 },
     allowPrivate,
+    extraBlockedCidrs,
     // Loopback echo upstreams are http, so the cleartext-injection seam is open
     // for most tests; the issue #11 suite closes it to assert the prod guard.
     allowInsecureConnection,
@@ -143,6 +148,8 @@ describe("egress SSRF hardening", () => {
     "http://127.0.0.1/secret",
     "http://10.0.0.5/internal",
     "http://[::1]/loopback",
+    "http://168.63.129.16/",
+    "http://[::ffff:a83f:8110]/",
   ]) {
     it(`refuses ${new URL(target).host}`, async () => {
       const app = makeApp(false);
@@ -161,6 +168,72 @@ describe("egress SSRF hardening", () => {
       await app.close();
     });
   }
+
+  it("refuses a target in EGRESS_EXTRA_BLOCKED_CIDRS", async () => {
+    const app = makeApp(
+      false,
+      true,
+      null,
+      parseCidrList("198.19.0.0/16", "EGRESS_EXTRA_BLOCKED_CIDRS"),
+    );
+    const target = "http://198.19.0.1/";
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(new URL(target).origin),
+        [TARGET_HEADER]: target,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe("blocked");
+    await app.close();
+  });
+
+  it("applies EGRESS_EXTRA_BLOCKED_CIDRS on the llm dispatcher too", async () => {
+    // The llm capability rides its own dispatcher (longer idle timeout). It must
+    // carry the same validating connector, extra block list included. The range
+    // here is not in the built-in list, so only the extra list can refuse it.
+    const app = makeApp(
+      false,
+      true,
+      null,
+      parseCidrList("203.0.114.0/24", "EGRESS_EXTRA_BLOCKED_CIDRS"),
+    );
+    const target = "http://203.0.114.1/";
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(new URL(target).origin, undefined, "llm"),
+        [TARGET_HEADER]: target,
+        [METHOD_HEADER]: "POST",
+      },
+      payload: "{}",
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe("blocked");
+    await app.close();
+  });
+
+  it("returns a blocked-address message for the Azure platform IP (no dial)", async () => {
+    const app = makeApp(false);
+    const target = "http://168.63.129.16/";
+    const res = await app.inject({
+      method: "POST",
+      url: "/proxy",
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(new URL(target).origin),
+        [TARGET_HEADER]: target,
+        [METHOD_HEADER]: "GET",
+      },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe("blocked");
+    expect(res.json().message).toMatch(/blocked address/);
+    await app.close();
+  });
 });
 
 describe("egress header smuggling", () => {
@@ -476,8 +549,19 @@ describe("egress body-size cap (issue #8)", () => {
   let capOrigin: string;
   let app: ReturnType<typeof buildApp>;
   let base: string;
+  let recording: RecordingTelemetry;
+
+  async function metricTotal(name: string, match: Record<string, string>): Promise<number> {
+    const points = await recording.metrics();
+    return points
+      .filter(
+        (m) => m.name === name && Object.entries(match).every(([k, v]) => m.attributes[k] === v),
+      )
+      .reduce((sum, m) => sum + m.value, 0);
+  }
 
   beforeAll(async () => {
+    recording = startRecordingTelemetry();
     upstream = createServer((req, res) => {
       if (req.url === "/large") {
         // 320 bytes, chunked (no content-length) — the headline bypass.
@@ -501,15 +585,18 @@ describe("egress body-size cap (issue #8)", () => {
     capOrigin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 
     const config = {
-      limits: { maxBodyBytes: CAP, timeoutMs: 5000 },
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000, llmTimeoutMs: 30_000 },
       allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     } as EgressConfig;
     // Body-size cap suite: replay protection is orthogonal, so no burn store.
     app = buildApp({ config, resolver, instructionKey: key, burnStore: null });
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   });
+  afterEach(() => recording.reset());
   afterAll(async () => {
+    await recording.restore();
     await app.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
   });
@@ -595,6 +682,119 @@ describe("egress body-size cap (issue #8)", () => {
     expect(json.code).toBe("too_large");
     expect(res.headers[OUTCOME_HEADER]).toBe("refusal");
     expect(received).toBe(0); // never forwarded
+  });
+
+  it("does not count a request-cap trip as an upstream abort", async () => {
+    const chunks: string[] = [];
+    const capture = new Writable({
+      write(chunk: unknown, _enc: BufferEncoding, cb: (e?: Error | null) => void) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const config = {
+      limits: { maxBodyBytes: CAP, timeoutMs: 5000, llmTimeoutMs: 30_000 },
+      allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
+    } as EgressConfig;
+    const capApp = buildApp(
+      { config, resolver, instructionKey: key, burnStore: null },
+      { level: "warn", stream: capture },
+    );
+    await capApp.listen({ port: 0, host: "127.0.0.1" });
+    const capBase = `http://127.0.0.1:${(capApp.server.address() as AddressInfo).port}`;
+
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    received = 0;
+    const body = Readable.from([bytes(64), bytes(64), bytes(64), bytes(64)]);
+    let status = 0;
+    let threw = false;
+    try {
+      const res = await undiciRequest(`${capBase}/proxy`, {
+        method: "POST",
+        headers: {
+          [INSTRUCTION_HEADER]: await mint(capOrigin),
+          [TARGET_HEADER]: `${capOrigin}/sink`,
+          [METHOD_HEADER]: "POST",
+        },
+        body,
+      });
+      status = res.statusCode;
+      await res.body.text().catch(() => {});
+    } catch {
+      threw = true;
+    }
+    expect(threw || status === 413).toBe(true);
+    const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    expect(after).toBe(before);
+    expect(chunks.join("")).not.toContain("upstream request failed");
+    await capApp.close();
+  });
+
+  it("counts a client hang-up mid-upload as an upstream abort", async () => {
+    const chunks: string[] = [];
+    const capture = new Writable({
+      write(chunk: unknown, _enc: BufferEncoding, cb: (e?: Error | null) => void) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const config = {
+      limits: { maxBodyBytes: CAP * 4, timeoutMs: 5000, llmTimeoutMs: 30_000 },
+      allowPrivate: true,
+      extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
+    } as EgressConfig;
+    const capApp = buildApp(
+      { config, resolver, instructionKey: key, burnStore: null },
+      { level: "warn", stream: capture },
+    );
+    await capApp.listen({ port: 0, host: "127.0.0.1" });
+    const capBase = `http://127.0.0.1:${(capApp.server.address() as AddressInfo).port}`;
+
+    const before = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+      [ATTR_CAPABILITY]: "fetch",
+    });
+    received = 0;
+    const ac = new AbortController();
+    let pushed = 0;
+    const slowBody = new Readable({
+      read() {
+        if (pushed++ >= 3) return;
+        this.push(bytes(16));
+      },
+    });
+    const pending = undiciRequest(`${capBase}/proxy`, {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        [INSTRUCTION_HEADER]: await mint(capOrigin),
+        [TARGET_HEADER]: `${capOrigin}/sink`,
+        [METHOD_HEADER]: "POST",
+      },
+      body: slowBody,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    ac.abort();
+    try {
+      await pending;
+    } catch {
+      // hang-up mid-upload
+    }
+    await vi.waitFor(
+      async () => {
+        const after = await metricTotal(INSTR_EGRESS_UPSTREAM_ABORTS, {
+          [ATTR_CAPABILITY]: "fetch",
+        });
+        expect(after - before).toBe(1);
+      },
+      { timeout: 2000, interval: 25 },
+    );
+    expect(chunks.join("")).not.toContain("upstream request failed");
+    await capApp.close();
   });
 });
 

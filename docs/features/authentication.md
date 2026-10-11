@@ -18,10 +18,11 @@ and Entra in production. Issuer settings select the environment; see the
 
 ## App-user auth (the edge)
 
-**What it is.** A central OIDC callback on `auth.<base>` does the code exchange once; a
-single-use **handoff token** carries the result to the app subdomain, which mints a
-`__Host-session` cookie backed by a server-side, revocable session row. Every asset and
-`/_api/*` call on an app host then passes a per-request **session gate**.
+**What it is.** A central OIDC callback on `auth.<control domain>` does the code exchange once; a
+single-use **handoff token** carries the result to the app host on the apps domain, which mints a
+`__Host-session` cookie backed by a server-side, revocable session row. In a single-domain install
+the control and apps domains are the same, so this reads as today's `auth.<base>` → `<slug>.<base>`
+flow. Every asset and `/_api/*` call on an app host then passes a per-request **session gate**.
 
 ### The flow (Appendix A, steps 1–8)
 
@@ -47,6 +48,53 @@ single-use **handoff token** carries the result to the app subdomain, which mint
 Single-use is enforced two ways (defense in depth): the JWS `aud` check **and** the store's
 atomic `appId`+`tokenHash IS NULL` predicate — either alone defeats replay and audience
 confusion.
+
+### Control and apps domains
+
+An install may serve hosted apps on a **separate domain** from the control hosts (`auth.`,
+`portal.`, `dev-api.`). The edge reads `EDGE_BASE_DOMAIN` as the apps domain and
+`EDGE_CONTROL_DOMAIN` as the control domain (unset defaults to the apps domain — single-domain
+layout). The portal reads `APP_PUBLIC_BASE` for app URLs and, when split,
+`CONTROL_PUBLIC_BASE` for the control origin (unset defaults to `APP_PUBLIC_BASE`). Bicep sets both
+from one parameter pair when `hostedAppsDomain` is configured.
+
+**Host classification** (`apps/edge/src/routing/hosts.ts`): only `auth.<controlDomain>` is the
+auth host. Under the apps suffix, `auth.<appsDomain>` is **platform**, never auth — the adversarial
+tests pin that property. With `EDGE_LEGACY_APP_REDIRECT` on (split only), `<slug>.<controlDomain>`
+classifies as `legacy-app` and may receive a 307 to the same path on the apps domain (GET/HEAD,
+paths not starting with `_`).
+
+**Which helper builds which URL** (`apps/edge/src/config.ts`): `controlOrigin(config, "auth" |
+"portal" | "dev-api")` builds auth-host URLs — `/start`, the OIDC redirect URI, the vendor
+`/connections/callback`, silent-refresh restarts. `publicOrigin(config, slug)` builds app origins —
+the handoff target `/_auth/complete`, the Origin check, password login, consent popup targets.
+`publicOrigin` throws if passed a reserved label (`auth`, `portal`, …) so unmigrated call sites
+fail in tests rather than emitting `auth.<appsDomain>`.
+
+The handoff redirect is a **cross-site top-level navigation** when the domains differ.
+`SameSite=Lax` does not block it; cookies stay **host-only** (`__Host-`, no `Domain`), so their
+scope does not widen. The Origin and Fetch Metadata guard (`apps/edge/src/auth/validate.ts`)
+accepts only `same-origin`; both `same-site` and `cross-site` are refused, so moving a sibling
+app from same-site to cross-site changes nothing for `/_api/*`.
+
+**Boot rules:** `controlDomain` and `appsDomain` must each be a valid hostname. They may be equal
+(single-domain layout) or the control domain may be a **parent** of the apps domain (the delegated
+subdomain case — that zone must be on the Public Suffix List or the two remain the same site). The
+control domain must **not** be a subdomain of the apps domain. The apps domain must not be on or
+under `auth.`, `portal.`, or `dev-api.` of the control domain. The edge cannot verify Public Suffix
+List membership without a new dependency; it logs the split at boot and the operator documentation
+states the PSL requirement for delegated apps zones.
+
+**Recorded browser check (dev container, Chromium 156 headless):** navigation from
+`<slug>.helix-apps.localhost` to `auth.local.helix.azxlabs.io` reported `Sec-Fetch-Site:
+cross-site`. The same-site pair `apps.local.helix.azxlabs.io` with control
+`local.helix.azxlabs.io` reported `same-site`; in that pair a `Domain=<control domain>` cookie set
+from the app host was observed reaching `auth.<control>`. Only Chromium was measured.
+
+**Not tested:** Safari ITP, Firefox ETP, and Chrome bounce-tracking mitigations on real domains; a
+real Public Suffix List entry and live DNS delegation; certificate issuance and two wildcard
+bindings on one Container App (**unverified in Azure**); the TLS what-if canary with two bindings;
+certbot behind the firewall tier on a split install.
 
 ### The session gate (`apps/edge/src/auth/gate.ts`)
 
@@ -114,7 +162,7 @@ app host** (no auth host, no handoff), so the OIDC review surface is untouched.
   password is for externals; internal users just sign in. So `resolveAppForAuth` admits password
   apps into the OIDC flow (only `public` is excluded — it has no session), the callback's
   `visibilityAllows` lets any authenticated user through, and the login page links to
-  `auth.<base>/start?app=…`. An SSO session on a password app behaves like any other (real
+  `auth.<control domain>/start?app=…`. An SSO session on a password app behaves like any other (real
   identity + groups, silent refresh): the gate's refresh/visibility redirects target the auth
   host, while only the *cold* redirect picks the password form — a password session never reaches
   a refresh (its `refreshDueAt == expiresAt`).
@@ -184,6 +232,14 @@ Anything touching this path changes its tests **in lockstep**:
   open-redirect, cookie tossing, state/nonce tampering, expired/alg-confused tokens, fixation.
 - `apps/edge/src/auth/flow.integration.test.ts` and `sessions.integration.test.ts` — the real
   flow against an ephemeral dev-idp, including the concurrent-redeem race and `prompt=none`.
+- Split-layout coverage (local Chromium / in-process fixtures unless noted): `routing/hosts.test.ts`
+  (auth only on `auth.<control>`; `auth.<apps>` is platform); `config.test.ts` (boot validation and
+  `EDGE_LEGACY_APP_REDIRECT` polarity); `routing/legacyRedirect.test.ts` (307 rules and open-redirect
+  safety); `auth/validate.test.ts` and `auth/gate.test.ts` (Origin and gate redirects across
+  domains); `auth/flow.integration.test.ts` (full handoff against dev-idp); `auth/adversarial.test.ts`
+  (auth-host impersonation on the apps domain and cross-domain cookie scope); `routing/consentStart.test.ts`
+  and `routing/connectionsProxy.test.ts` (control callback URL; `auth.<apps>` does not proxy);
+  `devGateway/consentStart.test.ts` (popup URL on the control domain).
 
 ---
 

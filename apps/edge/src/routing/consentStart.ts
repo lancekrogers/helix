@@ -22,7 +22,7 @@ import {
   ROUTE_CONSENT_START,
   SPAN_CONSENT_START,
 } from "@azx-pbc/shared/telemetry";
-import { publicOrigin, type EdgeConfig } from "../config.js";
+import { controlOrigin, publicOrigin, type EdgeConfig } from "../config.js";
 import { sendForbidden, sendNotFound } from "../errors.js";
 import { SESSION_COOKIE, parseCookieHeader } from "../auth/cookies.js";
 import { hashSessionToken, type Session, type SessionStore } from "../auth/sessions.js";
@@ -317,7 +317,7 @@ export function makeConsentStartHandler(rt: ConsentStartRuntime) {
         openerOrigin: appOrigin,
         // From the edge's own auth-host origin — the single source of the
         // callback URL.
-        callbackUrl: `${publicOrigin(rt.config, "auth")}/connections/callback`,
+        callbackUrl: `${controlOrigin(rt.config, "auth")}/connections/callback`,
       });
 
       // Abort the consult if the popup goes away — watching the *response*,

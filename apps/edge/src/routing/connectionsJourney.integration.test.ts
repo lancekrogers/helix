@@ -267,7 +267,7 @@ async function seedFixture(
     visibility: { mode: "internal" },
   });
   expect(created.statusCode).toBe(201);
-  const appId = created.body.id as string;
+  const appId = (created.body as { id: string }).id;
   await seedLiveVersion(appId);
 
   // The provider row(s) — created through the portal's real route, so the
@@ -735,9 +735,10 @@ beforeAll(async () => {
       retireSweepIntervalMs: 60_000,
       instructionSecret: INSTRUCTION_SECRET,
       exchangeSecret: EXCHANGE_SECRET,
-      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000 },
+      limits: { maxBodyBytes: 1024 * 1024, timeoutMs: 5_000, llmTimeoutMs: 30_000 },
       managedIdentityConnections: [],
       allowPrivate: true,
+      extraBlockedCidrs: [],
       allowInsecureConnection: true,
     },
     resolver: null,
@@ -823,6 +824,7 @@ beforeAll(async () => {
         instructionSecret: INSTRUCTION_SECRET,
         timeoutMs: 10_000,
         maxBodyBytes: 1024 * 1024,
+        maxAppInFlight: 0,
       },
       internalSecret: INTERNAL_SECRET,
       portalUrl: portalBaseUrl,
@@ -846,6 +848,7 @@ beforeAll(async () => {
         instructionSecret: INSTRUCTION_SECRET,
         timeoutMs: 10_000,
         maxBodyBytes: 1024 * 1024,
+        maxAppInFlight: 0,
       },
       internalSecret: INTERNAL_SECRET,
       portalUrl: portalBaseUrl,
@@ -1184,7 +1187,7 @@ describe("two approved apps share one connection", () => {
       visibility: { mode: "internal" },
     });
     expect(created.statusCode).toBe(201);
-    const appIdB = created.body.id as string;
+    const appIdB = (created.body as { id: string }).id;
     await seedLiveVersion(appIdB);
     const put = await portalApi("PUT", `/api/v1/apps/${bSlug}/manifest`, "owner", {
       capabilities: {

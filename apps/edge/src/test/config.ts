@@ -57,6 +57,7 @@ export function testManagedIdentityBlob(overrides: Partial<AzureBlobConfig> = {}
 export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     databaseUrl: "postgresql://unused",
     blob: testBlobConfig(),
     auth: null,
@@ -66,6 +67,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
     // disallow path override these to false.
     allowPublicApps: true,
     allowPasswordApps: true,
+    legacyAppRedirect: false,
     publicScheme: "https",
     publicPort: 8080,
     tls: null,
@@ -81,9 +83,18 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
         path: "/v1/chat/completions",
         connection: "openai",
       },
+      defaultDollarsPerDay: 50,
+      platformDollarsPerDay: 0,
+      maxAppInFlight: 0,
+      maxUserInFlight: 0,
+      maxInFlight: 0,
+      maxCallMs: 600_000,
     },
     // Off by default in unit tests; suites that exercise it pass a low `max`.
     anonRateLimit: { max: 0, windowMs: 60_000 },
+    imgSrcExtra: [],
+    imgSrcReportOnly: false,
+    imgSrcAllowAll: false,
     // Default: trust nothing (the socket peer is the client), as in prod until
     // EDGE_TRUST_PROXY names the ingress address.
     trustProxy: false,
@@ -94,6 +105,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
       instructionSecret: null,
       timeoutMs: 30_000,
       maxBodyBytes: 10 * 1024 * 1024,
+      maxAppInFlight: 0,
     },
     // Edge→portal mint key unset by default; the consult suites set it.
     internalSecret: null,
@@ -113,6 +125,7 @@ export function testEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig 
 export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}): DevGatewayConfig {
   return {
     baseDomain: "local.helix.azxlabs.io",
+    controlDomain: "local.helix.azxlabs.io",
     tls: null,
     reconcileIntervalMs: 60_000,
     statementTimeoutMs: 10_000,
@@ -131,12 +144,19 @@ export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}):
         path: "/v1/chat/completions",
         connection: "openai",
       },
+      defaultDollarsPerDay: 50,
+      platformDollarsPerDay: 0,
+      maxAppInFlight: 0,
+      maxUserInFlight: 0,
+      maxInFlight: 0,
+      maxCallMs: 600_000,
     },
     fetch: {
       egressUrl: null,
       instructionSecret: null,
       timeoutMs: 30_000,
       maxBodyBytes: 10 * 1024 * 1024,
+      maxAppInFlight: 0,
     },
     internalSecret: null,
     portalUrl: null,
@@ -147,4 +167,24 @@ export function testDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}):
     },
     ...overrides,
   };
+}
+
+/** Distinct registrable domain from legacy `local.helix.azxlabs.io` so split auth URLs differ from single-domain fixtures. */
+export const SPLIT_CONTROL_DOMAIN = "helix-control.localhost";
+export const SPLIT_APPS_DOMAIN = "helix-apps.localhost";
+
+export function splitEdgeConfig(overrides: Partial<EdgeConfig> = {}): EdgeConfig {
+  return testEdgeConfig({
+    baseDomain: SPLIT_APPS_DOMAIN,
+    controlDomain: SPLIT_CONTROL_DOMAIN,
+    ...overrides,
+  });
+}
+
+export function splitDevGatewayConfig(overrides: Partial<DevGatewayConfig> = {}): DevGatewayConfig {
+  return testDevGatewayConfig({
+    baseDomain: SPLIT_APPS_DOMAIN,
+    controlDomain: SPLIT_CONTROL_DOMAIN,
+    ...overrides,
+  });
 }

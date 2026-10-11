@@ -69,6 +69,9 @@ by the mappers.
    (`apps/portal/src/routes/apps.ts`), validated through `CapabilitiesSchema`. The PUT is a full
    **replace**, but it is **not** committed wholesale — it is routed through the approval
    write-gate (next section), which splits it into a part that commits now and a part that waits.
+   The same classifier runs on optional `capabilities` in `POST /api/v1/apps`: baseline deltas land
+   on the new row, elevated ones open a pending request, and the response carries
+   `{ app, applied, pending }` like a manifest PUT.
 2. **Project** — the committed `capabilities` JSONB lands in `apps`, and the edge's LISTEN/NOTIFY
    projection picks it up (`apps/edge/src/registry/projection.ts`, parsing `llm`/`data`/`fetch`
    fail-closed). The live registry entry now carries `entry.llm` / `entry.data` / `entry.fetch`.
@@ -115,7 +118,7 @@ SPA's pre-submit warning never drift:
 | Area | Baseline (applies now) | Elevated (needs approval) | Risk |
 |---|---|---|---|
 | LLM models | `CURATED_LLM_MODELS` (= every model in `MODEL_PRICING`: the `claude-*` family plus the OpenAI `gpt-*` models) | any other model | med |
-| LLM budget | `dollarsPerDay ≤ BASELINE_DOLLARS_PER_DAY` ($50) | above threshold | med |
+| LLM budget | `dollarsPerDay ≤ BASELINE_DOLLARS_PER_DAY` ($50) | above threshold; also a **brand-new** `llm` grant with no `dollarsPerDay` (unset counts as unlimited vs effective none) | med |
 | data scopes | user store, collections, shared keys (literal) | shared read/write **prefixes** (ADR-0042 — one element covers unboundedly many runtime-chosen keys; a write prefix is refused without a `writesPerDay` budget, so the grant and its bound approve together) | low |
 | data budgets | writes/bytes ≤ thresholds | above threshold | med |
 | mcp | `CURATED_MCP_ALLOWLIST` (**empty** ⇒ *every* MCP grant elevates) | any MCP server | high |
@@ -149,9 +152,15 @@ Two invariants keep it safe without being annoying (`docs/design/approvals.md` �
 - **Reducing privilege is always baseline** — removing a grant, shrinking a budget, public→internal
   never needs approval; only increases gate. For visibility the rule is really *crossing the tenant
   boundary*: `group → internal` widens access and is still baseline, because `internal` is the
-  baseline trust level and the default. Subtle corollary: an **unset budget is unlimited**
-  (the edge only enforces a defined cap), so *removing* a cap is a privilege increase and gates,
-  while *adding* one is a reduction and commits.
+  baseline trust level and the default. **LLM spend cap:** at the edge, an unset
+  `dollarsPerDay` is enforced at the install default (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY`, $50/day
+  unless changed); **data and fetch** daily caps, when unset in the manifest, stay unlimited at the
+  gateway (only a defined cap is enforced on those paths). The classifier cannot read that knob, so a *requested* unset cap is treated as
+  possibly unlimited and *removing* an explicit LLM cap gates; *adding* a cap (including unset →
+  any number) is a reduction and commits when the new cap is at or under the $50 baseline. **Unset
+  data and fetch budgets** remain unlimited (those paths only enforce a defined cap), so removing
+  those caps is still a privilege increase and gates, while *adding* any budget is a reduction and
+  commits.
 - **Any elevated part makes the whole submission one atomic request** (the reviewer sees the full
   diff), with `risk` = the max across its deltas.
 

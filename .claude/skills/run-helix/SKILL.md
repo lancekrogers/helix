@@ -34,7 +34,37 @@ node .claude/skills/run-helix/smoke.mjs --offset 2000   # a different isolated s
 node .claude/skills/run-helix/smoke.mjs --offset 0      # share the dev ports + database
 ```
 
-Groups: `idp`, `portal`, `edge`, `egress`, `spa`, `browser`, `cli`.
+Groups: `idp`, `portal`, `edge`, `egress`, `spa`, `browser`, `cli`, `split-tls`, `split`.
+
+### Split-domain mode
+
+Set `HELIX_APPS_DOMAIN` (for example `helix-apps.localhost`) to host apps on a second loopback domain while the control plane stays on `local.helix.azxlabs.io`. A full smoke run then includes the `split` group (HTTP login, browser `Sec-Fetch-Site`, cookie scope, silent refresh). Run only that group with `--only split`:
+
+```bash
+HELIX_APPS_DOMAIN=helix-apps.localhost node .claude/skills/run-helix/smoke.mjs
+HELIX_APPS_DOMAIN=helix-apps.localhost node .claude/skills/run-helix/smoke.mjs --only split
+```
+
+The run writes `sec-fetch-site.json` in its artifact directory with the handoff and API `Sec-Fetch-Site` values Chromium sent. If `.localhost` is classified as `same-site` with the control domain, the runner records **HYPOTHESIS REFUTED**, skips unverified cross-site checks, and you should also run the same-site fallback pair:
+
+```bash
+HELIX_APPS_DOMAIN=apps.local.helix.azxlabs.io node .claude/skills/run-helix/smoke.mjs --only split
+```
+
+Without a cached Chromium (`HELIX_SMOKE_CHROME` or Playwright’s binary), browser checks in the `split` group report SKIP — they are not counted as passes.
+
+Connections consent popups in split mode are exercised by `pnpm lane:connections` with the same variable, not in the smoke runner.
+
+Create the split TLS pair once per dev container (or when `local-helix-split.pem` is missing):
+
+```bash
+CAROOT=/workspace/.devcontainer/certs/caroot mkcert \
+  -cert-file /workspace/.devcontainer/certs/local-helix-split.pem \
+  -key-file /workspace/.devcontainer/certs/local-helix-split-key.pem \
+  "*.local.helix.azxlabs.io" local.helix.azxlabs.io \
+  "*.helix-apps.localhost" helix-apps.localhost \
+  "*.apps.local.helix.azxlabs.io" apps.local.helix.azxlabs.io
+```
 
 Output is one line per check. Screenshots and per-service logs land in a printed temp dir (`/tmp/helix-smoke-*/`) — `signed-out.png`, `dashboard.png`, `apps-list.png`, and `edge.log`, `portal.log`, etc. **Look at the screenshots**; a mounted-but-blank page still passes the DOM assertion.
 

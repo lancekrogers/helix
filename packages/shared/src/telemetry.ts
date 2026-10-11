@@ -37,7 +37,13 @@ export const INSTR_CONSENT_OPERATIONS = "helix.consent.operations";
 export const INSTR_EGRESS_EXCHANGES = "helix.egress.exchanges";
 export const INSTR_EGRESS_RENEWALS = "helix.egress.renewals";
 export const INSTR_EGRESS_RETIREMENTS = "helix.egress.retirements";
+export const INSTR_EGRESS_UPSTREAM_ABORTS = "helix.egress.upstream_aborts";
 export const INSTR_APP_VISITS = "helix.app.visits";
+export const INSTR_LEGACY_APP_REDIRECTS = "helix.edge.legacy_app_redirects";
+export const INSTR_CSP_REPORTS = "helix.edge.csp_reports";
+export const INSTR_GATEWAY_CUT_CHARGES = "helix.gateway.cut_charges";
+export const INSTR_GATEWAY_ADMISSION_DENIED = "helix.gateway.admission_denied";
+export const INSTR_GATEWAY_PLATFORM_SPEND_RATIO = "helix.gateway.platform_spend_ratio";
 
 /**
  * Attribute keys.
@@ -60,6 +66,7 @@ export const ATTR_TARGET_PATH = "helix.target.path";
 export const ATTR_CONNECTION = "helix.connection";
 export const ATTR_UPSTREAM_STATUS = "helix.upstream.status";
 export const ATTR_CLIENT_DISCONNECTED = "helix.client_disconnected";
+export const ATTR_USAGE_BASIS = "helix.usage.basis";
 /**
  * How egress sourced the injected credential — `secret` (a sealed `app_secrets`
  * row), `managed-identity` (a minted Entra token, ADR-0046), or `delegated`
@@ -109,6 +116,10 @@ export const ATTR_PROVIDER_REF = "helix.provider_ref";
 export const ATTR_CONSENT_SWEEP_REMOVED = "helix.consent.sweep_removed";
 /** How many pending consent attempts a disconnect killed. */
 export const ATTR_ATTEMPTS_KILLED = "helix.attempts_killed";
+/** Violated directive on a CSP report, folded to CSP_REPORT_DIRECTIVES. */
+export const ATTR_CSP_DIRECTIVE = "helix.csp.directive";
+/** Whether the report came from an enforced or a Report-Only policy. */
+export const ATTR_CSP_DISPOSITION = "helix.csp.disposition";
 
 /**
  * Span names. Like the instrument names these are queried by humans and by
@@ -129,6 +140,7 @@ export const SPAN_PROVIDERS_RECONCILE = "helix.providers.reconcile";
 export const SPAN_AUTH_START = "helix.auth.oidc.start";
 export const SPAN_AUTH_CALLBACK = "helix.auth.oidc.callback";
 export const SPAN_AUTH_COMPLETE = "helix.auth.handoff.complete";
+export const SPAN_LEGACY_APP_REDIRECT = "helix.edge.legacy_app_redirect";
 export const SPAN_CONNECTIONS_PROXY = "helix.auth.connections.proxy";
 export const SPAN_DEPLOY_BUNDLE = "helix.deploy.bundle";
 export const SPAN_DEPLOY_VALIDATE = "helix.deploy.validate";
@@ -173,6 +185,7 @@ export const ROUTE_DATA = "/_api/data/*";
 export const ROUTE_AUTH_START = "/start";
 export const ROUTE_AUTH_CALLBACK = "/callback";
 export const ROUTE_AUTH_COMPLETE = "/_auth/complete";
+export const ROUTE_LEGACY_APP_REDIRECT = "/*";
 export const ROUTE_CONNECTIONS = "/connections/*";
 export const ROUTE_CONSENT_START = "/_api/connections/:ref/start";
 export const ROUTE_CONSENT_START_DEV = "/:slug/_api/connections/:ref/start";
@@ -222,6 +235,22 @@ export const SESSION_DENIAL_REASONS = [
 export type SessionDenialReason = (typeof SESSION_DENIAL_REASONS)[number];
 
 /**
+ * Why the LLM gateway refused a call before sending it upstream: the `helix.reason`
+ * dimension of `helix.gateway.admission_denied`. Bounded by construction: these are the
+ * refusal branches in `apps/edge/src/gateway/llm.ts`, and a test asserts the set.
+ * `app_budget_day` and `app_budget_burst` are the per-app USD windows.
+ */
+export const ADMISSION_DENIAL_REASONS = [
+  "app_budget_day",
+  "app_budget_burst",
+  "platform_ceiling",
+  "concurrency_app",
+  "concurrency_user",
+  "concurrency_replica",
+] as const;
+export type AdmissionDenialReason = (typeof ADMISSION_DENIAL_REASONS)[number];
+
+/**
  * Why a registry projection load failed — the `helix.registry.load_failures`
  * dimension. Mirrors the split `apps/edge/src/registry/listener.ts` already
  * makes between its two event names, so the counter and the log agree.
@@ -246,6 +275,35 @@ export const VISIT_RECORD_OUTCOMES = ["recorded", "failed", "dropped", "deduplic
 export type VisitRecordOutcome = (typeof VISIT_RECORD_OUTCOMES)[number];
 
 /**
+ * What the edge did with a request to an old `<slug>.<controlDomain>` host — the
+ * `helix.edge.legacy_app_redirects` dimension. When `redirected` stays at zero
+ * for the operator's chosen period, the redirect can be turned off.
+ * - `redirected`: a 307 to the app's new origin.
+ * - `unknown_app`: unknown, archived, nothing live, mode not permitted, or the
+ *   registry not loaded; all answer 404 and none is told apart.
+ * - `refused_path`: a path that starts with `_` or fails return-path validation,
+ *   or a method other than GET/HEAD; answered with 404.
+ */
+export const LEGACY_REDIRECT_OUTCOMES = ["redirected", "unknown_app", "refused_path"] as const;
+export type LegacyRedirectOutcome = (typeof LEGACY_REDIRECT_OUTCOMES)[number];
+
+export const CSP_REPORT_DIRECTIVES = [
+  "img-src",
+  "connect-src",
+  "script-src",
+  "style-src",
+  "font-src",
+  "object-src",
+  "other",
+] as const;
+export type CspReportDirective = (typeof CSP_REPORT_DIRECTIVES)[number];
+export const CSP_REPORT_DISPOSITIONS = ["enforce", "report", "unknown"] as const;
+export type CspReportDisposition = (typeof CSP_REPORT_DISPOSITIONS)[number];
+/** Whether a parsed CSP report row reached `csp_reports` (`helix.edge.csp_reports` / {@link ATTR_OUTCOME}). */
+export const CSP_REPORT_OUTCOMES = ["recorded", "dropped", "failed"] as const;
+export type CspReportOutcome = (typeof CSP_REPORT_OUTCOMES)[number];
+
+/**
  * Why a provider-cache reconcile was counted — the `helix.providers.reconciles`
  * dimension. An attempt counter, not a failures-only counter: the cache has no
  * `/health` grade to ladder into (egress reports liveness only), so the alert
@@ -253,6 +311,15 @@ export type VisitRecordOutcome = (typeof VISIT_RECORD_OUTCOMES)[number];
  */
 export const PROVIDERS_RECONCILE_OUTCOMES = ["ok", "failed"] as const;
 export type ProvidersReconcileOutcome = (typeof PROVIDERS_RECONCILE_OUTCOMES)[number];
+
+/**
+ * How a cut or failed LLM call's charge was derived: the `helix.usage.basis` span
+ * attribute and the `helix.gateway.cut_charges` dimension. `measured`: both counts
+ * came from the vendor's usage block. `estimated`: both came from byte counts.
+ * `mixed`: one of each (for example a measured input and an estimated output).
+ */
+export const CUT_CHARGE_BASES = ["measured", "estimated", "mixed"] as const;
+export type CutChargeBasis = (typeof CUT_CHARGE_BASES)[number];
 
 /**
  * Why a `shared` list call was denied — the {@link ATTR_REASON} value on the

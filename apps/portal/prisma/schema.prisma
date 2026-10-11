@@ -74,7 +74,7 @@ model App {
   /// empty is also a legal (deny-everyone) `group` state. Cap lives in zod
   /// (`MAX_VISIBILITY_GROUPS`), not here — an array needs no migration to
   /// re-tune it (ADR-0040 §5).
-  visibilityGroupIds String[]
+  visibilityGroupIds String[] @default([])
   // Shared-password credential for `password` visibility (docs/features/
   // authentication.md). `passwordHash`/`passwordSalt` (scrypt) are PROJECTED to
   // the edge to verify a login; `passwordEnc` (AES-256-GCM) is portal-only —
@@ -392,6 +392,21 @@ model InstructionJti {
 
   @@index([expiresAt])
   @@map("instruction_jti")
+}
+
+/// In-flight call leases behind the edge's per-app and per-user concurrency caps. **Edge-written
+/// data**: the edge inserts one row per scope per admitted call (apps/edge/src/gateway/leaseStore.ts)
+/// and deletes them when the call ends. A row also expires at `expiresAt`, so a replica that dies
+/// leaks a slot only until then. No RLS: `scope` embeds the app id, the way rate_counters keys
+/// do. `helix_edge` has SELECT+INSERT+DELETE; every other role is carved out.
+model InflightLease {
+  id        String   @db.Uuid
+  scope     String
+  expiresAt DateTime
+
+  @@id([id, scope])
+  @@index([scope, expiresAt])
+  @@map("inflight_leases")
 }
 
 /// Per-user / per-app key-value store (architecture §6.1, app-data design

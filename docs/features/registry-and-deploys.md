@@ -14,7 +14,7 @@ public. Uploaded versions start as `preview`; promotion makes them live
 ### App CRUD (`apps/portal/src/routes/apps.ts`)
 
 ```
-POST   /api/v1/apps                  create (slug, displayName, description?, visibility, optional capabilities)
+POST   /api/v1/apps                  create (slug, displayName, description?, visibility, optional capabilities) → app fields at the top level plus `applied` (baseline deltas committed) and `pending` (approval request id, or null)
 GET    /api/v1/apps                  list (authenticated)
 GET    /api/v1/apps/:slug            get (authenticated)
 PATCH  /api/v1/apps/:slug            edit the registry record (description today; owner/admin)
@@ -26,11 +26,13 @@ POST   /api/v1/apps/:slug/access/origin       grant a CSP/proxy origin (routes t
 POST/GET /api/v1/apps/:slug/access/password   mint/rotate/read the shared passphrase
 ```
 
-Capability/visibility/origin mutations route through one write-gate (`applyCapabilityChange`):
-a reduction in privilege commits immediately; an above-baseline delta (bigger budgets, non-curated
-models, any MCP/external origin, visibility→public) opens an `ApprovalRequest` instead of applying
-(see [docs/design/approvals.md](../design/approvals.md)). Enabling `password` is refused here — it
-needs a minted credential, so it has its own `/access/password` routes.
+Capability/visibility/origin mutations route through one write-gate (`applyCapabilityChange` for
+manifest, visibility, and origin-grant routes; `gateCapabilitiesAtCreate` on app create): a reduction
+in privilege commits immediately; an above-baseline delta (bigger budgets, non-curated models, any
+MCP/external origin, visibility→public, or a brand-new LLM grant with no spend cap) opens an
+`ApprovalRequest` instead of applying (see [docs/design/approvals.md](../design/approvals.md)).
+Enabling `password` is refused here — it needs a minted credential, so it has its own
+`/access/password` routes.
 
 Slugs are DNS labels (`[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?`); visibility defaults to `internal`.
 Every app response carries an optional plain-text `description` (≤ 500 chars —

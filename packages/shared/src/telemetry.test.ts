@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import * as telemetry from "./telemetry.js";
 import {
+  ADMISSION_DENIAL_REASONS,
+  CUT_CHARGE_BASES,
   FORBIDDEN_URL_ATTRS,
+  LEGACY_REDIRECT_OUTCOMES,
   REGISTRY_LOAD_OUTCOMES,
   SESSION_DENIAL_REASONS,
 } from "./telemetry.js";
@@ -65,6 +68,18 @@ describe("the telemetry vocabulary", () => {
     expect(SESSION_DENIAL_REASONS.length).toBeLessThanOrEqual(8);
     expect(new Set(SESSION_DENIAL_REASONS).size).toBe(SESSION_DENIAL_REASONS.length);
     expect([...REGISTRY_LOAD_OUTCOMES]).toEqual(["failed", "never_loaded"]);
+    expect([...CUT_CHARGE_BASES]).toEqual(["measured", "estimated", "mixed"]);
+    expect([...ADMISSION_DENIAL_REASONS]).toEqual([
+      "app_budget_day",
+      "app_budget_burst",
+      "platform_ceiling",
+      "concurrency_app",
+      "concurrency_user",
+      "concurrency_replica",
+    ]);
+    expect(LEGACY_REDIRECT_OUTCOMES.length).toBeGreaterThan(0);
+    expect(new Set(LEGACY_REDIRECT_OUTCOMES).size).toBe(LEGACY_REDIRECT_OUTCOMES.length);
+    expect([...LEGACY_REDIRECT_OUTCOMES]).toEqual(["redirected", "unknown_app", "refused_path"]);
   });
 
   it("keeps the consent-start outcome vocabulary bounded and duplicate-free", () => {

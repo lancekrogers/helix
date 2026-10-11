@@ -1,7 +1,13 @@
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 import { Pool, type Dispatcher } from "undici";
-import { priceForModel, type Env, type LlmChatRequest, type LlmUsage } from "@azx-pbc/shared";
+import {
+  priceForModel,
+  REASONING_MIN_COMPLETION_TOKENS_DEFAULT,
+  type Env,
+  type LlmChatRequest,
+  type LlmUsage,
+} from "@azx-pbc/shared";
 
 /**
  * The `LlmProvider` seam (architecture §6.1, project plan §4 M4). The gateway
@@ -9,13 +15,21 @@ import { priceForModel, type Env, type LlmChatRequest, type LlmUsage } from "@az
  * shape and lets the provider translate. Anthropic is the only member in M4;
  * Azure OpenAI etc. become new implementations behind this interface.
  *
- * Every provider streams: it yields `delta` events as text arrives and a final
- * `done` event carrying the stop reason and token usage (the basis for
- * metering). The handler relays those as SSE for streaming clients or
- * accumulates them into a single JSON body otherwise — one code path either way.
+ * Every provider streams: it yields `delta` events as text arrives, optional
+ * interim `usage` events as token counts become known, and a final `done` event
+ * carrying the stop reason and token usage (the basis for metering). The handler
+ * relays those as SSE for streaming clients or accumulates them into a single
+ * JSON body otherwise — one code path either way.
  */
 export type LlmStreamEvent =
   | { type: "delta"; text: string }
+  /**
+   * Token counts the vendor has reported so far, cumulative. Yielded as soon as they
+   * are known (Anthropic: at `message_start` and `message_delta`; OpenAI: with the final
+   * usage chunk), so a caller that loses the stream still holds them. The terminal
+   * `done` carries the final counts.
+   */
+  | { type: "usage"; usage: LlmUsage }
   | { type: "done"; stopReason: string; usage: LlmUsage };
 
 /**
@@ -125,6 +139,10 @@ export async function* mapAnthropicStream(body: Readable): AsyncIterable<LlmStre
           event.message?.usage?.cache_creation_input_tokens ?? 0,
           "cache_creation_input_tokens",
         );
+        yield {
+          type: "usage",
+          usage: { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens },
+        };
         break;
       case "content_block_delta":
         if (event.delta?.type === "text_delta" && event.delta.text) {
@@ -134,6 +152,10 @@ export async function* mapAnthropicStream(body: Readable): AsyncIterable<LlmStre
       case "message_delta":
         if (event.usage?.output_tokens != null) {
           outputTokens = wireCount(event.usage.output_tokens, "output_tokens");
+          yield {
+            type: "usage",
+            usage: { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens },
+          };
         }
         if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
         break;
@@ -157,7 +179,6 @@ export async function* mapAnthropicStream(body: Readable): AsyncIterable<LlmStre
 }
 
 /** Floor for a reasoning model's `max_completion_tokens` when the catalog gives none. */
-const DEFAULT_REASONING_FLOOR = 25_000;
 
 /**
  * The OpenAI **chat/completions** request body (always streamed). The neutral
@@ -183,7 +204,7 @@ export function openAiRequestBody(req: LlmChatRequest): string {
   };
   const price = priceForModel(req.model);
   if (price?.reasoning) {
-    const floor = price.minCompletionTokens ?? DEFAULT_REASONING_FLOOR;
+    const floor = price.minCompletionTokens ?? REASONING_MIN_COMPLETION_TOKENS_DEFAULT;
     body.max_completion_tokens = Math.max(req.maxTokens ?? floor, floor);
   } else if (req.maxTokens !== undefined) {
     body.max_tokens = req.maxTokens;
@@ -263,6 +284,10 @@ export async function* mapOpenAiStream(body: Readable): AsyncIterable<LlmStreamE
       // why the cast alone would concatenate or poison the accounting.
       inputTokens = wireCount(event.usage.prompt_tokens ?? 0, "prompt_tokens");
       outputTokens = wireCount(event.usage.completion_tokens ?? 0, "completion_tokens");
+      yield {
+        type: "usage",
+        usage: { inputTokens, outputTokens, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      };
     }
   }
 
@@ -331,11 +356,14 @@ export class LlmProviderError extends Error {
    * `retryAfterSeconds` in `egressLlmProvider.ts`).
    */
   readonly retryAfter?: number;
-  constructor(message: string, upstreamStatus?: number, retryAfter?: number) {
+  /** Egress JSON `code` when the failure was a platform refusal before the vendor body. */
+  readonly egressCode?: string;
+  constructor(message: string, upstreamStatus?: number, retryAfter?: number, egressCode?: string) {
     super(message);
     this.name = "LlmProviderError";
     this.upstreamStatus = upstreamStatus;
     this.retryAfter = retryAfter;
+    this.egressCode = egressCode;
   }
 }
 

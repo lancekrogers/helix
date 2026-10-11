@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { AuthConfig, EdgeConfig } from "../../config.js";
-import { publicOrigin } from "../../config.js";
+import { controlOrigin, publicOrigin } from "../../config.js";
 import type { RegistryReader } from "../../registry/projection.js";
 import { sendAuthFlowError, sendNotFound, sendUnavailable } from "../../errors.js";
 import {
@@ -150,7 +150,7 @@ export function makeCallbackHandler(rt: AuthHostRuntime) {
       // openid-client needs the exact public callback URL (redirect_uri match).
       const callbackUrl = new URL(
         (req.raw.url ?? "/callback").replace(/^[^?]*/, "/callback"),
-        publicOrigin(rt.config, "auth"),
+        controlOrigin(rt.config, "auth"),
       );
       const outcome = await rt.oidc.exchangeCode(callbackUrl, {
         state: flow.state,
@@ -160,7 +160,7 @@ export function makeCallbackHandler(rt: AuthHostRuntime) {
 
       if (outcome.kind === "interaction-required" && flow.silent) {
         // Silent refresh needs a human: rerun interactively, same destination.
-        const restart = new URL(`${publicOrigin(rt.config, "auth")}/start`);
+        const restart = new URL(`${controlOrigin(rt.config, "auth")}/start`);
         restart.searchParams.set("app", entry.slug);
         restart.searchParams.set("rd", flow.rd);
         reply.header("referrer-policy", "no-referrer").redirect(restart.toString(), 302);

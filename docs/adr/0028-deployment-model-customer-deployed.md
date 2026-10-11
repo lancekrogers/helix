@@ -41,6 +41,18 @@ Concretely, each prior decision that was implicitly single-install is **paramete
 - **Version skew across the fleet is now a first-class cost.** Customers run different versions; docs/ADRs describe *a* deployment, and cross-version compatibility (migration ordering, manifest schema, instruction/handoff token formats) must be explicitly versioned. This is the classic self-managed-software tax (GitLab/Retool self-hosted).
 - **Edits this ADR obligates — done 2026-07-22:** architecture decision 11 (now "no per-app vanity domains; base domain is a per-deployment parameter") and the §11 resolved-note both qualified in `platform-architecture.md`; ADR-0019 carries a 2026-07-22 amendment reframing the #16 split as a per-deployment topology + PSL recommendation, not a domain we own.
 
+## Amendment (2026-10-09): admission controls are per-install settings
+
+The platform LLM daily ceiling, LLM and fetch in-flight concurrency caps, the install default LLM
+budget when a manifest omits `dollarsPerDay`, and the wall-clock LLM call deadline are **per-install
+settings**, each with a strict default and an off value where the knob allows it (the call deadline
+excepted — it has no off value). A one-organization install on this model may relax or disable
+individual controls without forking code. Later network-egress and domain-split work extends this same
+amendment rather than adding a second one. Detail: ADR [0051](0051-llm-admission-control.md).
+
+- **Network egress:** `egressFqdnMode`, `egressNsgEnforce`, and `EGRESS_EXTRA_BLOCKED_CIDRS` (set by the template from `vnetAddressPrefix`) are per-install settings. Unlike the admission settings, the two network modes default to the upgrade-conservative values (`any`, `deny-list-only`); the strict values (`allowlist`, `enforce`) are an operator's step once `just infra net-verify` and the edge→egress check pass — designed not to change platform flows on upgrade, **unverified in Azure** until then. See the network-controls amendment in ADR [0005](0005-ssrf-egress-controls.md).
+- **Domain split (decision 2, now implemented):** `EDGE_BASE_DOMAIN` remains the apps domain; `EDGE_CONTROL_DOMAIN` defaults to it. Bicep `hostedAppsDomain` (default empty) moves apps to a second zone while `appsDomain` becomes control; `hostedAppsTlsBound` is the second TLS gate beside `wildcardTlsBound`; `legacyAppRedirect` / `EDGE_LEGACY_APP_REDIRECT` (default off) optionally 307 old control-domain app URLs. `auth.<appsDomain>` is never an auth host when split. `CONTROL_PUBLIC_BASE` supplies the portal control origin (configured, not derived); Bicep sets it with `APP_PUBLIC_BASE` from one parameter pair. Delegated apps subdomains need a Public Suffix List entry — documented for operators; the edge logs the split only. **Tested locally** in the dev container (Chromium): host classification, handoff, Origin guard, legacy redirect. **Not tested:** Safari/Firefox/Chrome on real domains, real PSL/DNS, Azure two-wildcard bindings, dual TLS canary, firewall-tier certbot (**unverified in Azure**).
+
 ## Considered and rejected
 
 **Hosted multi-tenant SaaS on our cloud.** Rejected: it would place customer apps, secrets, and data in *our* tenancy (custody + residency burden), create a cross-customer blast radius, and require exactly the multi-tenant machinery this model avoids — per-tenant base-domain resolution, SNI multi-cert at a shared ingress, cross-tenant unknown-host rejection, and an `orgId` scoping layer. Not a permanent bar: recorded so that any future hosted offering is a **conscious re-decision**, not drift — and note that reversing to it later is a large re-architecture, precisely because the machinery above is deliberately absent.

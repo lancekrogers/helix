@@ -39,6 +39,10 @@ param privateEndpointSubnetId string
 @description('Resource id of the privatelink.vaultcore.azure.net private DNS zone.')
 param keyVaultPrivateDnsZoneId string
 
+param platformPrivateIp string = ''
+param connectionsPrivateIp string = ''
+param delegatedPrivateIp string = ''
+
 var commonProperties = {
   sku: {
     family: 'A'
@@ -94,6 +98,8 @@ module platformPe 'private-endpoint.bicep' = {
     targetResourceId: platformVault.id
     groupId: 'vault'
     privateDnsZoneId: keyVaultPrivateDnsZoneId
+    privateIpAddress: platformPrivateIp
+    memberName: 'default'
   }
 }
 
@@ -106,6 +112,8 @@ module connectionsPe 'private-endpoint.bicep' = {
     targetResourceId: connectionsVault.id
     groupId: 'vault'
     privateDnsZoneId: keyVaultPrivateDnsZoneId
+    privateIpAddress: connectionsPrivateIp
+    memberName: 'default'
   }
 }
 
@@ -118,6 +126,8 @@ module delegatedPe 'private-endpoint.bicep' = {
     targetResourceId: delegatedVault.id
     groupId: 'vault'
     privateDnsZoneId: keyVaultPrivateDnsZoneId
+    privateIpAddress: delegatedPrivateIp
+    memberName: 'default'
   }
 }
 

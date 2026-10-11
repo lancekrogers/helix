@@ -106,6 +106,18 @@ export const REQUEST_HEADER_SAFELIST: readonly string[] = [
  * Strip Location so browsers cannot follow a redirect outside the proxy;
  * egress also does not follow redirects (ADR-0005). Keep Content-Location,
  * which does not navigate, but redact any injected query credential in it.
+ *
+ * Policy and reporting headers belong to the app origin, not a vendor. The
+ * gateway's response is same-origin with the app, so a copied clear-site-data
+ * or nel applies to the app's origin even on a fetch() response (clearing its
+ * cookies and storage, or registering a reporting policy). Navigations that would
+ * treat the body as a document are refused on `/_api/fetch/*`; worker-destination
+ * loads and `Service-Worker` registration fetches are refused too. The edge still
+ * sets a backstop `content-security-policy: default-src 'none'` on every proxied
+ * response so a misclassified load cannot inherit vendor policy. Strip upstream
+ * CSP and reporting headers here anyway — they must never replace the app CSP.
+ * Keep this a denylist; an allowlist would drop headers apps rely on (etag,
+ * retry-after, rate-limit headers).
  */
 export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
   "set-cookie",
@@ -119,6 +131,15 @@ export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
   "proxy-authorization",
   "trailer",
   "upgrade",
+  "clear-site-data",
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "refresh",
+  "report-to",
+  "reporting-endpoints",
+  "nel",
+  "service-worker-allowed",
+  "alt-svc",
 ];
 
 // ── App-facing error shape ────────────────────────────────────────────────────
@@ -130,7 +151,9 @@ export const RESPONSE_HEADER_BLOCKLIST: readonly string[] = [
  * target; `too_large` a request body over the size cap (413, refused before the
  * upstream call); `replay` a re-presented attested instruction whose one-time
  * `jti` was already burned (409, refused at egress before any upstream call —
- * ADR-0013 Step 1, issue #3); `upstream_error` an egress/transport failure. (A
+ * ADR-0013 Step 1, issue #3); `upstream_error` an egress/transport failure;
+ * `upstream_timeout` a vendor hop that exceeded its idle timeout after the
+ * request was dispatched. (A
  * *response* over the cap cannot use this code — status + headers are already
  * flushed by the time the byte counter trips, so the body is truncated instead;
  * see issue #8 and `@azx-pbc/shared` `capBody`.)
@@ -157,6 +180,7 @@ export const FETCH_ERROR_CODES = [
   "too_large",
   "replay",
   "upstream_error",
+  "upstream_timeout",
   "connection_required",
   "provider_unavailable",
   "provider_misconfigured",

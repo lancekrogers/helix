@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { request as undiciRequest } from "undici";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { startRecordingTelemetry } from "@azx-pbc/telemetry/testing";
+import { INSTR_GATEWAY_ADMISSION_DENIED } from "@azx-pbc/shared/telemetry";
 import type { FastifyInstance } from "fastify";
 import { type JWTPayload, jwtVerify } from "jose";
 import { INSTRUCTION_AUDIENCE, INSTRUCTION_JWT_TYP } from "@azx-pbc/shared";
@@ -20,6 +22,7 @@ import {
 import { deriveInstructionKey } from "./instruction.js";
 import { MODEL_MAX, PATH_MAX } from "./usage.js";
 import type { EgressProvider, EgressRequest, EgressResponse } from "./egressProvider.js";
+import { InMemoryLeaseStore, type AcquireResult, type LeaseStore } from "./leaseStore.js";
 
 /**
  * The `/_api/fetch` policy plane (fetch-proxy design §7): gate + CSRF, the
@@ -49,6 +52,8 @@ class FakeEgress implements EgressProvider {
   status = 200;
   /** When set, the response body egress "returns" — used to exercise the cap. */
   responseBody: Readable | null = null;
+  /** Extra headers the fake upstream response carries (merged over the default). */
+  responseHeaders: Record<string, string> = {};
   /** When set, the request body is fully drained so tests can measure its size. */
   drainRequest = false;
   drainedBytes = 0;
@@ -87,7 +92,7 @@ class FakeEgress implements EgressProvider {
     settled = true;
     return {
       status: this.status,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.responseHeaders },
       body: this.responseBody ?? Readable.from([Buffer.from(JSON.stringify({ ok: true }))]),
       outcome: this.outcome,
     };
@@ -124,7 +129,10 @@ interface FetchEdge {
   app: FastifyInstance;
   egress: FakeEgress;
   usage: FakeUsageStore;
+  leases: InMemoryLeaseStore;
 }
+
+const FETCH_PATH = "/_api/fetch/https://api.github.com/users/octocat";
 
 function buildFetchEdge(
   opts: {
@@ -132,10 +140,13 @@ function buildFetchEdge(
     requestsPerDay?: number | null;
     withEgress?: boolean;
     maxBodyBytes?: number;
+    maxAppInFlight?: number;
+    leases?: LeaseStore;
   } = {},
 ): FetchEdge {
   const egress = new FakeEgress();
   const usage = new FakeUsageStore();
+  const leases = opts.leases instanceof InMemoryLeaseStore ? opts.leases : new InMemoryLeaseStore();
   const connections =
     opts.connections ??
     new Map<string, ProxiedOriginCredential>([
@@ -151,6 +162,7 @@ function buildFetchEdge(
         instructionSecret: null,
         timeoutMs: 30_000,
         maxBodyBytes: opts.maxBodyBytes ?? 10 * 1024 * 1024,
+        maxAppInFlight: opts.maxAppInFlight ?? 0,
       },
     }),
     registry: new FakeRegistry([
@@ -168,8 +180,9 @@ function buildFetchEdge(
     usage,
     egress: opts.withEgress === false ? null : egress,
     instructionKey: opts.withEgress === false ? null : key,
+    leases,
   });
-  return { app, egress, usage };
+  return { app, egress, usage, leases };
 }
 
 async function decode(token: string): Promise<JWTPayload> {
@@ -543,6 +556,10 @@ describe("/_api/fetch", () => {
       ["sec-fetch-mode: navigate", { "sec-fetch-mode": "navigate" }],
       ["sec-fetch-dest: document", { "sec-fetch-dest": "document" }],
       ["sec-fetch-dest: iframe", { "sec-fetch-dest": "iframe" }],
+      ["sec-fetch-dest: worker", { "sec-fetch-dest": "worker" }],
+      ["sec-fetch-dest: sharedworker", { "sec-fetch-dest": "sharedworker" }],
+      ["sec-fetch-dest: serviceworker", { "sec-fetch-dest": "serviceworker" }],
+      ["service-worker header", { "service-worker": "script" }],
     ])("refuses a navigation even when same-origin (%s)", async (_label, extra) => {
       expect(await call({ "sec-fetch-site": "same-origin", ...extra })).toEqual({
         status: 403,
@@ -556,6 +573,12 @@ describe("/_api/fetch", () => {
     it("does not mistake an app fetching HTML for a navigation", async () => {
       expect(
         await call({ "sec-fetch-site": "same-origin", accept: "text/html,*/*" }),
+      ).toMatchObject({ status: 200 });
+    });
+
+    it("allows a fetch()-shaped request with sec-fetch-dest empty", async () => {
+      expect(
+        await call({ "sec-fetch-site": "same-origin", "sec-fetch-dest": "empty" }),
       ).toMatchObject({ status: 200 });
     });
 
@@ -645,6 +668,61 @@ describe("/_api/fetch", () => {
     expect(usage.records).toContainEqual(
       expect.objectContaining({ capability: "fetch", outcome: "error", statusCode: 429 }),
     );
+    await app.close();
+  });
+
+  const NEW_HEADERS = [
+    "clear-site-data",
+    "content-security-policy-report-only",
+    "refresh",
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+    "service-worker-allowed",
+    "alt-svc",
+  ] as const;
+
+  it.each(NEW_HEADERS)("does not copy %s from egress's response onto the app's", async (name) => {
+    const { app, egress } = buildFetchEdge();
+    egress.responseHeaders = {
+      "clear-site-data": '"cookies"',
+      "content-security-policy": "default-src 'none'",
+      "content-security-policy-report-only": "default-src 'none'",
+      refresh: "0; url=https://evil.example/",
+      "report-to": '{"group":"x","max_age":1,"endpoints":[{"url":"https://evil.example/r"}]}',
+      "reporting-endpoints": 'x="https://evil.example/r"',
+      nel: '{"report_to":"x","max_age":1}',
+      "service-worker-allowed": "/",
+      "alt-svc": 'h3="evil.example:443"',
+      link: '<https://evil.example/p2>; rel="next"',
+      etag: '"v1"',
+      "retry-after": "30",
+      "x-ratelimit-remaining": "41",
+    };
+    const res = await app.inject({
+      method: "GET",
+      url: "/_api/fetch/https://api.github.com/x",
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers[name]).toBeUndefined();
+    expect(res.headers["link"]).toBe('<https://evil.example/p2>; rel="next"');
+    expect(res.headers["etag"]).toBe('"v1"');
+    expect(res.headers["retry-after"]).toBe("30");
+    expect(res.headers["x-ratelimit-remaining"]).toBe("41");
+    await app.close();
+  });
+
+  it("sets a backstop content-security-policy on every proxied response", async () => {
+    const { app, egress } = buildFetchEdge();
+    egress.responseHeaders = { "content-security-policy": "default-src https:" };
+    const res = await app.inject({
+      method: "GET",
+      url: "/_api/fetch/https://api.github.com/x",
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
     await app.close();
   });
 
@@ -910,5 +988,227 @@ describe("/_api/fetch over a real socket", () => {
       expect(((await res?.body.json()) as { code: string }).code).toBe("too_large");
     });
     expect(usage.records).toContainEqual(expect.objectContaining({ statusCode: 413 }));
+  });
+});
+
+describe("fetch per-app concurrency cap", () => {
+  it("refuses at the cap and admits again after the first finishes", async () => {
+    const { app, egress, usage, leases } = buildFetchEdge({ maxAppInFlight: 1 });
+    egress.delayMs = 300;
+    const first = app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    await until(() => egress.calls.length === 1, "first egress call");
+    const blocked = await app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.json()).toMatchObject({ code: "rate_limited" });
+    expect(egress.calls).toHaveLength(1);
+    expect(usage.records.filter((r) => r.outcome === "quota_blocked")).toHaveLength(0);
+    await first;
+    const third = await app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(third.statusCode).toBe(200);
+    expect(leases.held(`fetch:app:${APP_ID}`)).toBe(0);
+  });
+
+  it("holds the lease for the whole streamed body", async () => {
+    const { app, egress, leases } = buildFetchEdge({ maxAppInFlight: 1 });
+    let phase = 0;
+    egress.responseBody = new Readable({
+      read() {
+        if (phase === 0) {
+          phase = 1;
+          this.push(Buffer.from("a"));
+          setTimeout(() => {
+            phase = 2;
+            this.push(null);
+          }, 200);
+        }
+      },
+    });
+    const pending = app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    await until(() => leases.held(`fetch:app:${APP_ID}`) === 1, "lease held");
+    await pending;
+    await until(() => leases.held(`fetch:app:${APP_ID}`) === 0, "lease released");
+  });
+
+  it("releases the lease when the socket is already gone after acquire", async () => {
+    const leases = new InMemoryLeaseStore();
+    const baseAcquire = leases.acquire.bind(leases);
+    let unblock: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    vi.spyOn(leases, "acquire").mockImplementation(async (req, ttl) => {
+      await gate;
+      return baseAcquire(req, ttl);
+    });
+    const { app } = buildFetchEdge({ maxAppInFlight: 2, leases });
+    await withServer(app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}${FETCH_PATH}`, {
+        method: "GET",
+        headers: { ...HOST, origin: ORIGIN },
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 40));
+      ac.abort();
+      unblock();
+      await pending;
+      await until(() => leases.held(`fetch:app:${APP_ID}`) === 0, "lease released");
+    });
+  });
+
+  it("releases the lease when the client hangs up mid-upload", async () => {
+    const { app, egress, leases } = buildFetchEdge({ maxAppInFlight: 2 });
+    egress.drainRequest = true;
+    const stalled = new Readable({ read() {} });
+    stalled.push(Buffer.alloc(16, 0x61));
+    await withServer(app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}${FETCH_PATH}`, {
+        method: "POST",
+        headers: { ...HOST, origin: ORIGIN, "content-type": "application/octet-stream" },
+        body: stalled,
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => egress.calls.length === 1, "egress dialed");
+      ac.abort();
+      stalled.destroy();
+      await pending;
+      await until(() => leases.held(`fetch:app:${APP_ID}`) === 0, "lease released");
+    });
+  });
+
+  it("releases the lease when the egress call is aborted", async () => {
+    const { app, egress, leases } = buildFetchEdge({ maxAppInFlight: 2 });
+    egress.delayMs = 5_000;
+    await withServer(app, async (base) => {
+      const ac = new AbortController();
+      const pending = undiciRequest(`${base}${FETCH_PATH}`, {
+        method: "GET",
+        headers: { ...HOST, origin: ORIGIN },
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await until(() => egress.calls.length === 1, "egress dialed");
+      ac.abort();
+      await pending;
+      await until(() => leases.held(`fetch:app:${APP_ID}`) === 0, "lease released");
+    });
+  });
+
+  it("releases the lease exactly once per completed call", async () => {
+    const leases = new InMemoryLeaseStore();
+    let releaseCount = 0;
+    const baseRelease = leases.release.bind(leases);
+    vi.spyOn(leases, "release").mockImplementation(async (id) => {
+      releaseCount += 1;
+      await baseRelease(id);
+    });
+    const { app } = buildFetchEdge({ maxAppInFlight: 5, leases });
+    await app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(releaseCount).toBe(1);
+  });
+
+  it("does not call the lease store when the cap is off", async () => {
+    class ThrowingStore extends InMemoryLeaseStore {
+      override async acquire(): Promise<never> {
+        throw new Error("must not acquire");
+      }
+    }
+    const { app, egress } = buildFetchEdge({ maxAppInFlight: 0, leases: new ThrowingStore() });
+    const res = await app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(egress.calls).toHaveLength(1);
+  });
+
+  it("fails closed when lease acquire throws", async () => {
+    class BrokenStore extends InMemoryLeaseStore {
+      override async acquire(): Promise<AcquireResult> {
+        throw new Error("db down");
+      }
+    }
+    const { app, egress } = buildFetchEdge({ maxAppInFlight: 2, leases: new BrokenStore() });
+    const res = await app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({
+      code: "upstream_error",
+      message: "fetch concurrency check unavailable",
+    });
+    expect(egress.calls).toHaveLength(0);
+  });
+
+  it("does not count fetch leases against LLM scopes", async () => {
+    const leases = new InMemoryLeaseStore();
+    const { app, egress } = buildFetchEdge({ maxAppInFlight: 1, leases });
+    egress.delayMs = 300;
+    void app.inject({
+      method: "GET",
+      url: FETCH_PATH,
+      headers: { ...HOST, origin: ORIGIN },
+    });
+    await until(() => leases.held(`fetch:app:${APP_ID}`) === 1, "fetch lease");
+    expect(leases.held(`llm:app:${APP_ID}`)).toBe(0);
+  });
+
+  it("increments admission_denied with fetch and concurrency_app on refusal", async () => {
+    const recording = startRecordingTelemetry();
+    try {
+      const { app, egress } = buildFetchEdge({ maxAppInFlight: 1 });
+      egress.delayMs = 300;
+      void app.inject({
+        method: "GET",
+        url: FETCH_PATH,
+        headers: { ...HOST, origin: ORIGIN },
+      });
+      await until(() => egress.calls.length === 1, "first call");
+      await app.inject({
+        method: "GET",
+        url: FETCH_PATH,
+        headers: { ...HOST, origin: ORIGIN },
+      });
+      const points = (await recording.metrics()).filter(
+        (p) => p.name === INSTR_GATEWAY_ADMISSION_DENIED,
+      );
+      const denied = points.filter(
+        (p) =>
+          p.attributes["helix.capability"] === "fetch" &&
+          p.attributes["helix.reason"] === "concurrency_app" &&
+          p.attributes["helix.app_id"] === APP_ID,
+      );
+      expect(denied.length).toBeGreaterThanOrEqual(1);
+      expect(Object.keys(denied[0]!.attributes).sort()).toEqual([
+        "helix.app_id",
+        "helix.capability",
+        "helix.reason",
+      ]);
+    } finally {
+      await recording.restore();
+    }
   });
 });

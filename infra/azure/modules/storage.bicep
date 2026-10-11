@@ -25,6 +25,8 @@ param privateEndpointSubnetId string
 @description('Resource id of the privatelink.blob.* private DNS zone.')
 param blobPrivateDnsZoneId string
 
+param privateIpAddress string = ''
+
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
   location: location
@@ -66,6 +68,8 @@ module privateEndpoint 'private-endpoint.bicep' = {
     targetResourceId: storageAccount.id
     groupId: 'blob'
     privateDnsZoneId: blobPrivateDnsZoneId
+    privateIpAddress: privateIpAddress
+    memberName: 'blob'
   }
 }
 

@@ -12,7 +12,8 @@ import {
 } from "@azx-pbc/shared";
 import { ROUTE_CONSENT_CANCEL, ROUTE_CONSENT_START } from "@azx-pbc/shared/telemetry";
 import { buildApp } from "../app.js";
-import { testEdgeConfig } from "../test/config.js";
+import { controlOrigin, publicOrigin } from "../config.js";
+import { splitEdgeConfig, testEdgeConfig } from "../test/config.js";
 import { FakeBlobReader, FakeRegistry, registryEntry } from "../test/fakes.js";
 import type { ProxiedOriginCredential } from "../registry/projection.js";
 import { buildConnectScript } from "./connectHelper.js";
@@ -643,7 +644,10 @@ describe("the connect helper script — concurrent calls", () => {
  */
 const HTML = "<!doctype html><html><head></head><body>hi</body></html>";
 
-async function serveIndex(entry: ReturnType<typeof registryEntry>): Promise<{
+async function serveIndex(
+  entry: ReturnType<typeof registryEntry>,
+  config = testEdgeConfig({ allowUnauthenticated: true }),
+): Promise<{
   status: number;
   body: string;
   etag: string | undefined;
@@ -655,14 +659,14 @@ async function serveIndex(entry: ReturnType<typeof registryEntry>): Promise<{
     etag: '"h1"',
   });
   const app = buildApp({
-    config: testEdgeConfig({ allowUnauthenticated: true }),
+    config,
     registry: new FakeRegistry([entry]),
     blob,
   });
   try {
     const res = await app.inject({
       url: "/",
-      headers: { host: `${entry.slug}.local.helix.azxlabs.io` },
+      headers: { host: new URL(publicOrigin(config, entry.slug)).host },
     });
     return { status: res.statusCode, body: res.body, etag: res.headers.etag as string | undefined };
   } finally {
@@ -693,6 +697,23 @@ describe("helper injection is gated by the manifest's shim.connect grant (advers
     expect(res.body).toContain(ROUTE_CONSENT_CANCEL);
     // Injected bytes ≠ blob etag.
     expect(res.etag).toBeUndefined();
+  });
+
+  it("split layout: platform origins use apps + control auth host", async () => {
+    const cfg = splitEdgeConfig();
+    const slug = "helper";
+    const res = await serveIndex(
+      registryEntry({
+        appId: "a3",
+        slug,
+        blobPrefix: "apps/h2/1/",
+        shim: { fetch: false, connect: true },
+      }),
+      cfg,
+    );
+    expect(res.body).toContain(publicOrigin(cfg, slug));
+    expect(res.body).toContain(controlOrigin(cfg, "auth"));
+    expect(res.body).not.toContain(`auth.${cfg.baseDomain}`);
   });
 
   it("a provider-bound app WITHOUT shim.connect receives no helper script", async () => {

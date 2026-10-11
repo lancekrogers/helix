@@ -19,7 +19,7 @@ import {
   ROUTE_CONSENT_START_DEV,
   SPAN_CONSENT_START_DEV,
 } from "@azx-pbc/shared/telemetry";
-import { publicOrigin, type GatewayConfig } from "../config.js";
+import { controlOrigin, type GatewayConfig } from "../config.js";
 import { sendNotFound } from "../errors.js";
 import type { CallerResolver } from "../auth/gate.js";
 import { resolveServingEntry } from "../auth/routes/appHost.js";
@@ -167,7 +167,7 @@ export function makeDevConsentStartHandler(rt: DevConsentStartRuntime) {
         openerOrigin,
         // From the edge's own auth-host origin — the single source of the
         // callback URL.
-        callbackUrl: `${publicOrigin(rt.config, "auth")}/connections/callback`,
+        callbackUrl: `${controlOrigin(rt.config, "auth")}/connections/callback`,
       });
 
       // Abort the consult if the caller goes away — the shared seam wiring.
@@ -208,7 +208,7 @@ export function makeDevConsentStartHandler(rt: DevConsentStartRuntime) {
           // design — carrying it would bypass the single-use redemption that
           // makes the popup one-time; the portal re-derives it at redemption
           // from the attempt it stored (state + verifier stay server-side).
-          const popupUrl = new URL(CONSENT_NONCE_ENTRY_PATH, publicOrigin(rt.config, "auth"));
+          const popupUrl = new URL(CONSENT_NONCE_ENTRY_PATH, controlOrigin(rt.config, "auth"));
           popupUrl.searchParams.set("nonce", nonce);
           setOutcome("started");
           reply

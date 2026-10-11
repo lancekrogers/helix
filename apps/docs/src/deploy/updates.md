@@ -139,6 +139,8 @@ Two things that look like reasons to skip it, and are not:
 
 ### 2. Roll the apps
 
+If this release tightens `img-src`, read [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy) step 0 first — set `imgSrcReportOnly = true` in your parameter file before rolling the edge image. If it ships hosted-app containment, read [Upgrading to hosted-app containment](#upgrading-to-hosted-app-containment) step 0 before rolling the edge image or running any full apply.
+
 ```bash
 for app in edge portal egress; do
   az containerapp update -g <rg> -n "<namePrefix>-$app" \
@@ -167,6 +169,292 @@ state:properties.runningState,replicas:properties.replicas}" -o table
 The active revision's image must be the tag you just deployed, and its running
 state must be `Running`. Two active revisions means the new one has not become
 ready and the old one is still serving.
+
+## Upgrading to the LLM spend controls
+
+These notes are for an operator adopting the admission and metering work in a live install. Nothing
+here runs automatically — you choose the order and the parameter values.
+
+1. **Role bootstrap.** Apply `infra/azure/sql/01-roles.sql` as the database admin so `helix_edge`,
+   `helix_egress`, and the other platform roles exist. The spend-control migrations grant privileges
+   to `helix_edge` only when that role is present; if the roles are missing, those `GRANT` blocks are
+   skipped silently and the edge will refuse to start once lease caps or the platform ceiling are on.
+
+2. **Apply the migrations before any new edge image.** Run `pnpm --filter @azx-pbc/portal db:deploy`
+   (or your usual migration path) so `platform_llm_spend_micro_usd` and `inflight_leases` exist. An
+   edge that starts without them fails closed on its first ceiling or lease call. Confirm the
+   migration identity's role name (`helixadmin` by default, the `postgresAdminLogin` parameter) is
+   the role the owner policy on `gateway_calls` was created for.
+
+3. **Egress and edge images.** Build and deploy the new egress and edge images. If the edge image
+   ships tightened `img-src`, follow [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy) step 0 in your parameter file before rolling the edge. There is no extra data
+   migration for the upstream abort or the charging change. New `error` rows carry `;usage=` markers;
+   historical rows keep their $0. The new edge image enforces in-flight lease caps from **code
+   defaults** (10 concurrent LLM calls per app, 3 per authenticated user) before you apply the Bicep
+   template in step 6, so step 2 is not optional.
+
+4. **List approved apps with no budget.** Before the install default takes effect, find apps that are
+   unlimited today:
+
+```sql
+SELECT slug FROM apps
+ WHERE capabilities->'llm' IS NOT NULL
+   AND capabilities->'llm'->>'dollarsPerDay' IS NULL
+   AND jsonb_array_length(COALESCE(capabilities->'llm'->'models', '[]'::jsonb)) > 0;
+```
+
+   These become $50 per day when the default deploys unless you change
+   `llmDefaultDollarsPerDay`. Set an explicit number for each through the portal, or deploy with
+   `llmDefaultDollarsPerDay` raised for a transition and lower it afterwards. Skipping this step
+   means refusals on the first busy day. Column and JSON paths match `apps/portal/prisma/schema.prisma`
+   (`App.capabilities`) and `packages/shared/src/approval.ts`; validate the query on your database
+   before you rely on it in production.
+
+5. **Choose the platform ceiling.** The Bicep default is one tenth of `platformMonthlyUsdCap` per
+   day. Set it from the install's own ledger history; an untuned value either blocks real use or
+   never trips. A one-organization install may set `llmPlatformDollarsPerDay` to `0` to switch the
+   ceiling off and should record that choice in its own runbook.
+
+6. **Apply the new template.** A Bicep default does not reach an install until you apply the template
+   with your parameters. Set the four concurrency parameters (`llmMaxAppInFlight`,
+   `llmMaxUserInFlight`, `llmMaxInFlight`, `fetchMaxAppInFlight`), the call deadline
+   (`llmMaxCallMs`), and `llmDefaultDollarsPerDay` / `llmPlatformDollarsPerDay` there. The template
+   also sets `EGRESS_LLM_TIMEOUT_MS` from the same `llmMaxCallMs` (plus 120s) so egress's LLM vendor
+   bound cannot drift below the edge deadline. See [Configuration](/deploy/configuration). If this
+   template also ships network controls, read
+   [Upgrading to the network controls](#upgrading-to-the-network-controls) step 0 first — set
+   `egressNsgEnforce = 'off'` until the scratch-copy test passes before any full apply, including
+   this step. If the template also ships tightened `img-src`, set `imgSrcReportOnly = true` in the
+   parameter file first ([image policy step 0](#upgrading-to-the-tightened-image-policy)). If it also
+   ships the apps/control domain split, read [Upgrading to hosted-app
+   containment](#upgrading-to-hosted-app-containment) before changing `hostedAppsDomain`.
+
+7. **Mixed replicas.** An edge revision without `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` disables the
+   platform ceiling on that replica, so a rolling deploy with old and new replicas does not refuse
+   calls for the ceiling until every replica carries the setting.
+
+**Dev gateway.** Enabling `deployDevGateway` runs a separate edge process whose LLM traffic is tagged
+`env=dev`. The platform daily ceiling sums only `env=prod`, so **dev-gateway LLM spend is outside
+the platform ceiling** unless you accept that gap as a precondition or add your own controls. Per-app
+budgets remain per env.
+
+**Rollback.** Roll images back with `az containerapp update` as in step 2 above. Each Part 3 control
+has an off value (`0`) except the call deadline. Migrations are additive and can stay.
+
+**What was not verified in Azure.** Bicep parameters and edge/dev-gateway environment wiring
+(compile-checked only); the platform-spend alert rule's query and whether it fires; the production
+owner role under `FORCE` RLS; abort propagation through the Container Apps ingress between edge and
+egress; lease behavior across real replicas.
+
+## Upgrading to the network controls
+
+These notes mirror the operator rollout in `docs/features/network-controls.md` in the
+repository. Nothing here runs automatically.
+
+0. **Hold the NSG off until the scratch copy passes.** Until you have attached the egress NSG on a
+   non-production copy of the install and run `just infra net-verify` there, set
+   `egressNsgEnforce = 'off'` in your parameter file before **any** full template apply — including
+   step 6 of [Upgrading to the LLM spend controls](#upgrading-to-the-llm-spend-controls) if that
+   apply ships this template, and before the apply that creates the second certbot job in
+   [Upgrading to hosted-app containment](#upgrading-to-hosted-app-containment) when that template
+   ships the firewall-tier platform lists. Also decide `deployNetprobe`: the probe job and its two log alerts
+   deploy by default (`deployNetprobe` true, requires `deployApps`), and the no-recent-success alert
+   fires until the first scheduled or on-demand run.
+
+   Any full apply of this template changes more than the NSG, even with `egressNsgEnforce = 'off'`:
+   it deploys the `<prefix>-netprobe` job and its alerts (unless `deployNetprobe = false`), sets
+   threat intelligence to `Deny` on firewall installs (`threatIntelMode`), adds `login.microsoft.com`
+   to the egress platform firewall list (Key Vault references), excludes the probe's canary host from
+   the firewall-denial alert query, and sets `EGRESS_EXTRA_BLOCKED_CIDRS` on the egress container.
+
+1. **Scratch copy first.** Test NSG attachment on a non-production copy of the install. Resolve
+   hypothesis rows with `just infra net-verify` and fill the ADR-0005 probe table in the repository.
+
+2. **Application layer.** Roll the next egress image with a scoped `az containerapp update` (same
+   shape as [Roll the apps](#2-roll-the-apps) above). `EGRESS_EXTRA_BLOCKED_CIDRS` arrives with the
+   first full template apply, not with the image roll alone.
+
+3. **Non-80/443 origins.** Audit live manifests for approved fetch origins on other ports; they stop
+   working once `egressNsgEnforce=enforce` and the closing deny is active.
+
+4. **Private-endpoint pinning.** For new installs set `pinPrivateEndpointAddresses=true`. On an
+   existing install list current endpoint addresses (`az network private-endpoint list`), pick
+   non-clashing values for `privateEndpointAddresses`, then enable pinning — Azure may require
+   recreating endpoints (**unverified in Azure**).
+
+5. **NSG `deny-list-only`.** Apply the template with `egressNsgEnforce=deny-list-only`, then verify
+   `/health`, a proxied fetch, an LLM call, a connection-secret read, edge→egress `/health` from inside
+   the edge replica (the probe cannot test inbound rules), and `just infra net-verify` (must exit 0
+   with `denyProven: true` — enable pinning in step 4 first; exit 3 means the NSG was not proven).
+
+6. **`enforce`.** Once the probe is green with `denyProven: true` **and** edge→egress `/health`
+   returns 200, move one install at a time to `egressNsgEnforce=enforce`. Optionally set
+   `netprobeClosingDenyTarget` on a firewall-off scratch copy to record `closingDenyProven: true`.
+
+7. **Subnet recreation fallback.** If a populated subnet cannot take an NSG as a plain update,
+   recreating the egress environment is the documented disruption — schedule it.
+
+8. **Accepted-risk record.** In the deployments repo, point the firewall-off acceptance at the
+   `netControls` deployment output and the last successful `egress.netprobe_result` instead of
+   duplicating posture in prose.
+
+**Existing firewall installs:** `egressFqdnMode` stays `any` on template upgrade unless your
+parameter file sets `allowlist`; `threatIntelMode=Deny` can ship on apply. Flipping to `allowlist`
+requires maintaining `egressAllowedFqdns` (use `just infra egress-hosts`).
+
+## Upgrading to the tightened image policy
+
+0. **Hold enforcement until you have read the Violations screen.** Until you have reviewed CSP
+   reports there, set `imgSrcReportOnly = true` in your parameter file before rolling the edge
+   image or running **any** full template apply. That restores the measurement window: open
+   enforced `img-src` plus a Report-Only tightened policy. A hand-set
+   `EDGE_IMG_SRC_REPORT_ONLY=true` on the edge Container App works only until the next full apply —
+   the template re-declares the variable from the params file, so once any apply follows, the flag
+   must live in the parameter file, not only on the Container App.
+
+1. **Audit approved origins that will drop out of CSP.** Before you turn enforcement on, run this
+   read-only query against the install's database and fix or pre-grant anything you still need.
+   It lists `externalOrigins` entries that are not `https:` or `wss:`, or that use a wildcard host
+   (both are omitted from `connect-src` / `img-src`). Origins whose hostname contains characters
+   outside `[a-z0-9.-]` (aside from IPv6 literals) are dropped too — inspect those manually in
+   `capabilities.externalOrigins` if any app relied on them.
+
+```sql
+SELECT slug, o FROM apps, jsonb_array_elements_text(COALESCE(capabilities->'externalOrigins','[]'::jsonb)) o
+ WHERE o !~* '^(https|wss)://' OR o LIKE '%*%';
+```
+
+   Column and JSON paths match `apps/portal/prisma/schema.prisma` (`App.capabilities`); validate
+   on your database before you rely on it in production.
+
+2. **Measurement window.** With `imgSrcReportOnly = true` applied (parameter file or scoped
+   `az containerapp update --set-env-vars`), roll the edge image. Read the Violations screen and the
+   `helix.edge.csp_reports` counter for the window (`disposition=report` while the flag is on).
+   Pre-grant legitimate image hosts per app, or list operator-trusted hosts in `EDGE_IMG_SRC_EXTRA`
+   — never an image proxy. Tell app owners to inline images or ship them in the bundle.
+
+3. **Enforce.** Remove `imgSrcReportOnly` from the parameter file (or set it false) and apply the
+   template, or set `EDGE_IMG_SRC_REPORT_ONLY=false` with a scoped
+   `az containerapp update --set-env-vars`. That switches the enforced header to
+   `img-src 'self' data: blob:` (plus approved origins and extras) and `object-src 'none'`. No
+   further image roll is required unless you are also shipping new edge code. One-org installs that
+   accept the open image channel set `EDGE_IMG_SRC_ALLOW_ALL=true` instead of enforcing the tight
+   default.
+
+Passing these parameters through Container Apps on a live install is **unverified in Azure**.
+
+## Upgrading to hosted-app containment
+
+These notes cover the three containment parts shipped together: response-header stripping,
+tightened CSP, and the optional apps/control domain split. Nothing runs automatically — you choose
+the order and parameter values.
+
+0. **Applies to all three parts.** Before rolling the edge image or running any full template apply
+   in this release:
+
+   - Set `imgSrcReportOnly = true` in your parameter file ([image policy step
+     0](#upgrading-to-the-tightened-image-policy)).
+   - Keep `egressNsgEnforce = 'off'` until the scratch-copy test passes ([network controls step
+     0](#upgrading-to-the-network-controls)).
+
+### Part 3 — proxied response headers
+
+Deploy the new egress and edge images after step 0; the header blocklist itself needs no setting.
+
+The edge strips a fixed blocklist of response headers on every `/_api/fetch/*` response (the list lives
+in `packages/shared/src/fetch.ts`). Browsers do not act on a `Link` header in a `fetch()` response,
+so `link` is deliberately **not** stripped — pagination that relies on `rel="next"` keeps working. If
+an upstream vendor expected one of the other stripped headers to reach app JavaScript (unlikely), the
+blocklist is the single source of truth.
+
+### Part 2 — CSP (`img-src` / `object-src`)
+
+Follow [Upgrading to the tightened image policy](#upgrading-to-the-tightened-image-policy): step 0
+(`imgSrcReportOnly = true`) before any edge roll or full apply that ships the measurement mode (one
+edge image; the flag selects the mode); then the Violations screen and `helix.edge.csp_reports`
+(`disposition=report` during measurement); then enforce (remove the flag or set
+`EDGE_IMG_SRC_REPORT_ONLY=false`). Pre-grant per app or list operator-trusted image hosts in
+`EDGE_IMG_SRC_EXTRA` — never an image proxy that fetches attacker-chosen URLs. One-organization
+installs that accept the open channel set `EDGE_IMG_SRC_ALLOW_ALL=true`. Parameter names in Bicep:
+`imgSrcExtra`, `imgSrcReportOnly`, `imgSrcAllowAll`.
+
+### Part 1 — domain split
+
+**New install**
+
+1. Choose two domains, or one domain plus a delegated subdomain you will list on the Public Suffix
+   List (**operator-run**; without that entry the two remain the same site and host-only cookies do
+   not stop a `Domain=` cookie from reaching the control hosts). The template creates both DNS zones
+   in step 2; delegate each at its parent from the `dnsNameServers` and `hostedDnsNameServers`
+   deployment outputs (**operator-run**) before running the certbot jobs.
+2. Set `appsDomain` (the **control** domain: `auth.`, `portal.`, `dev-api.`), `hostedAppsDomain`
+   (the apps domain), and `hostedAppsLive = true` in the parameter file. Deploy with
+   `wildcardTlsBound` and `hostedAppsTlsBound` `false`.
+3. On a firewall install, apply the release that carries the per-subnet platform FQDN lists (ACME,
+   Resource Manager, Entra) **before** the apply that creates the second certbot job, or issuance can
+   fail silently (**operator-run**; prerequisite from the network-controls work).
+4. Run the first certbot job (`<namePrefix>-certbot`), then the second (`<namePrefix>-ap-certbot`);
+   flip both bound flags and redeploy. The TLS what-if canary must never show
+   `Delete properties.configuration.ingress.customDomains` for either binding (**unverified in Azure**
+   with two bindings on one Container App). Confirm the `edge-health-apps` availability test is green
+   once `hostedAppsTlsBound` is on.
+5. Register Entra redirect URIs for the control domain as in [Entra setup](/deploy/entra-setup).
+6. Submit the apps zone to the Public Suffix List when it is a delegated subdomain (**operator-run**).
+
+**Existing install — keep the current domain as control** (sign-in, portal, dev-api, Entra and vendor
+callbacks stay put; only app URLs move)
+
+0. Complete [step 0](#upgrading-to-hosted-app-containment) above before rolling the edge image or
+   running any full apply.
+1. Deploy new edge and portal images with all split settings absent; confirm a no-op before changing
+   parameters.
+2. **Provision.** Set `hostedAppsDomain` and keep `hostedAppsLive = false`, then apply. Read the
+   deployment output `hostedDnsNameServers` and delegate the apps zone at the parent
+   (**operator-run**). On a firewall install, apply the release with the per-subnet platform FQDN
+   lists before the apply that creates the second certbot job. Start `<namePrefix>-ap-certbot` once
+   delegation resolves publicly; check from outside that `https://www.<hostedAppsDomain>/health`
+   answers over HTTPS with a valid certificate. Set `hostedAppsTlsBound = true`, apply, run the TLS what-if canary for both bindings, and
+   confirm the `edge-health-apps` availability test is green (**unverified in Azure**).
+3. **Verify.** Run the cross-browser sign-in check (Chrome, Firefox, Safari) on a **separate staging
+   install** configured like the scratch copy in [network controls step
+   1](#upgrading-to-the-network-controls), with `hostedAppsLive = true` and the same domain shape.
+   The edge moves all apps or none, so this production install cannot host one staging app on the new
+   domain while the rest stay on the old hosts. Tracking-protection heuristics may treat an auth host
+   that redirects without a click as a bounce tracker — symptom: login loop at `/start`, visible in
+   the `helix.session.gate_denied` counter and the `helix.auth.handoff.complete` span (**unverified in
+   Safari, Firefox and Chrome on real domains**).
+4. **Cut over.** Set `hostedAppsLive = true` and `legacyAppRedirect = true` in one apply. Bicep sets
+   `EDGE_BASE_DOMAIN`, `EDGE_CONTROL_DOMAIN`, `APP_PUBLIC_BASE`, `CONTROL_PUBLIC_BASE`, and
+   `EDGE_LEGACY_APP_REDIRECT` from that parameter pair, so the edge, portal, and dev gateway flip
+   together.
+5. **Operator check after cutover.** `GET /api/v1/providers` (authenticated) must list
+   `callbackUrl` exactly `https://auth.<EDGE_CONTROL_DOMAIN>/connections/callback` — the only way to
+   catch an edge/portal mismatch the portal cannot detect at boot alone.
+6. Tell app owners URLs changed; update `availabilityExtraTargets` (it holds app URLs) and any
+   external registration by old host.
+7. **Sunset.** Watch `helix.edge.legacy_app_redirects`. When `redirected` has been near zero for your
+   chosen period: set `legacyAppRedirect` to `false` and re-apply; delete the control zone's `*` A
+   record by hand (a re-apply does not delete DNS records); **keep** the edge's `*.<control domain>`
+   binding — `auth.<control domain>` terminates TLS through it and certbot re-binds it on every run;
+   keep the `auth`, `portal`, and `dev-api` records.
+
+**Rollback (cutover).** Set `hostedAppsLive` back to `false` and apply. The template omits the
+split-only environment variables and replaces each app's env list whole, so the edge, portal, and dev
+gateway revert to the single-domain values while the apps zone and second certbot job stay (incremental
+mode). Sessions minted on the new app hosts are lost. The legacy redirect is a `307` with `no-store`,
+so browsers do not cache it and a rollback stays clean. Leave `hostedAppsDomain` set if you plan to
+retry cutover without reprovisioning DNS and TLS.
+
+**Data migration:** none — apps are keyed by slug and id.
+
+**Compatibility:** sessions on old hosts are lost; handoff tokens in flight at cutover fail; browser
+state on the old origin does not carry over; `/_api` clients that hard-coded the old host break
+(relative URLs are correct); the grace redirect softens GET navigations only.
+
+Split topology on Azure (**unverified in Azure** until exercised on your install): two wildcard
+certificates, two certbot jobs, two declarative bindings when both TLS gates are on. New split installs
+never create a `*` A record in the control zone; whether Container Apps still binds and re-binds
+`*.<control>` without that record is not documented — check the first certbot run.
 
 ## What a rollout actually does
 
@@ -409,8 +697,9 @@ What the preview genuinely cannot answer:
 
 ### The TLS canary
 
-On an install with `wildcardTlsBound: true`, the what-if must **not** show a
-delete of `properties.configuration.ingress.customDomains`.
+On an install with `wildcardTlsBound: true` (and `hostedAppsTlsBound: true` when
+`hostedAppsDomain` is set), the what-if must **not** show a delete of
+`properties.configuration.ingress.customDomains` for **either** wildcard binding.
 
 **If it does, the gate is off — stop, do not apply.** With the gate on, the
 template declares the bindings and an apply preserves them (verified by an
@@ -468,7 +757,12 @@ real outages. Check the things that fail silently:
     https://auth.<appsDomain>/health
   ```
 
-  `tls=0` is a verified chain.
+  `tls=0` is a verified chain. With a split install (`hostedAppsLive = true`), also probe
+  `https://www.<hostedAppsDomain>/health` the same way.
+- **Split installs:** `GET /api/v1/providers` must list `callbackUrl` as
+  `https://auth.<control domain>/connections/callback` (same value as `EDGE_CONTROL_DOMAIN` on the
+  edge). A mismatch means the portal and edge disagree and vendor OAuth will fail even when both
+  services boot.
 - **The edge→egress hop resolves**, after any full apply. The apply rewrites
   that URL on every caller from a `reference()` the diff could never resolve,
   so an apply is exactly when this hop breaks. Probe it from inside the
@@ -492,6 +786,12 @@ real outages. Check the things that fail silently:
   the latency has passed. When a query comes back empty, suspect the query
   first — wrong workspace, wrong table, wrong schema. There are two Log
   Analytics workspaces per install, so **never index them by position**.
+- **Network controls after a networking change.** If the update touched NSG,
+  firewall, or private-endpoint parameters, run `just infra net-verify` and read
+  `egress.netprobe_result` (`denyProven`, `closingDenyProven`) plus any failing
+  `egress.netprobe_check` lines in the **egress** workspace (exit 3 when the NSG
+  is on but pinning was not used to prove a deny — **unverified in Azure** until
+  you have run it on that install).
 
 ### Verification pitfalls
 

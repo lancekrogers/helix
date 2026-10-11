@@ -201,8 +201,13 @@ const markerResolver: SecretResolver = {
 
 function makeApp(providers: ReturnType<typeof cacheFor>, opts: { wired?: boolean } = {}) {
   const config = {
-    limits: { maxBodyBytes: 1024 * 1024, timeoutMs: VENDOR_TIMEOUT_MS },
+    limits: {
+      maxBodyBytes: 1024 * 1024,
+      timeoutMs: VENDOR_TIMEOUT_MS,
+      llmTimeoutMs: VENDOR_TIMEOUT_MS * 6,
+    },
     allowPrivate: true,
+    extraBlockedCidrs: [] as EgressConfig["extraBlockedCidrs"],
     // The fixture vendor is http; the cleartext seam is a dev/test one.
     allowInsecureConnection: true,
   } as EgressConfig;

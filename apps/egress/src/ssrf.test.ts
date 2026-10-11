@@ -10,16 +10,29 @@ import { lookup } from "node:dns/promises";
 import {
   isBlockedAddress,
   makeValidatingConnector,
+  parseCidrList,
   resolveAndValidate,
   SsrfBlockedError,
+  type ParsedCidr,
 } from "./ssrf.js";
 
 const mockLookup = vi.mocked(lookup);
+const NO_EXTRA: readonly ParsedCidr[] = [];
 
 // resolveAndValidate calls lookup(host, { all: true }), which returns an array;
 // vi.mocked resolves to the single-address overload, so cast the array once here.
 function resolveTo(addrs: LookupAddress[]): void {
   mockLookup.mockResolvedValue(addrs as unknown as LookupAddress);
+}
+
+function embed(form: "mapped" | "nat64" | "compat" | "translated", v4: string): string {
+  const [a, b, c, d] = v4.split(".").map(Number) as [number, number, number, number];
+  const hi = ((a << 8) | b).toString(16);
+  const lo = ((c << 8) | d).toString(16);
+  const prefix = { mapped: "::ffff:", nat64: "64:ff9b::", compat: "::", translated: "::ffff:0:" }[
+    form
+  ];
+  return `${prefix}${hi}:${lo}`;
 }
 
 describe("isBlockedAddress — IPv6 forms now blocked", () => {
@@ -47,7 +60,7 @@ describe("isBlockedAddress — IPv6 forms now blocked", () => {
     "2001:db8::1", // documentation
     "ff02::1", // multicast
   ])("blocks %s", (ip) => {
-    expect(isBlockedAddress(ip)).toBe(true);
+    expect(isBlockedAddress(ip, NO_EXTRA)).toBe(true);
   });
 });
 
@@ -59,13 +72,90 @@ describe("isBlockedAddress — IPv6 public targets allowed", () => {
     "::ffff:8.8.8.8", // public v4-mapped — extraction allows it
     "64:ff9b::8.8.8.8", // NAT64-to-public — extraction allows it
   ])("allows %s", (ip) => {
-    expect(isBlockedAddress(ip)).toBe(false);
+    expect(isBlockedAddress(ip, NO_EXTRA)).toBe(false);
   });
 });
 
 describe("isBlockedAddress — zone identifiers", () => {
   it("strips the %zone and still classifies the base scope", () => {
-    expect(isBlockedAddress("fe80::1%eth0")).toBe(true);
+    expect(isBlockedAddress("fe80::1%eth0", NO_EXTRA)).toBe(true);
+  });
+});
+
+describe("isBlockedAddress — new IPv4 ranges (boundaries)", () => {
+  it.each([
+    ["168.63.129.16/32", "168.63.129.16", "168.63.129.16", "168.63.129.15", "168.63.129.17"],
+    ["192.0.2.0/24", "192.0.2.0", "192.0.2.255", "192.0.1.255", "192.0.3.0"],
+    ["198.51.100.0/24", "198.51.100.0", "198.51.100.255", "198.51.99.255", "198.51.101.0"],
+    ["203.0.113.0/24", "203.0.113.0", "203.0.113.255", "203.0.112.255", "203.0.114.0"],
+    ["192.88.99.0/24", "192.88.99.0", "192.88.99.255", "192.88.98.255", "192.88.100.0"],
+  ])("blocks first and last of %s", (_range, first, last) => {
+    expect(isBlockedAddress(first, NO_EXTRA)).toBe(true);
+    expect(isBlockedAddress(last, NO_EXTRA)).toBe(true);
+  });
+
+  it.each([
+    ["168.63.129.16/32", "168.63.129.15", "168.63.129.17"],
+    ["192.0.2.0/24", "192.0.1.255", "192.0.3.0"],
+    ["198.51.100.0/24", "198.51.99.255", "198.51.101.0"],
+    ["203.0.113.0/24", "203.0.112.255", "203.0.114.0"],
+    ["192.88.99.0/24", "192.88.98.255", "192.88.100.0"],
+  ])("allows the neighbors of %s", (_range, below, above) => {
+    expect(isBlockedAddress(below, NO_EXTRA)).toBe(false);
+    expect(isBlockedAddress(above, NO_EXTRA)).toBe(false);
+  });
+});
+
+describe("isBlockedAddress — new ranges through every embedded form", () => {
+  const rangeEndpoints = [
+    ["168.63.129.16/32", "168.63.129.16"],
+    ["192.0.2.0/24", "192.0.2.0", "192.0.2.255"],
+    ["198.51.100.0/24", "198.51.100.0", "198.51.100.255"],
+    ["203.0.113.0/24", "203.0.113.0", "203.0.113.255"],
+    ["192.88.99.0/24", "192.88.99.0", "192.88.99.255"],
+  ] as const;
+
+  for (const row of rangeEndpoints) {
+    const [label, ...addrs] = row;
+    for (const v4 of addrs) {
+      for (const form of ["mapped", "nat64", "compat", "translated"] as const) {
+        it(`blocks ${label} endpoint ${v4} as ${form}`, () => {
+          expect(isBlockedAddress(embed(form, v4), NO_EXTRA)).toBe(true);
+        });
+      }
+    }
+  }
+
+  it.each(["::ffff:a83f:8110", "64:ff9b::a83f:8110", "::a83f:8110", "::ffff:0:a83f:8110"])(
+    "blocks literal Azure platform spelling %s",
+    (ip) => {
+      expect(isBlockedAddress(ip, NO_EXTRA)).toBe(true);
+    },
+  );
+
+  it.each([embed("mapped", "168.63.129.17"), embed("translated", "8.8.8.8")])(
+    "allows public embedded %s",
+    (ip) => {
+      expect(isBlockedAddress(ip, NO_EXTRA)).toBe(false);
+    },
+  );
+});
+
+describe("isBlockedAddress — new IPv6 ranges", () => {
+  it.each([
+    ["3fff::/20", "3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"],
+    ["5f00::/16", "5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+  ])("blocks first and last of %s", (_range, first, last) => {
+    expect(isBlockedAddress(first, NO_EXTRA)).toBe(true);
+    expect(isBlockedAddress(last, NO_EXTRA)).toBe(true);
+  });
+
+  it.each([
+    ["3fff::/20", "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "3fff:1000::"],
+    ["5f00::/16", "5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "5f01::"],
+  ])("allows the neighbors of %s", (_range, below, above) => {
+    expect(isBlockedAddress(below, NO_EXTRA)).toBe(false);
+    expect(isBlockedAddress(above, NO_EXTRA)).toBe(false);
   });
 });
 
@@ -79,11 +169,11 @@ describe("isBlockedAddress — IPv4 ranges (regression)", () => {
     "100.64.0.1",
     "0.0.0.0",
   ])("blocks %s", (ip) => {
-    expect(isBlockedAddress(ip)).toBe(true);
+    expect(isBlockedAddress(ip, NO_EXTRA)).toBe(true);
   });
 
   it.each(["8.8.8.8", "1.1.1.1"])("allows %s", (ip) => {
-    expect(isBlockedAddress(ip)).toBe(false);
+    expect(isBlockedAddress(ip, NO_EXTRA)).toBe(false);
   });
 });
 
@@ -99,13 +189,13 @@ describe("IPv4 alternate literals are normalized by the URL parser, not isBlocke
   ])("URL parser normalizes %s to 127.0.0.1", (url) => {
     const { hostname } = new URL(url);
     expect(hostname).toBe("127.0.0.1");
-    expect(isBlockedAddress(hostname)).toBe(true);
+    expect(isBlockedAddress(hostname, NO_EXTRA)).toBe(true);
   });
 
   it("defensively refuses an un-normalized bare-integer literal", () => {
     // Not the real defense (the URL layer is) — but a raw string that is neither
     // a dotted quad nor a valid IP literal hits the refuse-unrecognized branch.
-    expect(isBlockedAddress("2130706433")).toBe(true);
+    expect(isBlockedAddress("2130706433", NO_EXTRA)).toBe(true);
   });
 });
 
@@ -114,21 +204,21 @@ describe("resolveAndValidate — DNS AAAA rebind (mocked lookup)", () => {
 
   it("rejects a host whose AAAA is NAT64-embedded IMDS", async () => {
     resolveTo([{ address: "64:ff9b::a9fe:a9fe", family: 6 }]);
-    await expect(resolveAndValidate("api.partner.com", false)).rejects.toBeInstanceOf(
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).rejects.toBeInstanceOf(
       SsrfBlockedError,
     );
   });
 
   it("rejects a host whose AAAA is a hex v4-mapped loopback", async () => {
     resolveTo([{ address: "::ffff:7f00:1", family: 6 }]);
-    await expect(resolveAndValidate("api.partner.com", false)).rejects.toBeInstanceOf(
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).rejects.toBeInstanceOf(
       SsrfBlockedError,
     );
   });
 
   it("resolves a genuinely public AAAA", async () => {
     resolveTo([{ address: "2606:4700:4700::1111", family: 6 }]);
-    await expect(resolveAndValidate("api.partner.com", false)).resolves.toEqual([
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).resolves.toEqual([
       { address: "2606:4700:4700::1111", family: 6 },
     ]);
   });
@@ -138,7 +228,7 @@ describe("resolveAndValidate — DNS AAAA rebind (mocked lookup)", () => {
       { address: "2606:4700:4700::1111", family: 6 },
       { address: "8.8.8.8", family: 4 },
     ]);
-    await expect(resolveAndValidate("api.partner.com", false)).resolves.toEqual([
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).resolves.toEqual([
       { address: "2606:4700:4700::1111", family: 6 },
       { address: "8.8.8.8", family: 4 },
     ]);
@@ -149,14 +239,38 @@ describe("resolveAndValidate — DNS AAAA rebind (mocked lookup)", () => {
       { address: "2606:4700:4700::1111", family: 6 },
       { address: "::ffff:7f00:1", family: 6 },
     ]);
-    await expect(resolveAndValidate("api.partner.com", false)).rejects.toBeInstanceOf(
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).rejects.toBeInstanceOf(
+      SsrfBlockedError,
+    );
+  });
+
+  it("rejects a host whose A record is the Azure platform address", async () => {
+    resolveTo([{ address: "168.63.129.16", family: 4 }]);
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).rejects.toBeInstanceOf(
+      SsrfBlockedError,
+    );
+  });
+
+  it("rejects the whole host when one A record is the Azure platform address (dual-record)", async () => {
+    resolveTo([
+      { address: "8.8.8.8", family: 4 },
+      { address: "168.63.129.16", family: 4 },
+    ]);
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).rejects.toBeInstanceOf(
+      SsrfBlockedError,
+    );
+  });
+
+  it("rejects a host whose AAAA is IPv4-translated Azure platform", async () => {
+    resolveTo([{ address: "::ffff:0:a83f:8110", family: 6 }]);
+    await expect(resolveAndValidate("api.partner.com", false, NO_EXTRA)).rejects.toBeInstanceOf(
       SsrfBlockedError,
     );
   });
 
   it("bypasses validation under the allowPrivate dev/test seam", async () => {
     resolveTo([{ address: "64:ff9b::a9fe:a9fe", family: 6 }]);
-    await expect(resolveAndValidate("api.partner.com", true)).resolves.toEqual([
+    await expect(resolveAndValidate("api.partner.com", true, NO_EXTRA)).resolves.toEqual([
       { address: "64:ff9b::a9fe:a9fe", family: 6 },
     ]);
   });
@@ -166,7 +280,7 @@ describe("resolveAndValidate — IP-literal branch", () => {
   beforeEach(() => mockLookup.mockReset());
 
   it("strips brackets and blocks a mapped-loopback literal without a DNS lookup", async () => {
-    await expect(resolveAndValidate("[::ffff:7f00:1]", false)).rejects.toBeInstanceOf(
+    await expect(resolveAndValidate("[::ffff:7f00:1]", false, NO_EXTRA)).rejects.toBeInstanceOf(
       SsrfBlockedError,
     );
     expect(mockLookup).not.toHaveBeenCalled();
@@ -191,7 +305,7 @@ describe("makeValidatingConnector — dial the validated addresses in order", ()
         { address: "::1", family: 6 }, // nothing listens here
         { address: "127.0.0.1", family: 4 }, // the real listener
       ]);
-      const connector = makeValidatingConnector(true, 5_000);
+      const connector = makeValidatingConnector(true, 5_000, NO_EXTRA);
       await new Promise<void>((resolve, reject) => {
         connector(
           {
@@ -231,7 +345,7 @@ describe("makeValidatingConnector — dial the validated addresses in order", ()
       { address: "::1", family: 6 },
       { address: "127.0.0.1", family: 4 },
     ]);
-    const connector = makeValidatingConnector(true, 5_000);
+    const connector = makeValidatingConnector(true, 5_000, NO_EXTRA);
     await new Promise<void>((resolve, reject) => {
       connector(
         {
@@ -252,4 +366,67 @@ describe("makeValidatingConnector — dial the validated addresses in order", ()
       );
     });
   }, 30_000);
+});
+
+describe("EGRESS_EXTRA_BLOCKED_CIDRS — isBlockedAddress", () => {
+  const list = parseCidrList("198.19.0.0/16,2001:db9::/32,203.0.114.0/25", "test");
+
+  it("blocks and allows at IPv4 extra-range boundaries", () => {
+    expect(isBlockedAddress("198.19.0.1", list)).toBe(true);
+    expect(isBlockedAddress("198.19.255.255", list)).toBe(true);
+    expect(isBlockedAddress("198.20.0.0", list)).toBe(false);
+  });
+
+  it("blocks and allows at IPv6 extra-range boundaries", () => {
+    expect(isBlockedAddress("2001:db9::1", list)).toBe(true);
+    expect(isBlockedAddress("2001:dba::1", list)).toBe(false);
+  });
+
+  it("blocks and allows at a narrow IPv4 extra range", () => {
+    expect(isBlockedAddress("203.0.114.127", list)).toBe(true);
+    expect(isBlockedAddress("203.0.114.128", list)).toBe(false);
+  });
+
+  it("blocks embedded IPv4 forms when the v4 address is in an extra range", () => {
+    const v4 = "203.0.114.1";
+    for (const form of ["mapped", "nat64", "compat", "translated"] as const) {
+      expect(isBlockedAddress(embed(form, v4), list)).toBe(true);
+      expect(isBlockedAddress(embed(form, v4), NO_EXTRA)).toBe(false);
+    }
+  });
+
+  it("does not change built-in blocking when the extra list is empty", () => {
+    expect(isBlockedAddress("10.0.0.1", NO_EXTRA)).toBe(true);
+    expect(isBlockedAddress("8.8.8.8", NO_EXTRA)).toBe(false);
+  });
+});
+
+describe("EGRESS_EXTRA_BLOCKED_CIDRS — resolveAndValidate", () => {
+  const list = parseCidrList("203.0.114.0/25", "test");
+
+  beforeEach(() => mockLookup.mockReset());
+
+  it("refuses a name that resolves into an extra range", async () => {
+    resolveTo([{ address: "203.0.114.10", family: 4 }]);
+    await expect(resolveAndValidate("extra.example", false, list)).rejects.toBeInstanceOf(
+      SsrfBlockedError,
+    );
+  });
+
+  it("allows the same resolution under allowPrivate", async () => {
+    resolveTo([{ address: "203.0.114.10", family: 4 }]);
+    await expect(resolveAndValidate("extra.example", true, list)).resolves.toEqual([
+      { address: "203.0.114.10", family: 4 },
+    ]);
+  });
+
+  it("refuses the whole host when any address is in an extra range (dual-record)", async () => {
+    resolveTo([
+      { address: "8.8.8.8", family: 4 },
+      { address: "203.0.114.10", family: 4 },
+    ]);
+    await expect(resolveAndValidate("mixed.example", false, list)).rejects.toBeInstanceOf(
+      SsrfBlockedError,
+    );
+  });
 });

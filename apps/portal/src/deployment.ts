@@ -44,6 +44,47 @@ export function resolveAppPublicBase(env: NodeJS.ProcessEnv = process.env): URL 
   }
 }
 
+/**
+ * Scheme + host + port of the control domain (`CONTROL_PUBLIC_BASE`): where the
+ * auth host (`auth.`) lives. Optional — unset or blank means the control hosts
+ * share the apps domain, which is the single-domain layout. When set it must
+ * agree with the edge's EDGE_CONTROL_DOMAIN; the two come from one Bicep
+ * parameter, and a mismatch fails at the vendor's redirect-URI check.
+ */
+export function resolveControlPublicBase(env: NodeJS.ProcessEnv = process.env): URL {
+  const apps = resolveAppPublicBase(env);
+  const raw = env.CONTROL_PUBLIC_BASE?.trim();
+  if (!raw) return apps;
+  let control: URL;
+  try {
+    control = new URL(raw);
+  } catch {
+    throw new Error(`CONTROL_PUBLIC_BASE is not a valid absolute URL: ${raw}`);
+  }
+  if (control.protocol !== apps.protocol || control.port !== apps.port) {
+    throw new Error(
+      `CONTROL_PUBLIC_BASE (${control.origin}) must use the same scheme and port as ` +
+        `APP_PUBLIC_BASE (${apps.origin}): the edge serves both on one listener.`,
+    );
+  }
+  if (control.hostname.endsWith(`.${apps.hostname}`)) {
+    throw new Error(
+      `CONTROL_PUBLIC_BASE (${control.hostname}) must not be a subdomain of the apps host ` +
+        `(${apps.hostname}): an app could set cookies that reach the control hosts.`,
+    );
+  }
+  for (const label of ["auth", "portal", "dev-api"] as const) {
+    const onLabel = `${label}.${control.hostname}`;
+    if (apps.hostname === onLabel || apps.hostname.endsWith(`.${onLabel}`)) {
+      throw new Error(
+        `APP_PUBLIC_BASE (${apps.hostname}) must not be on or under ${onLabel} ` +
+          `(CONTROL_PUBLIC_BASE ${control.hostname}): an app could set cookies that reach the control hosts.`,
+      );
+    }
+  }
+  return control;
+}
+
 /** `<slug>.<base host>` — the app's host, no scheme. */
 export function appPublicHost(slug: string, env: NodeJS.ProcessEnv = process.env): string {
   return `${slug}.${resolveAppPublicBase(env).host}`;
@@ -57,20 +98,16 @@ export function appPublicUrl(slug: string, env: NodeJS.ProcessEnv = process.env)
 
 /**
  * The fixed OAuth callback URL an administrator registers with the vendor:
- * `auth.<APP_PUBLIC_BASE host>` + {@link CONNECTIONS_CALLBACK_PATH} — the
- * reserved-subdomain convention the edge's host classifier routes to the auth
- * host (apps/edge/src/routing/hosts.ts, `classifyHost`). The edge's
- * `/connections/*` reverse proxy forwards that prefix to this portal, and the
- * shared constant is the single source both planes read (the keep-in-sync
- * convention REGISTRY_CHANNEL sets, sourced in @azx-pbc/shared).
- *
- * Derived, never configured: the edge owns the auth base as a single source,
- * and a second auth-base config field here could drift from it. Served at
- * runtime through the providers
- * payload, never a build-time variable.
+ * `auth.<control host>` + {@link CONNECTIONS_CALLBACK_PATH}. The control base
+ * defaults to {@link resolveAppPublicBase} (single-domain layout); when hosted
+ * apps use a separate domain, set `CONTROL_PUBLIC_BASE` to match the edge's
+ * `EDGE_CONTROL_DOMAIN`. The edge's host classifier routes `auth.<control>` to
+ * the auth host (apps/edge/src/routing/hosts.ts); its `/connections/*` reverse
+ * proxy forwards that prefix to this portal. {@link CONNECTIONS_CALLBACK_PATH}
+ * in @azx-pbc/shared is the path both planes read.
  */
 export function connectionsCallbackUrl(env: NodeJS.ProcessEnv = process.env): string {
-  const base = resolveAppPublicBase(env);
+  const base = resolveControlPublicBase(env);
   return `${base.protocol}//auth.${base.host}${CONNECTIONS_CALLBACK_PATH}`;
 }
 
@@ -130,6 +167,7 @@ export function resolveEgressBaseUrl(env: NodeJS.ProcessEnv = process.env): URL 
  */
 export function assertDeploymentConfig(env: NodeJS.ProcessEnv = process.env): void {
   resolveAppPublicBase(env);
+  resolveControlPublicBase(env);
   resolveDevApiBase(env);
   resolveEgressBaseUrl(env);
 }

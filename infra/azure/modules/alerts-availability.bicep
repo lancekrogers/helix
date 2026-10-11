@@ -15,8 +15,9 @@
 // WHAT IT PROBES, and why that URL. `/health` on an APP host serves app content
 // (a deployed file called `/health`, or the SPA fallback) — the edge's host
 // router mounts platform routes on platform hosts only. `auth.<appsDomain>` is
-// the auth host and answers the platform health JSON, so that is the edge's
-// probe URL. `dev-api.<appsDomain>` deliberately is NOT probed even when the
+// the auth host and answers the platform health JSON, so that is the control
+// certificate's probe URL; when the domain split is live, `www.<hostedAppsDomain>`
+// probes the apps-domain certificate the same way. `dev-api.<appsDomain>` deliberately is NOT probed even when the
 // dev-gateway is deployed: `dev-api` is a valid app slug and is not in
 // RESERVED_SUBDOMAINS, so the edge image classifies that host as an app and
 // serves assets from it — a probe there gets a 404, not a health body.

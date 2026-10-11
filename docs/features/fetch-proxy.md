@@ -1,6 +1,6 @@
 # Fetch proxy
 
-> **Related ADRs:** [ADR-0005](../adr/0005-ssrf-egress-controls.md) (SSRF + secret injection) · [ADR-0013](../adr/0013-egress-trust-model.md) (egress trust model) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split / edge posture) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0031](../adr/0031-connection-providers-delegated-auth.md) (connection providers — the delegated-auth catalog).
+> **Related ADRs:** [ADR-0005](../adr/0005-ssrf-egress-controls.md) (SSRF + secret injection) · [ADR-0013](../adr/0013-egress-trust-model.md) (egress trust model) · [ADR-0001](../adr/0001-three-runtime-split.md) (three-runtime split / edge posture) · [ADR-0014](../adr/0014-same-origin-api-gateway.md) (same-origin API gateway) · [ADR-0031](../adr/0031-connection-providers-delegated-auth.md) (connection providers — the delegated-auth catalog). Network layers beyond the application filter: [network-controls.md](./network-controls.md).
 
 Apps call third-party APIs through a same-origin URL, for example
 `fetch('/_api/fetch/https://api.github.com/...')`. The platform checks permissions,
@@ -33,17 +33,36 @@ decides *whether* the call may happen and to *where*; egress actually makes it.
    (`capabilities.fetch.origins`, projected as `proxyConnections`). Not present ⇒
    `403`, before anything leaves the edge. Direct-CSP origins
    (`externalOrigins`) are a separate list and are *not* proxied.
-4. **Quota.** A per-app `requestsPerDay` budget (block-new/finish-in-flight),
+4. **Worker loads refused.** `Sec-Fetch-Dest` values `worker`, `sharedworker`, and
+   `serviceworker`, and any request carrying a `Service-Worker` header, get `403` before egress
+   (same posture as the asset handler). Navigations that would treat the response as a document are
+   refused too.
+5. **Quota.** A per-app `requestsPerDay` budget (block-new/finish-in-flight),
    counted from `gateway_calls`.
-5. **Attest + forward.** The edge mints a short-lived signed instruction
+6. **Concurrency cap (optional).** When `EDGE_FETCH_MAX_APP_IN_FLIGHT` is
+   positive, the edge holds a Postgres lease on `fetch:app:<appId>` for the
+   whole response (including a streamed body) and refuses over-cap calls with
+   `429 rate_limited` before minting an instruction. `0` disables — no extra
+   database round trip. Lease TTL is ten minutes; a call that outlives it stops
+   counting (at most one residual slot per such call).
+7. **Attest + forward.** The edge mints a short-lived signed instruction
    `(app, user, capability, origin, connection?, request-id)` and forwards the
    request + instruction to egress over the `EgressProvider` HTTP seam. The edge
    has **no grant on `app_secrets`** (it cannot read an app's connection secret)
-   and no *arbitrary* outbound route — only egress reaches the open internet — so
-   it can only ask egress to make a call it already authorized. The edge is *not*
+   and, when `deployFirewall` is true, no general outbound internet route — only
+   egress reaches the open internet (with the firewall off, edge and portal have
+   default internet egress; see `infra/azure/README.md` and
+   [network-controls.md](./network-controls.md)) — so it can only ask egress to make
+   a call it already authorized. The edge is *not*
    secretless, though: it holds its own operational keys (auth/instruction/OIDC)
    and today an over-broad Blob access key (tightening that to a read-only managed
    identity is tracked). (ADR-0001.)
+
+On the way back, the edge sets `content-security-policy: default-src 'none'` on every proxied
+response (a backstop if a worker-destination check is ever bypassed) and strips upstream policy
+headers. `service-worker-allowed` and `alt-svc` are on the shared response blocklist with the other
+relay headers — only the platform offline worker route (`/_helix/sw.js`) emits
+`Service-Worker-Allowed`.
 
 ### `helix-egress` (mechanism plane)
 
@@ -63,7 +82,11 @@ plaintext secrets or the public internet:
    connection on the plane that holds plaintext secrets, and attaches the
    idle-client `'error'` listener (ADR-0002 ISSUE-05).
 3. **SSRF controls** (`apps/egress/src/ssrf.ts`): resolve every address and
-   refuse private / loopback / link-local / `169.254.169.254` (IMDS); pin the
+   refuse private / loopback / link-local / `169.254.169.254` (IMDS), the Azure
+   platform address `168.63.129.16`, and IPv4 documentation ranges (TEST-NET-1/2/3
+   and the deprecated 6to4 relay anycast); an install may add more blocked CIDRs
+   with `EGRESS_EXTRA_BLOCKED_CIDRS` (the dev `EGRESS_ALLOW_PRIVATE` seam bypasses
+   that list too); pin the
    connection to the validated IP (cert/SNI still checked against the hostname),
    defeating DNS rebinding; no redirect-following (undici 7 only follows redirects
    when a `redirect` interceptor is composed onto the dispatcher, and egress
@@ -71,11 +94,17 @@ plaintext secrets or the public internet:
    `Location` is stripped so the browser can't chase it either; issue #10).
 4. **Header controls** — a **request-header safelist** (the app's
    `cookie`/`authorization` never go upstream: no session leak, no overriding the
-   injected credential) plus a **response-header blocklist** (`set-cookie` and
-   friends stripped off the response). The response blocklist has tracked gaps
-   today — it omits `authorization`/`www-authenticate` (#7), the body caps read
-   only `content-length` (#8), and the injection path still accepts cleartext
-   `http://` (#11). (ADR-0005.)
+   injected credential) plus a **response-header blocklist** that strips
+   credential and transport headers (`set-cookie`, `authorization`, `location`,
+   hop-by-hop names, and similar), policy and reporting headers that would apply
+   to the app origin if copied through (`clear-site-data`,
+   `content-security-policy`, `content-security-policy-report-only`, `refresh`,
+   `report-to`, `reporting-endpoints`, `nel`, `service-worker-allowed`, `alt-svc`), while keeping
+   headers apps rely
+   on (`link`, `www-authenticate`, `etag`, rate-limit headers, and
+   `content-location` with any injected query credential redacted). The body caps
+   read only `content-length` (#8), and the injection path still accepts
+   cleartext `http://` (#11). (ADR-0005.)
 5. **Stream** the upstream response straight back through the edge to the
    browser; never buffered.
 
@@ -407,6 +436,31 @@ build well:
   control's label/state and announce it (a polite live region, or focus the
   control), rather than replacing the page or stealing focus with a modal.
 
+## Network probe (`pnpm probe`)
+
+The egress image ships a standalone probe (`apps/egress/src/netprobe.ts`) used by the
+Azure `<prefix>-netprobe` job and by local net simulation. It reads only `PROBE_*`
+environment variables (no secrets). Posture and rollout: [network-controls.md](./network-controls.md).
+When `deployFirewall` is true, see also `infra/azure/README.md`.
+
+| Variable | Meaning |
+| --- | --- |
+| `PROBE_PE_ADDRESSES` | `pinned` — require the four `PROBE_*_IP` values and run private-endpoint checks; `dynamic` — those four must be unset or empty and endpoint checks are skipped |
+| `PROBE_EXPECT_NSG` | `off`, `deny-list-only`, or `enforce` |
+| `PROBE_EXPECT_FIREWALL` | `true` or `false` |
+| `PROBE_EXPECT_FQDN_ALLOWLIST` | `true` or `false` (requires firewall true) |
+| `PROBE_APPS_IP` | Apps environment static IP (informational check) |
+| `PROBE_KV_PLATFORM_IP`, `PROBE_BLOB_PE_IP`, `PROBE_KV_CONNECTIONS_IP`, `PROBE_KV_DELEGATED_IP` | Private-endpoint IPs when `PROBE_PE_ADDRESSES=pinned` |
+| `PROBE_POSTGRES_HOST` | Postgres FQDN (positive control) |
+| `PROBE_ALLOWED_HOST` | Public host expected reachable on 443 |
+| `PROBE_CANARY_HOST` | Public host expected blocked when allow-list mode is on |
+| `PROBE_CLOSING_DENY_TARGET` | Optional `host:port` (port not 80 or 443) for the `closing-deny` check when proving `enforce` with the firewall off |
+| `PROBE_FQDN_PROTOCOL` | Optional `tls` (default) or `tcp` for public host checks |
+| `PROBE_TIMEOUT_MS` | Optional connect timeout in ms (default 5000) |
+
+Stdout uses `egress.netprobe_check` per check and `egress.netprobe_result` for the
+summary (`ok`, `denyProven`, `closingDenyProven`); see `docs/design/logging.md`.
+
 ## Key files
 
 - `apps/edge/src/gateway/fetch.ts` — `makeFetchHandler`, the policy plane.
@@ -415,7 +469,7 @@ build well:
 - `apps/edge/src/serving/connectHelper.ts` — the `window.helix.connect` helper script.
 - `apps/edge/src/routing/consentStart.ts` — the raw consent entry route + its terminal pages.
 - `apps/edge/src/gateway/instruction.ts` — mints the attested instruction.
-- `apps/egress/src/{proxy,ssrf,instruction}.ts` — the mechanism plane: verify, inject, SSRF, stream.
+- `apps/egress/src/{proxy,ssrf,instruction,netprobe}.ts` — the mechanism plane: verify, inject, SSRF, stream, plus the standalone network posture probe entry point.
 - `apps/egress/src/delegated.ts` — delegated-call resolution: the caller's connection, renewal, and the error taxonomy.
 - `packages/shared/src/{instruction,manifest}.ts` — the instruction payload + `capabilities.fetch` schema.
 - `packages/shared/src/consent.ts` — the completion-message and helper-result contracts.
@@ -430,8 +484,9 @@ build well:
   (authenticates to Key Vault as itself) and **own** network zone — a forked
   process shares both and "buys you almost nothing." The split buys three things:
   credential isolation that is true-by-architecture not by-code-review;
-  **network/SSRF isolation** (the big one — the edge has no *arbitrary* outbound
-  route, only egress reaches the open internet, so an SSRF bug in the edge itself
+  **network/SSRF isolation** (the big one — with `deployFirewall` true the edge has
+  no general outbound route; only egress reaches the open internet, so an SSRF bug
+  in the edge itself
   reaches nothing; ADR-0001); and dependency
   isolation (the fat HTTP deps live on egress, the edge stays minimal §3). Honest
   limit: extraction *relocates* the all-secrets read, it doesn't eliminate it —
@@ -468,8 +523,8 @@ build well:
   brackets (`[::1]`) which `isIP` rejects — they're stripped before resolve. The
   whole host is refused if *any* resolved address is blocked (defeats a
   dual-A-record split), and the connection is pinned to the validated IP against
-  rebind. App-layer checks here are the belt; an NSG/firewall is the
-  network-layer suspenders in prod.
+  rebind. App-layer checks here are the baseline; the `snet-egress` NSG and the
+  optional Azure Firewall are the network tiers ([network-controls.md](./network-controls.md)).
 
 ## Planned / not yet built
 

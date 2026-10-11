@@ -119,6 +119,88 @@ describe("GET /api/v1/csp/violations", () => {
     expect(find("script-src", "https://granted.example/lib.js")?.resolved).toBe(false);
     expect(find("connect-src", "https://other.example/x")?.resolved).toBe(false);
   });
+
+  it("resolves img-src only when the origin is granted; never object-src", async () => {
+    const slug = uniqueSlug();
+    const created = await t.app.inject({
+      method: "POST",
+      url: "/api/v1/apps",
+      headers: owner,
+      payload: { slug, displayName: "img" },
+    });
+    const appId = created.json().id as string;
+
+    await t.prisma.app.update({
+      where: { id: appId },
+      data: { capabilities: { externalOrigins: ["https://granted.example"] } },
+    });
+
+    await t.prisma.cspReport.create({
+      data: { appId, directive: "img-src", blockedUri: "https://granted.example/pic.png" },
+    });
+    await t.prisma.cspReport.create({
+      data: { appId, directive: "img-src", blockedUri: "https://other.example/pic.png" },
+    });
+    await t.prisma.cspReport.create({
+      data: { appId, directive: "object-src", blockedUri: "https://granted.example/x.swf" },
+    });
+    await t.prisma.cspReport.create({
+      data: { appId, directive: "img-src", blockedUri: "data" },
+    });
+
+    const res = await t.app.inject({
+      method: "GET",
+      url: "/api/v1/csp/violations",
+      headers: admin,
+    });
+    expect(res.statusCode).toBe(200);
+    const mine = (
+      res.json().violations as Array<{
+        appSlug: string;
+        directive: string;
+        blockedUri: string;
+        resolved: boolean;
+      }>
+    ).filter((v) => v.appSlug === slug);
+
+    const find = (directive: string, blockedUri: string) =>
+      mine.find((v) => v.directive === directive && v.blockedUri === blockedUri);
+
+    expect(find("img-src", "https://granted.example/pic.png")?.resolved).toBe(true);
+    expect(find("img-src", "https://other.example/pic.png")?.resolved).toBe(false);
+    expect(find("object-src", "https://granted.example/x.swf")?.resolved).toBe(false);
+    expect(find("img-src", "data")?.resolved).toBe(false);
+  });
+
+  it("excludes violations older than the lookback window", async () => {
+    const slug = uniqueSlug();
+    const created = await t.app.inject({
+      method: "POST",
+      url: "/api/v1/apps",
+      headers: owner,
+      payload: { slug, displayName: "old" },
+    });
+    const appId = created.json().id as string;
+
+    await t.prisma.cspReport.create({
+      data: { appId, directive: "img-src", blockedUri: "https://recent.example/x" },
+    });
+    await t.prisma.$executeRaw`
+      INSERT INTO csp_reports (id, "appId", directive, "blockedUri", "createdAt")
+      VALUES (gen_random_uuid(), ${appId}::uuid, 'img-src', 'https://stale.example/x', NOW() - INTERVAL '31 days')`;
+
+    const res = await t.app.inject({
+      method: "GET",
+      url: "/api/v1/csp/violations",
+      headers: admin,
+    });
+    expect(res.statusCode).toBe(200);
+    const mine = (res.json().violations as Array<{ appSlug: string; blockedUri: string }>).filter(
+      (v) => v.appSlug === slug,
+    );
+    expect(mine.some((v) => v.blockedUri === "https://recent.example/x")).toBe(true);
+    expect(mine.some((v) => v.blockedUri === "https://stale.example/x")).toBe(false);
+  });
 });
 
 describe("POST /api/v1/apps/:slug/access/origin", () => {
@@ -142,7 +224,9 @@ describe("POST /api/v1/apps/:slug/access/origin", () => {
     // Not applied until approved.
     expect(res.json().manifest.capabilities.externalOrigins).toEqual([]);
 
-    const reqs = await t.prisma.approvalRequest.findMany({ where: { appId: created.json().id } });
+    const reqs = await t.prisma.approvalRequest.findMany({
+      where: { appId: created.json().id },
+    });
     expect(reqs).toHaveLength(1);
     expect(reqs[0]?.risk).toBe("med");
   });

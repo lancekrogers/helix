@@ -54,8 +54,53 @@ param postgresStorageSizeGB int = 32
 @description('Public apps domain, e.g. azx.helix.azxlabs.io.')
 param appsDomain string = 'azx.helix.azxlabs.io'
 
-@description('Display-only month-to-date platform spend watch line in USD, surfaced on the admin Activity page via GET /api/v1/config. Defaults to 1000 so an install gets a budget signal without being configured for one; set 0 to show no ceiling. Nothing enforces this — per-app daily token budgets are the real limit.')
+@description('Address space of the VNet. The subnet prefixes below are fixed inside the 10.0.0.0/16 default; changing this to a range that does not contain them fails the deployment.')
+param vnetAddressPrefix string = '10.0.0.0/16'
+
+@sealed()
+type PrivateEndpointAddresses = {
+  kvPlatform: string?
+  kvConnections: string?
+  kvDelegated: string?
+  blob: string?
+}
+
+@description('When pinPrivateEndpointAddresses is true, override the fixed addresses of the four private endpoints in snet-pe. Keys: kvPlatform, kvConnections, kvDelegated, blob. Omitted keys use the defaults (.4–.7 of the endpoint subnet). On an existing install that already has dynamic addresses, leave pinPrivateEndpointAddresses false unless you have listed current endpoint IPs (az network private-endpoint list), chosen non-clashing values, and accept that Azure may require recreating the endpoints to change an address (unverified). Static ipConfigurations on private endpoints are unverified in Azure for API version 2024-05-01.')
+param privateEndpointAddresses PrivateEndpointAddresses = {}
+
+@description('Emit static ipConfigurations on the four snet-pe private endpoints. Default false keeps Azure-assigned dynamic addresses (safe for existing installs). New installs should set true so an egress NSG can name the Key Vault and Blob destinations; existing installs should enable only after reading live addresses and picking non-clashing pins.')
+param pinPrivateEndpointAddresses bool = false
+
+@description('Display-only month-to-date platform spend watch line in USD, surfaced on the admin Activity page via GET /api/v1/config. Defaults to 1000 so an install gets a budget signal without being configured for one; set 0 to show no ceiling. When llmPlatformDollarsPerDay is -1, the enforced daily LLM ceiling derives from one tenth of this value with a floor of three times llmDefaultDollarsPerDay.')
 param platformMonthlyUsdCap int = 1000
+
+@description('Daily LLM spend budget in USD applied to any app whose manifest sets no dollarsPerDay (EDGE_LLM_DEFAULT_DOLLARS_PER_DAY on the edge and dev gateway). Mirrors BASELINE_DOLLARS_PER_DAY (50) in packages/shared/src/approval.ts; raising it enforces more than the approval classifier showed the approver. 0 = an unset budget is unlimited.')
+@minValue(0)
+param llmDefaultDollarsPerDay int = 50
+
+@description('Platform-wide daily LLM spend ceiling in USD, enforced by the edge (EDGE_LLM_PLATFORM_DOLLARS_PER_DAY): once the day\'s spend across all apps reaches it, new LLM calls are refused with 503 until local midnight. -1 (default) derives max(one tenth of platformMonthlyUsdCap, three times llmDefaultDollarsPerDay) — 150 when both defaults apply; when platformMonthlyUsdCap is 0 the monthly tenth is 100 before that floor. 0 switches the ceiling off, for a one-organization install (ADR-0028). An explicit value is kept as set. Needs the platform_llm_spend_micro_usd migration applied before the edge image.')
+@minValue(-1)
+param llmPlatformDollarsPerDay int = -1
+
+@description('Max concurrent LLM calls per app across all edge replicas (EDGE_LLM_MAX_APP_IN_FLIGHT on the edge and dev gateway). 0 disables.')
+@minValue(0)
+param llmMaxAppInFlight int = 10
+
+@description('Max concurrent LLM calls per authenticated user per app (EDGE_LLM_MAX_USER_IN_FLIGHT). Anonymous callers are not bucketed by user. 0 disables.')
+@minValue(0)
+param llmMaxUserInFlight int = 3
+
+@description('Max concurrent LLM calls on each edge replica (EDGE_LLM_MAX_IN_FLIGHT). Per replica by design. 0 disables.')
+@minValue(0)
+param llmMaxInFlight int = 200
+
+@description('Wall-clock deadline for one upstream LLM call in milliseconds (EDGE_LLM_MAX_CALL_MS). Also bounds lease TTL on the edge.')
+@minValue(1000)
+@maxValue(2147483647)
+param llmMaxCallMs int = 600000
+
+// Egress LLM vendor idle timeout — must exceed llmMaxCallMs (see EGRESS_LLM_TIMEOUT_MARGIN_MS).
+var egressLlmTimeoutMs = llmMaxCallMs + 120000
 
 @description('Max uncompressed size in MB of any single file in a deployed bundle.')
 param deployMaxFileMb int = 50
@@ -66,6 +111,10 @@ param deployMaxBundleMb int = 250
 @description('Per-direction body cap in MB for the /_api/fetch proxy, enforced independently by the edge, the dev gateway and egress. Bodies are streamed, not buffered, so this bounds bytes per call rather than memory.')
 @minValue(1)
 param fetchMaxBodyMb int = 25
+
+@description('Max concurrent fetch-proxy calls per app across all edge replicas (EDGE_FETCH_MAX_APP_IN_FLIGHT on the edge and dev gateway). 0 disables. Lease TTL is ten minutes; a call that outlives it stops counting against the cap.')
+@minValue(0)
+param fetchMaxAppInFlight int = 0
 
 @description('Blob container for app bundles.')
 param blobContainerName string = 'app-bundles'
@@ -368,8 +417,44 @@ param llmMonthlyBudgetUsd int = 1000
 @description('Budget start date. Must be the first of a month and, for a monthly budget, no earlier than the current one — so it defaults to the first of the current month at deploy time rather than a date that would age out of validity. Pin it in the .bicepparam if you want deploys to stop touching it.')
 param budgetStartDate string = utcNow('yyyy-MM-01')
 
-@description('Deploy the Azure Firewall that enforces the egress-only network zone (ADR-0001) — the PRIMARY SSRF/egress control per ADR-0005. Default true (secure by default). Setting false SKIPS the firewall + its forced-tunnel routes to save ~$900/mo: the apps subnet then gets default internet egress, so a compromised edge can reach the internet and the only remaining outbound control is the egress app-level denylist (defense-in-depth). Data services stay private (private endpoints) either way. Only disable for dev / smoketest / trusted single-tenant installs — NOT production or untrusted-app hosting. See README "Optional: the egress firewall".')
+@description('Deploy the Azure Firewall FQDN-filtering tier for the egress-only network zone (ADR-0001). Default true. The baseline for every install is the egress application filter (apps/egress/src/ssrf.ts) plus the snet-egress NSG (egressNsgEnforce); the firewall is the stronger optional tier when enabled. Setting false SKIPS the firewall + its forced-tunnel routes to save ~$900/mo: both app subnets get default internet egress, so a compromised edge can reach the internet directly while egress traffic remains governed by ssrf.ts and the NSG. Data services stay private (private endpoints) either way. Only disable for dev / smoketest / trusted single-tenant installs — NOT production or untrusted-app hosting. See README "Optional: the egress firewall".')
 param deployFirewall bool = true
+
+@allowed(['any', 'allowlist'])
+@description('''
+  Egress internet FQDN mode when deployFirewall is true. any = snet-egress may reach every FQDN on 80/443 (existing firewall installs stay here on template update). allowlist = only platform hosts plus egressAllowedFqdnsEffective (LLM vendors, operator additions). New reference parameter files set allowlist; flipping modes is explicit. Each new approved origin needs its host in egressAllowedFqdns and a template apply — run just infra egress-hosts to see drift.''')
+param egressFqdnMode string = 'any'
+
+@description('Operator additions to the egress product allow-list (connection-provider hosts, approved fetch origins). LLM vendor hosts are derived from llm* params and egressManagedIdentityConnections. Ignored when egressFqdnMode is any.')
+param egressAllowedFqdns array = []
+
+@description('''
+  Firewall threat intelligence mode (only when deployFirewall is true). Default Deny blocks known-bad destinations; Alert logs without blocking; Off disables intel. Deny can false-positive on a vendor IP — use firewall logs to diagnose and set Alert to revert to log-only. Whether Basic firewall SKU supports Deny is unverified in Azure (this template uses Standard). Existing installs that used Alert before this parameter can set threatIntelMode = 'Alert' to avoid a stricter default on upgrade.''')
+@allowed(['Alert', 'Deny', 'Off'])
+param threatIntelMode string = 'Deny'
+
+@allowed(['off', 'deny-list-only', 'enforce'])
+@description('''
+  Subnet NSG on snet-egress (layer 2 egress control). Default deny-list-only: the explicit deny rules (private ranges, platform addresses, other subnets) without the closing deny-all, so default AllowInternetOutBound remains for ports outside egressAllowedPorts. It is the default because the platform-flow rules are unverified in Azure and a closing deny-all that misses one would cut egress on an existing install's next deploy. enforce adds the closing deny-all on outbound internet (row 4000) and the 100.64.0.0/10 deny row: choose it for a new install, and on an existing install after net-verify passes. off detaches the NSG from snet-egress; a previously created NSG resource remains in the resource group until you delete it. Whether a populated Container Apps subnet accepts an NSG as an update is unverified in Azure; test on a scratch copy first. Platform flows in the rule table (own-subnet, MCR, Front Door, Entra, Monitor, DNS via 168.63.129.16, inbound ILB source) are unverified in Azure until net-verify. A wrongly tight inbound rule blocks edge→egress (EDGE_EGRESS_URL); the net probe cannot test inbound — use README "Verifying the isolation (post-deploy)" after apply. Approved fetch origins on ports other than egressAllowedPorts stop working once rules 300 and 4000 are active.''')
+param egressNsgEnforce string = 'deny-list-only'
+
+@description('TCP ports the egress NSG internet allow (row 300) opens. Default 80 and 443. Non-standard ports need explicit values here and in any firewall allow-list when deployFirewall is true.')
+param egressAllowedPorts array = [
+  '80'
+  '443'
+]
+
+@description('Deploy the scheduled network probe job and its log alerts in the egress environment. Requires deployApps. Turn off for an install that cannot run the job yet.')
+param deployNetprobe bool = true
+
+@description('Public host the probe expects to reach on 443 — must stay on the egress platform firewall list in every mode. Default mcr.microsoft.com.')
+param netprobeAllowedHost string = 'mcr.microsoft.com'
+
+@description('Public host deliberately not on any allow-list; used to test firewall allow-list mode.')
+param netprobeCanaryHost string = 'example.net'
+
+@description('Optional host:port outside egressAllowedPorts (not 80 or 443) for the closing-deny probe check. Set only when proving enforce closing deny with the firewall off; leave empty on normal installs.')
+param netprobeClosingDenyTarget string = ''
 
 @description('Log verbosity for all four services (pino levels: fatal|error|warn|info|debug|trace|silent). Sets LOG_LEVEL, which every service reads unless its own <PREFIX>_LOG_LEVEL overrides it — so this one line raises the whole platform, and a per-service override raises just the noisy one. Applied per revision: changing it rolls a new ACA revision rather than taking effect on the running one. NOTE debug/trace on the edge is a data-exposure decision as much as a volume one — this stdout is retained in Log Analytics for 30 days.')
 @allowed(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
@@ -387,6 +472,18 @@ param acmeServer string = 'https://acme-staging-v02.api.letsencrypt.org/director
 @description('Declare the wildcard TLS custom-domain bindings in-template (ADR-0044), referencing the cert in the ACA environment store by its deterministic name. TRUE only after the certbot bootstrap has run — a cert must exist before a hostname can bind, the one ordering a declarative template cannot express, and this flag bridges it: a gated apply on an install with no cert fails LOUDLY at the app PUT (invalid certificate reference) rather than silently. While false, applies keep the pre-ADR-0044 semantics: customDomains is omitted from the ingress entirely and any runtime-made binding is stripped (README "Known deploy gotchas"). Leave false for a fresh install\'s apps-phase apply, flip it after the first certbot job run, and never look back. Set it LITERALLY in the params file — do not source it from an env var: readEnvironmentVariable renders a set-but-blank variable as \'\' = false, and the blank direction is the silent-wipe one.')
 param wildcardTlsBound bool = false
 
+@description('Serve hosted apps on a separate domain from the control hosts (auth., portal., dev-api.). Empty (default) = apps stay on appsDomain, the single-domain layout. When set, appsDomain becomes the CONTROL domain (auth/portal/dev-api, Entra and vendor callback URLs do not move) and apps live at <slug>.<hostedAppsDomain>. Delegate the zone, list it on the Public Suffix List if it is a subdomain of a domain you own (without that the two are the same site and the cookie protection is lost), and set hostedAppsTlsBound after the second certbot run. The edge refuses to start if appsDomain (the control domain) is a subdomain of hostedAppsDomain, because an app could then set cookies that reach the control hosts; the reverse, hostedAppsDomain under appsDomain, boots and needs the Public Suffix List entry. Two wildcard certificates on one Container App are UNVERIFIED IN AZURE.')
+param hostedAppsDomain string = ''
+
+@description('Declare the hosted-apps wildcard binding in-template, the second gate beside wildcardTlsBound (ADR-0044). TRUE only after the second certbot job has run: a declarative binding to a certificate that does not exist fails the edge app PUT loudly. Set it literally in the params file, never from an env var. Only meaningful with hostedAppsDomain. UNVERIFIED IN AZURE.')
+param hostedAppsTlsBound bool = false
+
+@description('Move hosted apps onto hostedAppsDomain: switches EDGE_BASE_DOMAIN and EDGE_CONTROL_DOMAIN (edge and dev gateway), APP_PUBLIC_BASE and CONTROL_PUBLIC_BASE (portal), EDGE_LEGACY_APP_REDIRECT, and the control-zone wildcard. False (default) with hostedAppsDomain set provisions only: the apps zone, the second certbot job and, with hostedAppsTlsBound, its edge binding exist while apps stay on appsDomain. Only meaningful with hostedAppsDomain.')
+param hostedAppsLive bool = false
+
+@description('Redirect old <slug>.<appsDomain> app URLs to the new apps domain with a 307 (EDGE_LEGACY_APP_REDIRECT), and keep the control zone wildcard DNS record while it is on. Only meaningful with hostedAppsDomain. Turn it off when the helix.edge.legacy_app_redirects counter has been zero for a period you choose. Default false.')
+param legacyAppRedirect bool = false
+
 @description('Expose the portal on the public LB at portal.<appsDomain>, gated by Entra OIDC (portal audience + platform-admin App Role). Default false (internal ingress — secure by default). The portal is the control plane + the azx-cli target, so a customer-run install (ADR-0028) generally needs it reachable; per-app authz is enforced by ownsApp (ADR-0007, issue #9 closed), and identity/device posture is the perimeter (Conditional Access), not network location. When true, portal.<appsDomain> gets its own custom-domain binding on the wildcard cert (runtime-bound by the certbot job, declared in-template once wildcardTlsBound=true — ADR-0044). See README "Portal access".')
 param portalExternal bool = false
 
@@ -396,11 +493,69 @@ param allowPublicApps bool = false
 @description('Permit `password` (shared-passphrase) apps on this install. Sets the matched pair EDGE_ALLOW_PASSWORD_APPS + PORTAL_ALLOW_PASSWORD_APPS — same paired-planes reasoning as allowPublicApps; when false the edge 403s the assets and the /_auth/login challenge 404s. Default false (deny).')
 param allowPasswordApps bool = false
 
+@description('Comma-separated https origins appended to every app\'s img-src (EDGE_IMG_SRC_EXTRA). Operator-trusted image hosts only — never list an image proxy that fetches attacker-chosen URLs. Empty sets the variable to an empty string, which the edge reads as no extra origins (that Container Apps passes an empty value through is unverified in Azure).')
+param imgSrcExtra string = ''
+
+@description('Measurement window before enforcing the tightened img-src: the previous open img-src stays enforced and the tightened policy is sent as Report-Only. Existing installs set true, read the Violations screen, then remove. Default false.')
+param imgSrcReportOnly bool = false
+
+@description('Puts https: back in every hosted app\'s img-src (EDGE_IMG_SRC_ALLOW_ALL). For one-org installs that accept the open image channel. Default false; object-src stays none either way.')
+param imgSrcAllowAll bool = false
+
+var imgSrcFlagsValidation = (imgSrcReportOnly && imgSrcAllowAll)
+  ? fail('imgSrcReportOnly and imgSrcAllowAll cannot both be true — the edge refuses to boot when EDGE_IMG_SRC_REPORT_ONLY and EDGE_IMG_SRC_ALLOW_ALL are both set.')
+  : true
+
 @description('Fastify trustProxy for the edge (EDGE_TRUST_PROXY) — the ADDRESS of the trusted ingress, as a CIDR/IP list or a proxy-addr preset ("uniquelocal"). Behind ACA Envoy ingress req.ip is the ingress hop unless this names it, collapsing per-IP rate limits + the login throttle into one bucket (issue #13). "auto" (the default) resolves to 100.64.0.0/10 — the RFC 6598 shared address space ACA draws its ingress pod addresses from on a workload-profile environment (100.100.0.0/17 + the three /19s), measured against a live deployment 2026-09-03. It is NOT the apps subnet: that is where the containers get their addresses, not the ingress that connects to them, and trusting it trusted nothing; EMPTY, "false" or a stale "0" trusts nothing (the socket peer is the client), matching the code default; anything else passes to the edge validator, which additionally refuses a /0 range ("0.0.0.0/0" trusts every peer — the GHSA-3m5p-2c4r-xxw2 shape) and the dotted-netmask form ("10.0.2.0/255.255.254.0" — spell the prefix length, "10.0.2.0/23"). A hop COUNT is refused at deploy: fastify 5.12.1 removed the form (GHSA-3m5p-2c4r-xxw2), the edge refuses to boot on one, and this template rejects it before it deploys. "true" is refused with it — it trusts every peer, so anyone reaching the edge directly sets its own req.ip. Re-verify if anything else fronts the edge (CDN, WAF, second proxy): too narrow collapses every client into one bucket, too broad makes X-Forwarded-For spoofable.')
 param edgeTrustProxy string = 'auto'
 
 @description('ACA custom-domain verification id (asuid TXT). Empty = skip.')
 param domainVerificationId string = ''
+
+var firewallSubnetPrefix = '10.0.0.0/26'
+var appsSubnetPrefix = '10.0.2.0/23'
+var egressSubnetPrefix = '10.0.4.0/23'
+var postgresSubnetPrefix = '10.0.6.0/24'
+var privateEndpointSubnetPrefix = '10.0.7.0/24'
+
+var peDefaults = {
+  kvPlatform: cidrHost(privateEndpointSubnetPrefix, 3)
+  kvConnections: cidrHost(privateEndpointSubnetPrefix, 4)
+  kvDelegated: cidrHost(privateEndpointSubnetPrefix, 5)
+  blob: cidrHost(privateEndpointSubnetPrefix, 6)
+}
+var pinnedPeIps = union(peDefaults, privateEndpointAddresses)
+
+var peSubnetClassPrefix = join(take(split(privateEndpointSubnetPrefix, '.'), 3), '.')
+var peKvPlatformHost = int(last(split(pinnedPeIps.kvPlatform, '.')))
+var peKvConnectionsHost = int(last(split(pinnedPeIps.kvConnections, '.')))
+var peKvDelegatedHost = int(last(split(pinnedPeIps.kvDelegated, '.')))
+var peBlobHost = int(last(split(pinnedPeIps.blob, '.')))
+var peKvPlatformOk = startsWith(pinnedPeIps.kvPlatform, '${peSubnetClassPrefix}.') && peKvPlatformHost >= 4 && peKvPlatformHost <= 254
+var peKvConnectionsOk = startsWith(pinnedPeIps.kvConnections, '${peSubnetClassPrefix}.') && peKvConnectionsHost >= 4 && peKvConnectionsHost <= 254
+var peKvDelegatedOk = startsWith(pinnedPeIps.kvDelegated, '${peSubnetClassPrefix}.') && peKvDelegatedHost >= 4 && peKvDelegatedHost <= 254
+var peBlobOk = startsWith(pinnedPeIps.blob, '${peSubnetClassPrefix}.') && peBlobHost >= 4 && peBlobHost <= 254
+var peIpsDistinct = length(union([pinnedPeIps.kvPlatform], [pinnedPeIps.kvConnections], [pinnedPeIps.kvDelegated], [pinnedPeIps.blob])) == 4
+var pinnedPeValidation = !pinPrivateEndpointAddresses
+  ? true
+  : !peIpsDistinct
+      ? fail('privateEndpointAddresses: kvPlatform, kvConnections, kvDelegated, and blob must each be a distinct IPv4 address')
+      : !peKvPlatformOk
+          ? fail('privateEndpointAddresses.kvPlatform must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+          : !peKvConnectionsOk
+              ? fail('privateEndpointAddresses.kvConnections must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+              : !peKvDelegatedOk
+                  ? fail('privateEndpointAddresses.kvDelegated must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+                  : !peBlobOk
+                      ? fail('privateEndpointAddresses.blob must be an IPv4 address in ${privateEndpointSubnetPrefix} with host octet between 4 and 254 (Azure reserves the first four and last address of every subnet)')
+                      : true
+
+var peBlobIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.blob : ''
+var peKvPlatformIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvPlatform : ''
+var peKvConnectionsIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvConnections : ''
+var peKvDelegatedIp = pinPrivateEndpointAddresses && pinnedPeValidation ? pinnedPeIps.kvDelegated : ''
+
+var egressExtraBlockedCidrs = '${vnetAddressPrefix},100.100.0.0/17'
 
 var oidcIssuer = '${az.environment().authentication.loginEndpoint}${entraTenantId}/v2.0'
 
@@ -416,6 +571,25 @@ module routing 'modules/routing.bicep' = {
   }
 }
 
+module egressNsg 'modules/nsg.bicep' = if (egressNsgEnforce != 'off') {
+  name: 'nsg-egress'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    mode: egressNsgEnforce == 'enforce' ? 'enforce' : 'deny-list-only'
+    vnetAddressPrefix: vnetAddressPrefix
+    egressSubnetPrefix: egressSubnetPrefix
+    appsSubnetPrefix: appsSubnetPrefix
+    postgresSubnetPrefix: postgresSubnetPrefix
+    privateEndpointSubnetPrefix: privateEndpointSubnetPrefix
+    pinPrivateEndpointAddresses: pinPrivateEndpointAddresses
+    kvPlatformIp: peKvPlatformIp
+    kvConnectionsIp: peKvConnectionsIp
+    kvDelegatedIp: peKvDelegatedIp
+    allowedPorts: egressAllowedPorts
+  }
+}
+
 module network 'modules/network.bicep' = {
   name: 'network'
   params: {
@@ -423,6 +597,13 @@ module network 'modules/network.bicep' = {
     namePrefix: namePrefix
     appsRouteTableId: routing.outputs.appsRouteTableId
     egressRouteTableId: routing.outputs.egressRouteTableId
+    egressNsgId: egressNsg.?outputs.nsgId ?? ''
+    vnetAddressPrefix: vnetAddressPrefix
+    firewallSubnetPrefix: firewallSubnetPrefix
+    appsSubnetPrefix: appsSubnetPrefix
+    egressSubnetPrefix: egressSubnetPrefix
+    postgresSubnetPrefix: postgresSubnetPrefix
+    privateEndpointSubnetPrefix: privateEndpointSubnetPrefix
   }
 }
 
@@ -504,6 +685,9 @@ var effectiveEdgeTrustProxy = trustProxyRaw == 'auto'
 // doc + README for the security trade-off). The route tables themselves stay
 // (created empty in routing.bicep) — an empty UDR is a no-op, so both subnets
 // fall back to system routing.
+// The ACME directory's host, for the apps-subnet firewall list. acmeServer is a full URL.
+var acmeServerHost = split(replace(replace(acmeServer, 'https://', ''), 'http://', ''), '/')[0]
+
 module firewall 'modules/firewall.bicep' = if (deployFirewall) {
   name: 'firewall'
   params: {
@@ -514,6 +698,10 @@ module firewall 'modules/firewall.bicep' = if (deployFirewall) {
     egressSubnetPrefix: network.outputs.egressSubnetPrefix
     appsRouteTableName: routing.outputs.appsRouteTableName
     egressRouteTableName: routing.outputs.egressRouteTableName
+    threatIntelMode: threatIntelMode
+    acmeServerHost: acmeServerHost
+    egressFqdnMode: egressFqdnMode
+    egressProductFqdns: egressProductFqdns
   }
 }
 
@@ -537,6 +725,7 @@ module storage 'modules/storage.bicep' = {
     containerName: blobContainerName
     privateEndpointSubnetId: network.outputs.privateEndpointSubnetId
     blobPrivateDnsZoneId: privateDns.outputs.blobZoneId
+    privateIpAddress: peBlobIp
   }
 }
 
@@ -549,6 +738,9 @@ module keyvault 'modules/keyvault.bicep' = {
     delegatedVaultName: delegatedVaultName
     privateEndpointSubnetId: network.outputs.privateEndpointSubnetId
     keyVaultPrivateDnsZoneId: privateDns.outputs.keyVaultZoneId
+    platformPrivateIp: peKvPlatformIp
+    connectionsPrivateIp: peKvConnectionsIp
+    delegatedPrivateIp: peKvDelegatedIp
   }
 }
 
@@ -651,6 +843,16 @@ var foundryMiConnections = deployFoundry
   ? 'foundry=${foundryHost},foundry-openai=${foundryHost}'
   : egressManagedIdentityConnections
 
+func hostOf(url string) string => split(split(replace(replace(url, 'https://', ''), 'http://', ''), '/')[0], ':')[0]
+
+var vendorHosts = union(
+  [hostOf(llm.anthropicEndpoint), hostOf(llm.openaiEndpoint)],
+  empty(foundryMiConnections)
+    ? []
+    : map(split(foundryMiConnections, ','), p => split(trim(p), '=')[1])
+)
+var egressProductFqdns = union(vendorHosts, egressAllowedFqdns)
+
 // What the portal advertises (ADR-0047): an explicit allowlist wins; on a
 // deployFoundry install with none, the deployed set IS the advertised set —
 // foundryModels deployment names are catalog ids by construction, and the
@@ -735,6 +937,8 @@ var portalBaseUrl = 'https://${portalApp.?outputs.fqdn ?? ''}'
 // One value for every hop that caps /_api/fetch bodies. A hop left at its code
 // default (10 MiB) keeps answering 413 above that, whatever the others allow.
 var fetchMaxBodyBytes = string(fetchMaxBodyMb * 1024 * 1024)
+var derivedLlmPlatformFromMonthly = platformMonthlyUsdCap > 0 ? max(1, platformMonthlyUsdCap / 10) : 100
+var effectiveLlmPlatformDollarsPerDay = llmPlatformDollarsPerDay >= 0 ? llmPlatformDollarsPerDay : max(derivedLlmPlatformFromMonthly, 3 * llmDefaultDollarsPerDay)
 
 // Base for the apps' ACA Key Vault references (vaultUri ends in '/').
 // Versionless on purpose: rotation becomes "write the vault" and ACA picks the
@@ -903,6 +1107,15 @@ var availabilityTargets = concat(
         }
       ]
     : [],
+  // Platform /health on www.<hostedAppsDomain> once the apps-domain cert is bound (reserved label → platform host).
+  declarativeHostedTls
+    ? [
+        {
+          name: 'edge-health-apps'
+          url: 'https://www.${hostedAppsDomainLc}/health'
+        }
+      ]
+    : [],
   availabilityExtraTargets
 )
 
@@ -945,6 +1158,33 @@ module infraAlerts 'modules/alerts-infra.bicep' = if (deployInfraAlerts && deplo
     edgeServerErrorThreshold: edgeServerErrorThreshold
     actionGroupId: actionGroupId
   }
+}
+
+module netprobeAlerts 'modules/alerts-netprobe.bicep' = if (deployInfraAlerts && deployApps && deployNetprobe) {
+  name: 'netprobe-alerts'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    workspaceId: egressEnv.outputs.logAnalyticsWorkspaceId
+    actionGroupId: actionGroupId
+  }
+}
+
+module firewallDiagnostics 'modules/firewall-diagnostics.bicep' = if (deployFirewall) {
+  name: 'firewall-diagnostics'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    firewallName: '${namePrefix}-fw'
+    workspaceId: appsEnv.outputs.logAnalyticsWorkspaceId
+    egressSubnetPrefix: egressSubnetPrefix
+    netprobeCanaryHost: netprobeCanaryHost
+    actionGroupId: actionGroupId
+    includeDenialAlert: deployInfraAlerts
+  }
+  dependsOn: [
+    firewall
+  ]
 }
 
 // The budget amount is DERIVED FROM THE DEPLOYMENT SHAPE, not from a constant
@@ -1085,6 +1325,7 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
       }
       { name: 'EGRESS_PORT', value: '8081' }
       { name: 'EGRESS_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
+      { name: 'EGRESS_LLM_TIMEOUT_MS', value: string(egressLlmTimeoutMs) }
       { name: 'HOST', value: '0.0.0.0' }
       { name: 'AZURE_KEY_VAULT_URL', value: connectionsVaultUri }
       // Delegated custody: user OAuth token material,
@@ -1101,6 +1342,11 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
       // foundry module) for these connection names instead of opening a sealed
       // key, pinned to the account's host. Empty = DB-only resolution.
       { name: 'EGRESS_MANAGED_IDENTITY_CONNECTIONS', value: foundryMiConnections }
+      // SSRF filter ranges beyond the built-in list (apps/egress/src/ssrf.ts): the VNet, so an
+      // install on a non-RFC 1918 range is covered, and the ACA platform-reserved range.
+      // 100.64.0.0/10 is already in the built-in list; 100.100.0.0/17 documents the ACA slice.
+      // 10.0.0.0/8 in the built-in list already covers the default VNet prefix.
+      { name: 'EGRESS_EXTRA_BLOCKED_CIDRS', value: egressExtraBlockedCidrs }
       { name: 'EGRESS_DATABASE_URL', secretRef: 'egress-database-url' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_EXCHANGE_SECRET', secretRef: 'helix-exchange-secret' }
@@ -1117,13 +1363,39 @@ module egressApp 'modules/containerapp.bicep' = if (deployApps) {
 // resource id is computable here — no existing-reference, no chicken-egg at
 // compile time. The SAME name is passed into the certbot module (injected as
 // CERT_NAME), so the job's uploads and these bindings cannot drift apart.
-var wildcardCertName = 'wildcard-${replace(appsDomain, '.', '-')}'
+var appsDomainLc = toLower(trim(appsDomain))
+var hostedAppsDomainLc = toLower(trim(hostedAppsDomain))
+var wildcardCertName = 'wildcard-${replace(appsDomainLc, '.', '-')}'
 var wildcardCertId = '${appsEnv.outputs.environmentId}/certificates/${wildcardCertName}'
+var hostedSplit = !empty(hostedAppsDomainLc) && hostedAppsDomainLc != appsDomainLc
+var hostedCutover = hostedSplit && hostedAppsLive
+var appHostsDomain = hostedCutover ? hostedAppsDomainLc : appsDomainLc
+var hostedCertName = 'wildcard-${replace(hostedAppsDomainLc, '.', '-')}'
+var hostedCertId = '${appsEnv.outputs.environmentId}/certificates/${hostedCertName}'
+// Refuse domain pairs the edge rejects at boot — a failed Container Apps revision is silent.
+var hostedAppsOnReservedControlHost = hostedSplit && (hostedAppsDomainLc == 'auth.${appsDomainLc}' || endsWith(hostedAppsDomainLc, '.auth.${appsDomainLc}') || hostedAppsDomainLc == 'portal.${appsDomainLc}' || endsWith(hostedAppsDomainLc, '.portal.${appsDomainLc}') || hostedAppsDomainLc == 'dev-api.${appsDomainLc}' || endsWith(hostedAppsDomainLc, '.dev-api.${appsDomainLc}'))
+var splitDomainValidation = hostedSplit && hostedCertName == wildcardCertName
+  ? fail('hostedAppsDomain and appsDomain derive the same ACA certificate name (${hostedCertName}). Choose domains whose dotted labels differ after replacing dots with dashes.')
+  : hostedSplit && endsWith(appsDomainLc, '.${hostedAppsDomainLc}')
+    ? fail('appsDomain (control) must not be a subdomain of hostedAppsDomain: an app could set a Domain= cookie that reaches the control hosts.')
+    : hostedAppsOnReservedControlHost
+      ? fail('hostedAppsDomain must not be on or under auth., portal. or dev-api. of appsDomain (control): an app could set a Domain= cookie that reaches the control hosts.')
+      : true
+var certbotEnabled = deployApps && deployCertbot && !empty(acmeEmail)
 // The gate: bindings are declared only once the bootstrap has run. Ungated
 // (fresh install, or an install that never flipped), customDomains comes
 // through as [] and containerapp.bicep omits the property entirely — the
 // byte-identical pre-ADR-0044 shape.
-var declarativeTls = deployApps && deployCertbot && !empty(acmeEmail) && wildcardTlsBound
+var declarativeTls = certbotEnabled && wildcardTlsBound
+var declarativeHostedTls = hostedSplit && certbotEnabled && hostedAppsTlsBound
+// Omitted entirely when hostedCutover is false so a single-domain install sees no
+// new environment variables (not blank placeholders).
+var splitEdgeEnv = concat(
+  hostedCutover ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomainLc } ] : [],
+  hostedCutover && legacyAppRedirect ? [ { name: 'EDGE_LEGACY_APP_REDIRECT', value: 'true' } ] : []
+)
+var splitPortalEnv = hostedCutover ? [ { name: 'CONTROL_PUBLIC_BASE', value: 'https://${appsDomainLc}' } ] : []
+var splitDevGatewayEnv = hostedCutover ? [ { name: 'EDGE_CONTROL_DOMAIN', value: appsDomainLc } ] : []
 
 module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
   name: 'app-edge'
@@ -1138,15 +1410,11 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
     // The wildcard custom domain (ADR-0044). Declared once the install's
     // bootstrap has run; until then the job's runtime bind is the mechanism
     // and an apply strips it (README "Known deploy gotchas").
-    customDomains: declarativeTls
-      ? [
-          {
-            name: '*.${appsDomain}'
-            bindingType: 'SniEnabled'
-            certificateId: wildcardCertId
-          }
-        ]
-      : []
+    customDomains: concat(
+      declarativeTls ? [ { name: '*.${appsDomain}', bindingType: 'SniEnabled', certificateId: wildcardCertId } ] : [],
+      // Hosted-apps wildcard on a second cert when the domain split is configured (UNVERIFIED IN AZURE).
+      declarativeHostedTls ? [ { name: '*.${hostedAppsDomainLc}', bindingType: 'SniEnabled', certificateId: hostedCertId } ] : []
+    )
     secretValues: {
       'edge-database-url': {
         keyVaultUrl: '${platformSecretsUri}edge-database-url'
@@ -1174,7 +1442,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
         identity: identity.outputs.edgeIdentityId
       }
     }
-    envVars: [
+    envVars: concat([
       { name: 'NODE_ENV', value: 'production' }
       { name: 'LOG_LEVEL', value: logLevel }
       // OTLP destination (ADR-0037). Empty when telemetry is not deployed, which
@@ -1194,7 +1462,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       // which fails Entra's redirect-URI match (AADSTS50011) and, more quietly,
       // breaks the per-app Origin check in auth/validate.ts for every app.
       { name: 'EDGE_PUBLIC_PORT', value: '443' }
-      { name: 'EDGE_BASE_DOMAIN', value: appsDomain }
+      { name: 'EDGE_BASE_DOMAIN', value: appHostsDomain }
       { name: 'BLOB_CONTAINER', value: blobContainerName }
       // Blob reads via managed identity (issue #15) — no account key. AZURE_CLIENT_ID
       // selects the user-assigned identity for the AAD token fetch; IDENTITY_ENDPOINT/
@@ -1220,6 +1488,9 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       // EDGE_ALLOW_DEV_MODE below is a literal.
       { name: 'EDGE_ALLOW_PUBLIC_APPS', value: allowPublicApps ? 'true' : 'false' }
       { name: 'EDGE_ALLOW_PASSWORD_APPS', value: allowPasswordApps ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_EXTRA', value: (imgSrcFlagsValidation && splitDomainValidation) ? imgSrcExtra : imgSrcExtra }
+      { name: 'EDGE_IMG_SRC_REPORT_ONLY', value: (imgSrcFlagsValidation && splitDomainValidation) && imgSrcReportOnly ? 'true' : 'false' }
+      { name: 'EDGE_IMG_SRC_ALLOW_ALL', value: (imgSrcFlagsValidation && splitDomainValidation) && imgSrcAllowAll ? 'true' : 'false' }
       // LLM upstreams (ADR-0046): first-party by default, the Foundry account
       // when deployFoundry is set, or a BYO endpoint via the llm* params.
       { name: 'EDGE_LLM_ENDPOINT', value: llm.anthropicEndpoint }
@@ -1228,6 +1499,12 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_LLM_OPENAI_ENDPOINT', value: llm.openaiEndpoint }
       { name: 'EDGE_LLM_OPENAI_PATH', value: llm.openaiPath }
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
+      { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
+      { name: 'EDGE_LLM_PLATFORM_DOLLARS_PER_DAY', value: string(effectiveLlmPlatformDollarsPerDay) }
+      { name: 'EDGE_LLM_MAX_APP_IN_FLIGHT', value: string(llmMaxAppInFlight) }
+      { name: 'EDGE_LLM_MAX_USER_IN_FLIGHT', value: string(llmMaxUserInFlight) }
+      { name: 'EDGE_LLM_MAX_IN_FLIGHT', value: string(llmMaxInFlight) }
+      { name: 'EDGE_LLM_MAX_CALL_MS', value: string(llmMaxCallMs) }
       // Behind ACA's Envoy ingress the socket peer is the ingress, so the
       // per-IP anon rate limiter and the password-login throttle need the
       // ingress address named to recover the real client IP (issue #13). See
@@ -1235,6 +1512,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_TRUST_PROXY', value: effectiveEdgeTrustProxy }
       { name: 'EDGE_EGRESS_URL', value: egressBaseUrl }
       { name: 'EDGE_FETCH_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
+      { name: 'EDGE_FETCH_MAX_APP_IN_FLIGHT', value: string(fetchMaxAppInFlight) }
       // The /connections/* proxy and both consent surfaces
       // consult the portal over this base; unset they answer fail-closed 503.
       { name: 'EDGE_PORTAL_URL', value: portalBaseUrl }
@@ -1245,7 +1523,7 @@ module edgeApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'EDGE_AUTH_SECRET', secretRef: 'edge-auth-secret' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_INTERNAL_SECRET', secretRef: 'helix-internal-secret' }
-    ]
+    ], splitEdgeEnv)
   }
   dependsOn: [
     rbac
@@ -1295,7 +1573,7 @@ module portalApp 'modules/containerapp.bicep' = if (deployApps) {
         identity: identity.outputs.portalIdentityId
       }
     }
-    envVars: [
+    envVars: concat([
       { name: 'NODE_ENV', value: 'production' }
       { name: 'LOG_LEVEL', value: logLevel }
       // OTLP destination (ADR-0037). Empty when telemetry is not deployed, which
@@ -1331,7 +1609,7 @@ module portalApp 'modules/containerapp.bicep' = if (deployApps) {
       // Deployment topology, served to the prebuilt portal SPA at runtime by
       // GET /api/v1/config — the bundle is baked into this image, so anything it
       // burned in at build time would be wrong in every environment but one.
-      { name: 'APP_PUBLIC_BASE', value: 'https://${appsDomain}' }
+      { name: 'APP_PUBLIC_BASE', value: 'https://${appHostsDomain}' }
       // Empty when the opt-in dev gateway isn't deployed; the portal reads that
       // as "not enabled" and the SPA hides the dev-mode API base accordingly.
       {
@@ -1353,7 +1631,7 @@ module portalApp 'modules/containerapp.bicep' = if (deployApps) {
       { name: 'PORTAL_SECRET', secretRef: 'portal-secret' }
       { name: 'HELIX_INTERNAL_SECRET', secretRef: 'helix-internal-secret' }
       { name: 'HELIX_EXCHANGE_SECRET', secretRef: 'helix-exchange-secret' }
-    ]
+    ], splitPortalEnv)
   }
   dependsOn: [
     rbac
@@ -1416,7 +1694,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
         identity: identity.outputs.devIdentityId
       }
     }
-    envVars: [
+    envVars: concat([
       { name: 'NODE_ENV', value: 'production' }
       { name: 'LOG_LEVEL', value: logLevel }
       // OTLP destination (ADR-0037). Empty when telemetry is not deployed, which
@@ -1430,7 +1708,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_DEV_GATEWAY_PORT', value: '8082' }
       // The per-plane opt-in; the dev-gateway entrypoint exits unless this is true.
       { name: 'EDGE_ALLOW_DEV_MODE', value: 'true' }
-      { name: 'EDGE_BASE_DOMAIN', value: appsDomain }
+      { name: 'EDGE_BASE_DOMAIN', value: appHostsDomain }
       // Same LLM upstream wiring as the edge (ADR-0046).
       { name: 'EDGE_LLM_ENDPOINT', value: llm.anthropicEndpoint }
       { name: 'EDGE_LLM_ANTHROPIC_PATH', value: llm.anthropicPath }
@@ -1438,8 +1716,14 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_LLM_OPENAI_ENDPOINT', value: llm.openaiEndpoint }
       { name: 'EDGE_LLM_OPENAI_PATH', value: llm.openaiPath }
       { name: 'EDGE_LLM_OPENAI_CONNECTION', value: llm.openaiConnection }
+      { name: 'EDGE_LLM_DEFAULT_DOLLARS_PER_DAY', value: string(llmDefaultDollarsPerDay) }
+      { name: 'EDGE_LLM_MAX_APP_IN_FLIGHT', value: string(llmMaxAppInFlight) }
+      { name: 'EDGE_LLM_MAX_USER_IN_FLIGHT', value: string(llmMaxUserInFlight) }
+      { name: 'EDGE_LLM_MAX_IN_FLIGHT', value: string(llmMaxInFlight) }
+      { name: 'EDGE_LLM_MAX_CALL_MS', value: string(llmMaxCallMs) }
       { name: 'EDGE_EGRESS_URL', value: egressBaseUrl }
       { name: 'EDGE_FETCH_MAX_BODY_BYTES', value: fetchMaxBodyBytes }
+      { name: 'EDGE_FETCH_MAX_APP_IN_FLIGHT', value: string(fetchMaxAppInFlight) }
       // The dev-gateway's consent surface consults the portal
       // over this base, same as the edge.
       { name: 'EDGE_PORTAL_URL', value: portalBaseUrl }
@@ -1450,7 +1734,7 @@ module devGatewayApp 'modules/containerapp.bicep' = if (deployApps && deployDevG
       { name: 'EDGE_DEV_DATABASE_URL', secretRef: 'edge-dev-database-url' }
       { name: 'HELIX_INSTRUCTION_SECRET', secretRef: 'helix-instruction-secret' }
       { name: 'HELIX_INTERNAL_SECRET', secretRef: 'helix-internal-secret' }
-    ]
+    ], splitDevGatewayEnv)
   }
   dependsOn: [
     rbac
@@ -1469,6 +1753,17 @@ module dns 'modules/dns.bicep' = {
     edgeStaticIp: appsEnv.outputs.staticIp
     domainVerificationId: domainVerificationId
     deployDevGateway: deployDevGateway
+    hostsWildcard: !hostedCutover || legacyAppRedirect
+  }
+}
+
+module dnsHosted 'modules/dns.bicep' = if (hostedSplit) {
+  name: 'dns-hosted'
+  params: {
+    appsDomain: hostedAppsDomainLc
+    edgeStaticIp: appsEnv.outputs.staticIp
+    domainVerificationId: domainVerificationId
+    hostsControlPlane: false
   }
 }
 
@@ -1511,6 +1806,33 @@ module certbot 'modules/certbot.bicep' = if (deployApps && deployCertbot && !emp
   ]
 }
 
+module certbotHosted 'modules/certbot.bicep' = if (hostedSplit && certbotEnabled) {
+  name: 'certbot-hosted'
+  params: {
+    location: location
+    // Distinct identity and job names (certbot.bicep:80, :148). Short on purpose: an ACA job name is
+    // limited to 32 characters, and <namePrefix>-ap-certbot must fit.
+    namePrefix: '${namePrefix}-ap'
+    appsDomain: hostedAppsDomainLc
+    wildcardCertName: hostedCertName
+    acaEnvName: '${namePrefix}-apps-env'
+    acaEnvId: appsEnv.outputs.environmentId
+    edgeAppName: '${namePrefix}-edge'
+    portalAppName: ''
+    devGatewayAppName: ''
+    image: '${imageRegistry}/helix-certbot:${imageTag}'
+    acmeEmail: acmeEmail
+    acmeServer: acmeServer
+    // The control instance runs at 03:00 UTC. Both jobs add and bind hostnames on the same edge app, so
+    // offset the second by half an hour rather than racing two writes to one Container App.
+    cronExpression: '30 3 * * *'
+  }
+  dependsOn: [
+    edgeApp
+    dnsHosted
+  ]
+}
+
 // ---------------------------------------------------------------------------
 // Prisma migrations (modules/migrate-job.bicep). A Manual job — declared here so
 // it exists to be triggered, never run by the template. It reads the schema-owner
@@ -1538,16 +1860,69 @@ module migrateJob 'modules/migrate-job.bicep' = if (deployApps) {
   ]
 }
 
+var netprobeProbeEnvCommon = [
+  { name: 'PROBE_PE_ADDRESSES', value: pinPrivateEndpointAddresses ? 'pinned' : 'dynamic' }
+  { name: 'PROBE_EXPECT_FIREWALL', value: deployFirewall ? 'true' : 'false' }
+  { name: 'PROBE_EXPECT_FQDN_ALLOWLIST', value: deployFirewall && egressFqdnMode == 'allowlist' ? 'true' : 'false' }
+  { name: 'PROBE_EXPECT_NSG', value: egressNsgEnforce }
+  { name: 'PROBE_APPS_IP', value: appsEnv.outputs.staticIp }
+  { name: 'PROBE_POSTGRES_HOST', value: pgFqdn }
+  { name: 'PROBE_ALLOWED_HOST', value: netprobeAllowedHost }
+  { name: 'PROBE_CANARY_HOST', value: netprobeCanaryHost }
+]
+
+var netprobeProbePeEnv = pinPrivateEndpointAddresses
+  ? [
+      { name: 'PROBE_KV_PLATFORM_IP', value: peKvPlatformIp }
+      { name: 'PROBE_BLOB_PE_IP', value: peBlobIp }
+      { name: 'PROBE_KV_CONNECTIONS_IP', value: peKvConnectionsIp }
+      { name: 'PROBE_KV_DELEGATED_IP', value: peKvDelegatedIp }
+    ]
+  : []
+
+var netprobeClosingDenyEnv = empty(netprobeClosingDenyTarget)
+  ? []
+  : [{ name: 'PROBE_CLOSING_DENY_TARGET', value: netprobeClosingDenyTarget }]
+
+var netprobeProbeEnv = concat(netprobeProbeEnvCommon, netprobeProbePeEnv, netprobeClosingDenyEnv)
+
+module netprobeJob 'modules/netprobe-job.bicep' = if (deployApps && deployNetprobe) {
+  name: 'netprobe-job'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    acaEnvId: egressEnv.outputs.environmentId
+    image: '${imageRegistry}/helix-egress:${imageTag}'
+    probeEnv: netprobeProbeEnv
+  }
+  dependsOn: [
+    egressApp
+  ]
+}
+
 // ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 
 output appsEnvStaticIp string = appsEnv.outputs.staticIp
+
+@description('True when the four snet-pe private endpoints use static ipConfigurations. When false, NSG rules should target privateEndpointSubnetPrefix instead of naming individual endpoint IPs.')
+output pinPrivateEndpointAddresses bool = pinPrivateEndpointAddresses
+
+@description('IPv4 addresses of the four snet-pe private endpoints (kvPlatform, kvConnections, kvDelegated, blob) when pinPrivateEndpointAddresses is true; empty object when endpoints keep dynamic addresses.')
+output privateEndpointIps object = pinPrivateEndpointAddresses ? pinnedPeIps : {}
+
+@description('CIDR of snet-pe. When pinPrivateEndpointAddresses is false, egress NSG allow rules target this prefix for private-link destinations.')
+output privateEndpointSubnetPrefix string = privateEndpointSubnetPrefix
+
 output postgresServerFqdn string = postgres.outputs.serverFqdn
 output migrateJobName string = migrateJob.?outputs.jobName ?? ''
 output connectionsVaultUri string = connectionsVaultUri
 output delegatedVaultUri string = delegatedVaultUri
 output dnsNameServers array = dns.outputs.nameServers
+
+@description('Name servers for the hosted-apps DNS zone when hostedAppsDomain is set; empty when single-domain.')
+output hostedDnsNameServers array = dnsHosted.?outputs.nameServers ?? []
 output edgeFqdn string = edgeApp.?outputs.fqdn ?? ''
 output egressFqdn string = egressApp.?outputs.fqdn ?? ''
 output portalFqdn string = portalApp.?outputs.fqdn ?? ''
@@ -1567,6 +1942,28 @@ output expectedMonthlyUsd int = expectedMonthlyUsd
 
 @description('Monthly USD the Foundry LLM budget is watching on the account\'s own resource group, or 0 when none deployed (deployFoundry false, llmMonthlyBudgetUsd 0, deployCostBudget false, or alertEmails empty). Notification only — per-app daily token budgets and the deployments\' TPM capacity are the real limits.')
 output llmBudgetUsd int = llmBudget.?outputs.budgetUsd ?? 0
+
+@description('The network controls this deployment declares, in one object, so nobody restates them in prose: firewall, FQDN mode, threat intelligence, NSG mode, allowed ports, the effective allow-list, private-endpoint addresses when pinned, the extra blocked CIDRs, and the probe job with its expectations. Read it next to the last probe result (`just infra net-verify`). Declared posture, not proof: the probe is the proof.')
+output netControls object = {
+  deployFirewall: deployFirewall
+  egressFqdnMode: deployFirewall ? egressFqdnMode : 'n/a'
+  threatIntelMode: deployFirewall ? threatIntelMode : 'n/a'
+  egressNsgEnforce: egressNsgEnforce
+  egressAllowedPorts: egressAllowedPorts
+  egressAllowedFqdns: deployFirewall && egressFqdnMode == 'allowlist' ? egressProductFqdns : []
+  privateEndpointAddresses: pinPrivateEndpointAddresses ? pinnedPeIps : {}
+  extraBlockedCidrs: egressExtraBlockedCidrs
+  probe: {
+    deployed: deployApps && deployNetprobe
+    jobName: '${namePrefix}-netprobe'
+    expectFirewall: deployFirewall
+    expectFqdnAllowlist: deployFirewall && egressFqdnMode == 'allowlist'
+    expectNsg: egressNsgEnforce
+    peAddresses: pinPrivateEndpointAddresses ? 'pinned' : 'dynamic'
+    denyProvable: egressNsgEnforce != 'off' && pinPrivateEndpointAddresses
+  }
+}
+
 // Feeds `portalIdentityPrincipalId` on the SIBLING ../entra stack, whose second pass
 // grants this identity GroupMember.Read.All on Microsoft Graph (ADR-0040 decision 4).
 // The two stacks deploy in the order entra -> azure -> entra: this output is the only
@@ -1584,3 +1981,6 @@ output foundryOrigin string = foundry.?outputs.origin ?? ''
 
 @description('Model deployments created on the Foundry account (deployment name == catalog model id). Empty when deployFoundry is false.')
 output foundryDeployments array = foundry.?outputs.deploymentNames ?? []
+
+@description('FQDNs the firewall enforces for egress product traffic when egressFqdnMode is allowlist (LLM vendors plus egressAllowedFqdns).')
+output egressAllowedFqdnsEffective array = egressProductFqdns

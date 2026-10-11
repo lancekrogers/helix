@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import {
   costUsd,
+  estimateCutUsage,
+  LLM_UPSTREAM_TIMEOUT_DETAIL,
   priceForModel,
   supportsStructuredOutputs,
   type ApiErrorCode,
   type LlmUsage,
 } from "@azx-pbc/shared";
+import { processShutdownSignal } from "@azx-pbc/shared/lifecycle";
 import type { GatewayConfig } from "../config.js";
 import type { RegistryReader } from "../registry/projection.js";
 import { meterIdentity, type CallerResolver } from "../auth/gate.js";
@@ -15,14 +18,30 @@ import type { OriginCheck } from "../auth/validate.js";
 import { anonRateLimited, type IpRateLimiter } from "./ipRateLimiter.js";
 import { LlmProviderError, type LlmProvider } from "./provider.js";
 import { nativeCodec, type LlmWireCodec, type LlmWireContext } from "./llmCodec.js";
-import { errorDetailOf, meterGatewayCall, type GatewayOutcome, type UsageStore } from "./usage.js";
+import {
+  ERROR_DETAIL_MAX,
+  errorDetailOf,
+  meterAdmissionDenied,
+  meterCutCharge,
+  meterGatewayCall,
+  type GatewayOutcome,
+  type LlmSpend,
+  type UsageStore,
+} from "./usage.js";
+import type { DenialThrottle } from "./denialThrottle.js";
+import type { AcquireResult, LeaseRequest, LeaseStore } from "./leaseStore.js";
+import { ReplicaGate } from "./replicaGate.js";
+import { truncate } from "../auth/identity.js";
 import { trace } from "@opentelemetry/api";
 import {
   ATTR_APP_SLUG,
   ATTR_CAPABILITY,
   ATTR_CLIENT_DISCONNECTED,
+  ATTR_REASON,
+  ATTR_USAGE_BASIS,
   ROUTE_LLM,
   SPAN_LLM,
+  type AdmissionDenialReason,
 } from "@azx-pbc/shared/telemetry";
 import { withRootSpan } from "../telemetry.js";
 
@@ -31,12 +50,15 @@ import { withRootSpan } from "../telemetry.js";
  * project plan §4 M4). The choke point that makes per-app blast-radius real:
  * it authenticates the user (session gate), proves the request came from the
  * app's own origin (CSRF — §4.2), enforces the per-app model allowlist and
- * daily spend budget from the manifest (§6.3), proxies to the vendor through
+ * daily spend budget from the manifest or install default (§6.3), proxies to the
+ * vendor through
  * the `LlmProvider` seam (the app never sees the key), and meters every call.
  *
  * Quota is **block-new, finish-in-flight**: the budget is checked once at
  * admission; an admitted request always runs to completion, even if it pushes
- * the app over budget — the next request is the one that gets blocked.
+ * the app over budget — the next request is the one that gets blocked. An abort
+ * by the client, or by the call deadline, is not a quota cut; the budget never
+ * cuts an admitted call.
  *
  * The budget is denominated in **USD**, not tokens, so the cap means the same
  * thing across models (a token cap is a 10× range of dollars between haiku and
@@ -54,6 +76,41 @@ import { withRootSpan } from "../telemetry.js";
  */
 const BURST_WINDOW_DIVISOR = 6;
 const BURST_BUDGET_FRACTION = 1 / BURST_WINDOW_DIVISOR;
+
+/** Lease TTL is the call deadline plus this, so a live call never loses its slot. */
+const LEASE_GRACE_MS = 60_000;
+
+// Hop timeouts after the request was dispatched: the vendor may hold the
+// prompt, so these are charged as a cut. A connect timeout is not here: the
+// request never left, so it stays uncharged.
+const UNDICI_IDLE_TIMEOUT_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+
+function isUndiciIdleTimeout(err: unknown): boolean {
+  for (let cur: unknown = err, depth = 0; depth < 8 && cur instanceof Error; depth += 1) {
+    const code = (cur as Error & { code?: string }).code;
+    if (typeof code === "string" && UNDICI_IDLE_TIMEOUT_CODES.has(code)) return true;
+    cur = cur.cause;
+  }
+  return false;
+}
+
+function llmErrorCharge(
+  err: unknown,
+  eventsSeen: number,
+  deadline: AbortSignal,
+  shutdownHit: boolean,
+): { errorDetail: string; cut: boolean } {
+  if (shutdownHit) return { errorDetail: "process_shutdown", cut: true };
+  if (deadline.aborted) return { errorDetail: "deadline_exceeded", cut: true };
+  if (eventsSeen > 0) return { errorDetail: errorDetailOf(err), cut: true };
+  if (isUndiciIdleTimeout(err)) {
+    return { errorDetail: LLM_UPSTREAM_TIMEOUT_DETAIL, cut: true };
+  }
+  if (err instanceof LlmProviderError && err.egressCode === "upstream_timeout") {
+    return { errorDetail: LLM_UPSTREAM_TIMEOUT_DETAIL, cut: true };
+  }
+  return { errorDetail: errorDetailOf(err), cut: false };
+}
 
 /**
  * Ledger `errorDetail` for a call the app abandoned. `GatewayOutcome` has no
@@ -73,6 +130,31 @@ export interface LlmGatewayRuntime {
   /** Null when no vendor key is configured — the capability 503s. */
   provider: LlmProvider | null;
   usage: UsageStore | null;
+  /** Caps metered quota denials per (app, env). null => uncapped (tests). */
+  denialThrottle: DenialThrottle | null;
+  /** Platform-wide daily LLM ceiling in USD; `0` disables. */
+  platformCeilingDollars: number;
+  /** Concurrency control; null disables every cap (tests that do not exercise it). */
+  concurrency: {
+    leases: LeaseStore;
+    gate: ReplicaGate | null;
+    maxAppInFlight: number;
+    maxUserInFlight: number;
+  } | null;
+  /** Wall-clock deadline for one upstream call, ms. Also bounds the lease TTL. */
+  maxCallMs: number;
+}
+
+/**
+ * Seconds until the next local midnight in the edge process timezone. The
+ * database day window uses `date_trunc('day', now())` in the session timezone,
+ * so the edge and Postgres must agree (both UTC on Container Apps and the dev
+ * container). The value is advisory for `retry-after`.
+ */
+export function secondsUntilNextLocalMidnight(now = new Date()): number {
+  const next = new Date(now);
+  next.setHours(24, 0, 0, 0);
+  return Math.max(1, Math.ceil((next.getTime() - now.getTime()) / 1000));
 }
 
 /**
@@ -182,16 +264,23 @@ export function makeLlmHandler(
 
     // Quota (block-new): if the app is already at/over its daily *or* rolling-
     // hour USD budget, refuse before sending anything upstream. An in-flight
-    // request is never cut. Both windows read the frozen costMicroUsd column.
+    // request is never cut — including when the client hangs up or a deadline
+    // fires; those are not quota cuts. Both windows read the frozen costMicroUsd column.
     const usage = rt.usage;
-    const cap = entry.llm.dollarsPerDay;
-    if (cap !== undefined) {
-      const capMicro = cap * 1_000_000;
-      const { todayMicro, hourMicro } = await usage.llmSpendMicroUsd(entry.appId, caller.env);
-      const overDay = todayMicro >= capMicro;
-      const overBurst = hourMicro >= capMicro * BURST_BUDGET_FRACTION;
-      if (overDay || overBurst) {
-        meterGatewayCall({ appId: entry.appId, capability: "llm", outcome: "quota_blocked" });
+    const recordDenial = async (reason: AdmissionDenialReason, errorDetail?: string) => {
+      meterGatewayCall({ appId: entry.appId, capability: "llm", outcome: "quota_blocked" });
+      meterAdmissionDenied({ appId: entry.appId, capability: "llm", reason });
+      trace.getActiveSpan()?.setAttribute(ATTR_REASON, reason);
+      const decision = rt.denialThrottle
+        ? await rt.denialThrottle.admit(entry.appId, caller.env, "llm")
+        : { meter: true as const, suppressedAt: undefined };
+      if (decision.suppressedAt !== undefined) {
+        req.log.warn(
+          { appId: entry.appId, env: caller.env, reason, attempts: decision.suppressedAt },
+          "quota-denial metering suppressed: this app is over its denial budget for the window",
+        );
+      }
+      if (decision.meter) {
         await usage
           .record({
             appId: entry.appId,
@@ -203,8 +292,22 @@ export function makeLlmHandler(
             outputTokens: 0,
             costMicroUsd: 0,
             outcome: "quota_blocked",
+            ...(errorDetail ? { errorDetail } : {}),
           })
           .catch(() => {});
+      }
+    };
+    // An unset budget is the install default, never unlimited. 0 is the operator's explicit
+    // "no default" (a one-organization install, ADR-0028).
+    const cap = entry.llm.dollarsPerDay ?? rt.config.llm.defaultDollarsPerDay;
+    if (cap > 0) {
+      const capMicro = cap * 1_000_000;
+      const { todayMicro, hourMicro } = await usage.llmSpendMicroUsd(entry.appId, caller.env);
+      const overDay = todayMicro >= capMicro;
+      const overBurst = hourMicro >= capMicro * BURST_BUDGET_FRACTION;
+      if (overDay || overBurst) {
+        const reason: AdmissionDenialReason = overDay ? "app_budget_day" : "app_budget_burst";
+        await recordDenial(reason);
         // Day cap is the harder stop ("done for the day"); prefer its message.
         if (overDay) {
           codec.error(reply, 429, "quota_exceeded", "daily spend budget exhausted");
@@ -215,194 +318,358 @@ export function makeLlmHandler(
       }
     }
 
-    // Admitted. Abort the upstream if the client goes away.
-    //
-    // Watch the *response*, not the request. `req.raw` emits 'close' when the
-    // request body finishes arriving, which on this route has already happened
-    // before the handler runs (Fastify's JSON parser drained it), so a listener
-    // here was attached after the event and never fired at all — the disconnect
-    // abort below has never actually run. The ServerResponse's 'close' fires when
-    // the connection goes away, and `writableEnded` separates "we finished
-    // answering" from "they hung up". Fastify's own `request.signal` is wired to
-    // the same unguarded `req.on('close')` — do not substitute it.
-    //
-    // `writableEnded`, not `writableFinished`: the two agree on a real socket,
-    // but light-my-request's null socket never settles `writableFinished`, so
-    // under `app.inject()` every ordinary response would look like a hang-up.
-    const abort = new AbortController();
-    let clientGone = false;
-    reply.raw.on("close", () => {
-      if (reply.raw.writableEnded) return;
-      clientGone = true;
-      abort.abort();
-      // Mark the span so an abandoned stream is filterable. Read off the active
-      // context rather than threaded in: the span is opened by the wrapper at
-      // the bottom of this factory, and this listener already closes over
-      // enough.
-      trace.getActiveSpan()?.setAttribute(ATTR_CLIENT_DISCONNECTED, true);
-    });
-
-    const startedAt = performance.now();
-    let recorded = false;
-    let finalStopReason = "end_turn";
-    const finalUsage: LlmUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadInputTokens: 0,
-      cacheCreationInputTokens: 0,
-    };
-    const recordOnce = async (
-      outcome: GatewayOutcome,
-      extra: { errorDetail?: string } = {},
-    ): Promise<void> => {
-      if (recorded) return;
-      recorded = true;
-      const durationMs = Math.round(performance.now() - startedAt);
-      // `recordOnce` runs after the stream has drained (the handler drives the
-      // `for await` itself), so this duration is the real end-to-end time, not
-      // time-to-first-header.
-      meterGatewayCall({ appId: entry.appId, capability: "llm", outcome, durationMs });
-      // Freeze the as-charged cost at write time (micro-USD) from the final
-      // token counts + the requested model's current rate. This is what both
-      // the spend gate and the portal dollar figures read back.
-      const costMicroUsd = Math.round(costUsd({ model: chat.model, ...finalUsage }) * 1_000_000);
-      await usage
-        .record({
-          appId: entry.appId,
-          env: caller.env,
-          ...identity,
-          capability: "llm",
-          model: chat.model,
-          inputTokens: finalUsage.inputTokens,
-          outputTokens: finalUsage.outputTokens,
-          cacheReadInputTokens: finalUsage.cacheReadInputTokens,
-          cacheCreationInputTokens: finalUsage.cacheCreationInputTokens,
-          costMicroUsd,
-          outcome,
-          durationMs,
-          // LLM streams over a 200; the stop reason is the useful signal here.
-          stopReason: finalStopReason,
-          errorDetail: extra.errorDetail ?? null,
-        })
-        .catch((err: unknown) =>
-          req.log.warn(
-            {
-              err,
-              event: "gateway.usage_record_failed",
-              appId: entry.appId,
-              capability: "llm",
-              outcome,
-            },
-            "gateway usage record failed",
-          ),
+    // Platform ceiling after the per-app gate: overshoot is at most the ceiling plus
+    // calls admitted before the per-replica cache (PLATFORM_SPEND_CACHE_MS) catches up.
+    if (rt.platformCeilingDollars > 0) {
+      let platform: LlmSpend;
+      try {
+        platform = await usage.platformLlmSpendMicroUsd(caller.env);
+      } catch (err) {
+        req.log.warn(
+          { err, event: "gateway.platform_spend_unavailable" },
+          "platform spend read failed",
         );
-    };
+        reply.header("retry-after", "5");
+        codec.error(reply, 503, "capability_unavailable", "platform budget check unavailable");
+        return;
+      }
+      if (platform.todayMicro >= rt.platformCeilingDollars * 1_000_000) {
+        await recordDenial("platform_ceiling", "platform_ceiling");
+        reply.header("retry-after", String(secondsUntilNextLocalMidnight()));
+        codec.error(
+          reply,
+          503,
+          "capability_unavailable",
+          "platform LLM budget exhausted for today",
+        );
+        return;
+      }
+    }
 
-    // Two distinct ids: `requestId` is internal — it correlates the egress call
-    // and becomes the attested instruction's `jti` (burned for replay
-    // protection), so it must never reach app code. `completionId` is the
-    // app-visible `chatcmpl-<id>`. `created` is stamped once so all chunks agree.
-    const requestId = randomUUID();
-    const ctx: LlmWireContext = {
-      completionId: randomUUID(),
-      model: chat.model,
-      created: Math.floor(Date.now() / 1000),
-      corsOrigin: req.devCorsOrigin,
-      includeUsage: parsed.includeUsage,
-    };
-    const events = rt.provider.stream(chat, {
-      signal: abort.signal,
-      appId: entry.appId,
-      // The opaque id ONLY — this reaches egress via the attested instruction.
-      userOid,
-      requestId,
-      // The log correlation id, NOT the jti above — see `LlmStreamOpts`.
-      correlationId: String(req.id),
-      env: caller.env,
-    });
-
-    // Whether a schema was requested, so an upstream 400 can name the likely cause
-    // (ADR-0034) without blaming a schema the app never sent.
-    const structured = chat.responseFormat !== undefined;
-
-    if (chat.stream) {
-      let started = false;
-      const start = (): void => {
-        if (!started) {
-          codec.startStream(reply, ctx);
-          started = true;
-        }
+    const conc = rt.concurrency;
+    let release: (() => Promise<void>) | null = null;
+    if (conc) {
+      const refuse = (reason: AdmissionDenialReason, message: string): void => {
+        meterAdmissionDenied({ appId: entry.appId, capability: "llm", reason });
+        trace.getActiveSpan()?.setAttribute(ATTR_REASON, reason);
+        reply.header("retry-after", "1");
+        codec.error(reply, 503, "capability_unavailable", message);
       };
+      if (conc.gate && !conc.gate.tryEnter()) {
+        refuse("concurrency_replica", "this replica is at its in-flight LLM limit");
+        return;
+      }
+      const requests: LeaseRequest[] = [
+        { scope: `llm:app:${entry.appId}`, cap: conc.maxAppInFlight },
+        // An anonymous caller shares one identity; the per-IP limiter covers them.
+        ...(caller.authenticated
+          ? [{ scope: `llm:user:${entry.appId}:${userOid}`, cap: conc.maxUserInFlight }]
+          : []),
+      ];
+      let acquired: AcquireResult;
+      try {
+        acquired = await conc.leases.acquire(requests, rt.maxCallMs + LEASE_GRACE_MS);
+      } catch (err) {
+        conc.gate?.leave();
+        req.log.warn({ err, event: "gateway.lease_unavailable" }, "lease acquire failed");
+        reply.header("retry-after", "5");
+        codec.error(reply, 503, "capability_unavailable", "concurrency check unavailable");
+        return;
+      }
+      if (!acquired.ok) {
+        conc.gate?.leave();
+        const app = acquired.scope.startsWith("llm:app:");
+        refuse(
+          app ? "concurrency_app" : "concurrency_user",
+          app
+            ? "too many concurrent LLM calls for this app"
+            : "too many concurrent LLM calls for this user",
+        );
+        return;
+      }
+      release = async () => {
+        conc.gate?.leave();
+        await conc.leases
+          .release(acquired.leaseId)
+          .catch((err: unknown) =>
+            req.log.warn({ err, event: "gateway.lease_release_failed" }, "lease release failed"),
+          );
+      };
+    }
+
+    try {
+      // Admitted. Abort the upstream if the client goes away.
+      //
+      // Watch the *response*, not the request. `req.raw` emits 'close' when the
+      // request body finishes arriving, which on this route has already happened
+      // before the handler runs (Fastify's JSON parser drained it), so a listener
+      // here was attached after the event and never fired at all — the disconnect
+      // abort below has never actually run. The ServerResponse's 'close' fires when
+      // the connection goes away, and `writableEnded` separates "we finished
+      // answering" from "they hung up". Fastify's own `request.signal` is wired to
+      // the same unguarded `req.on('close')` — do not substitute it.
+      //
+      // `writableEnded`, not `writableFinished`: the two agree on a real socket,
+      // but light-my-request's null socket never settles `writableFinished`, so
+      // under `app.inject()` every ordinary response would look like a hang-up.
+      const abort = new AbortController();
+      let clientGone = false;
+      const markClientGone = (): void => {
+        if (reply.raw.writableEnded) return;
+        clientGone = true;
+        abort.abort();
+        // Mark the span so an abandoned stream is filterable. Read off the active
+        // context rather than threaded in: the span is opened by the wrapper at
+        // the bottom of this factory, and this listener already closes over
+        // enough.
+        trace.getActiveSpan()?.setAttribute(ATTR_CLIENT_DISCONNECTED, true);
+      };
+      reply.raw.on("close", markClientGone);
+      // Admission can await budget, platform spend, and lease acquire before this
+      // listener is attached — same gap as egress (proxy.ts).
+      if (reply.raw.destroyed && !reply.raw.writableEnded) markClientGone();
+
+      const startedAt = performance.now();
+      let recorded = false;
+      let finalStopReason = "end_turn";
+      const finalUsage: LlmUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      };
+      // What a cut call is charged from, when the vendor never sent `done`.
+      const requestBytes =
+        Buffer.byteLength(chat.system ?? "", "utf8") +
+        chat.messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0);
+      let relayedBytes = 0;
+      let measured: LlmUsage | undefined;
+      let eventsSeen = 0;
+      const recordOnce = async (
+        outcome: GatewayOutcome,
+        extra: { errorDetail?: string; cut?: boolean } = {},
+      ): Promise<void> => {
+        if (recorded) return;
+        recorded = true;
+        const durationMs = Math.round(performance.now() - startedAt);
+        // `recordOnce` runs after the stream has drained (the handler drives the
+        // `for await` itself), so this duration is the real end-to-end time, not
+        // time-to-first-header.
+        meterGatewayCall({ appId: entry.appId, capability: "llm", outcome, durationMs });
+        let stopReason: string | null = finalStopReason;
+        let errorDetail = extra.errorDetail ?? null;
+        if (extra.cut) {
+          const estimate = estimateCutUsage({
+            measured,
+            requestBytes,
+            relayedBytes,
+            model: chat.model,
+            maxTokens: chat.maxTokens,
+          });
+          Object.assign(finalUsage, estimate.usage);
+          // The default "end_turn" is false for a call that never finished.
+          stopReason = null;
+          // The marker goes LAST and the text before it is cut to fit: clampRecord truncates
+          // errorDetail at ERROR_DETAIL_MAX and would otherwise drop the marker.
+          const marker = `;usage=${estimate.basis}`;
+          errorDetail =
+            truncate(extra.errorDetail ?? "", ERROR_DETAIL_MAX - marker.length - 1) + marker;
+          meterCutCharge({ appId: entry.appId, basis: estimate.basis });
+          trace.getActiveSpan()?.setAttribute(ATTR_USAGE_BASIS, estimate.basis);
+        }
+        // Freeze the as-charged cost at write time (micro-USD) from the final
+        // token counts + the requested model's current rate. This is what both
+        // the spend gate and the portal dollar figures read back.
+        const costMicroUsd = Math.round(costUsd({ model: chat.model, ...finalUsage }) * 1_000_000);
+        await usage
+          .record({
+            appId: entry.appId,
+            env: caller.env,
+            ...identity,
+            capability: "llm",
+            model: chat.model,
+            inputTokens: finalUsage.inputTokens,
+            outputTokens: finalUsage.outputTokens,
+            cacheReadInputTokens: finalUsage.cacheReadInputTokens,
+            cacheCreationInputTokens: finalUsage.cacheCreationInputTokens,
+            costMicroUsd,
+            outcome,
+            durationMs,
+            // LLM streams over a 200; the stop reason is the useful signal here.
+            stopReason,
+            errorDetail,
+          })
+          .catch((err: unknown) =>
+            req.log.warn(
+              {
+                err,
+                event: "gateway.usage_record_failed",
+                appId: entry.appId,
+                capability: "llm",
+                outcome,
+              },
+              "gateway usage record failed",
+            ),
+          );
+      };
+
+      // Two distinct ids: `requestId` is internal — it correlates the egress call
+      // and becomes the attested instruction's `jti` (burned for replay
+      // protection), so it must never reach app code. `completionId` is the
+      // app-visible `chatcmpl-<id>`. `created` is stamped once so all chunks agree.
+      const requestId = randomUUID();
+      const ctx: LlmWireContext = {
+        completionId: randomUUID(),
+        model: chat.model,
+        created: Math.floor(Date.now() / 1000),
+        corsOrigin: req.devCorsOrigin,
+        includeUsage: parsed.includeUsage,
+      };
+      const deadline = AbortSignal.timeout(rt.maxCallMs);
+      const callSignal = AbortSignal.any([abort.signal, deadline, processShutdownSignal()]);
+      if (clientGone) {
+        await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
+        return;
+      }
+      const events = rt.provider.stream(chat, {
+        signal: callSignal,
+        appId: entry.appId,
+        // The opaque id ONLY — this reaches egress via the attested instruction.
+        userOid,
+        requestId,
+        // The log correlation id, NOT the jti above — see `LlmStreamOpts`.
+        correlationId: String(req.id),
+        env: caller.env,
+      });
+
+      // Whether a schema was requested, so an upstream 400 can name the likely cause
+      // (ADR-0034) without blaming a schema the app never sent.
+      const structured = chat.responseFormat !== undefined;
+
+      if (chat.stream) {
+        let started = false;
+        const start = (): void => {
+          if (!started) {
+            codec.startStream(reply, ctx);
+            started = true;
+          }
+        };
+        try {
+          for await (const ev of events) {
+            if (ev.type === "delta") {
+              eventsSeen += 1;
+              relayedBytes += Buffer.byteLength(ev.text, "utf8");
+              start();
+              codec.writeDelta(reply, ctx, ev.text);
+            } else if (ev.type === "usage") {
+              eventsSeen += 1;
+              measured = ev.usage;
+            } else {
+              measured = ev.usage; // the final counts are measured too
+              Object.assign(finalUsage, ev.usage);
+              finalStopReason = ev.stopReason;
+            }
+          }
+          start();
+          codec.writeDone(reply, ctx, { stopReason: finalStopReason, usage: finalUsage });
+          codec.endStream(reply);
+          await recordOnce(outcomeFor(finalStopReason));
+        } catch (err) {
+          // The app hung up: the abort above is what ended this stream, so there is
+          // no upstream failure to describe and no socket left to describe it on.
+          // Meter it as an `error` carrying a distinct detail — `GatewayOutcome` has
+          // no `cancelled` member, and adding one would mean migrating a shared enum
+          // for something the detail already distinguishes.
+          if (clientGone) {
+            await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
+            return;
+          }
+          const shutdownHit = processShutdownSignal().aborted;
+          const charge = llmErrorCharge(err, eventsSeen, deadline, shutdownHit);
+          await recordOnce("error", charge);
+          const deadlineHit = deadline.aborted;
+          const { status, code, message, param, retryAfter } =
+            shutdownHit || deadlineHit
+              ? {
+                  status: 502,
+                  code: "internal" as const,
+                  message: shutdownHit
+                    ? "LLM call ended during platform shutdown"
+                    : "LLM call exceeded its time limit",
+                  param: undefined,
+                  retryAfter: undefined,
+                }
+              : describeError(err, { structured });
+          if (!started) {
+            // `start()` is lazy, so a failure before the first delta has written
+            // nothing — a real status is still possible, and matches how every other
+            // pre-stream refusal on this route (authz, quota, validation) answers.
+            if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
+            codec.error(reply, status, code, message, param);
+            return;
+          }
+          // The head is already out; an in-band error frame is the only channel left.
+          codec.writeStreamError(reply, ctx, { code, message });
+          codec.endStream(reply);
+        }
+        return;
+      }
+
+      // Non-streaming: accumulate into a single JSON body.
+      let content = "";
       try {
         for await (const ev of events) {
           if (ev.type === "delta") {
-            start();
-            codec.writeDelta(reply, ctx, ev.text);
+            eventsSeen += 1;
+            relayedBytes += Buffer.byteLength(ev.text, "utf8");
+            content += ev.text;
+          } else if (ev.type === "usage") {
+            eventsSeen += 1;
+            measured = ev.usage;
           } else {
+            measured = ev.usage; // the final counts are measured too
             Object.assign(finalUsage, ev.usage);
             finalStopReason = ev.stopReason;
           }
         }
-        start();
-        codec.writeDone(reply, ctx, { stopReason: finalStopReason, usage: finalUsage });
-        codec.endStream(reply);
         await recordOnce(outcomeFor(finalStopReason));
+        codec.sendResponse(reply, ctx, {
+          content,
+          stopReason: finalStopReason,
+          usage: finalUsage,
+        });
       } catch (err) {
-        // The app hung up: the abort above is what ended this stream, so there is
-        // no upstream failure to describe and no socket left to describe it on.
-        // Meter it as an `error` carrying a distinct detail — `GatewayOutcome` has
-        // no `cancelled` member, and adding one would mean migrating a shared enum
-        // for something the detail already distinguishes.
+        // As above: our own abort ended this, not the vendor.
         if (clientGone) {
-          await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED });
+          await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED, cut: true });
           return;
         }
-        await recordOnce("error", { errorDetail: errorDetailOf(err) });
-        const { status, code, message, param, retryAfter } = describeError(err, { structured });
-        if (!started) {
-          // `start()` is lazy, so a failure before the first delta has written
-          // nothing — a real status is still possible, and matches how every other
-          // pre-stream refusal on this route (authz, quota, validation) answers.
-          if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
-          codec.error(reply, status, code, message, param);
-          return;
-        }
-        // The head is already out; an in-band error frame is the only channel left.
-        codec.writeStreamError(reply, ctx, { code, message });
-        codec.endStream(reply);
+        const shutdownHit = processShutdownSignal().aborted;
+        const charge = llmErrorCharge(err, eventsSeen, deadline, shutdownHit);
+        await recordOnce("error", charge);
+        const deadlineHit = deadline.aborted;
+        const { status, code, message, param, retryAfter } =
+          shutdownHit || deadlineHit
+            ? {
+                status: 502,
+                code: "internal" as const,
+                message: shutdownHit
+                  ? "LLM call ended during platform shutdown"
+                  : "LLM call exceeded its time limit",
+                param: undefined,
+                retryAfter: undefined,
+              }
+            : describeError(err, { structured });
+        // 502 for upstream failures, 400 when the vendor rejected the app's request,
+        // 429 (with retry-after) when it throttled one; the code stays within the
+        // shared set.
+        if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
+        codec.error(reply, status, code, message, param);
       }
-      return;
-    }
-
-    // Non-streaming: accumulate into a single JSON body.
-    let content = "";
-    try {
-      for await (const ev of events) {
-        if (ev.type === "delta") content += ev.text;
-        else {
-          Object.assign(finalUsage, ev.usage);
-          finalStopReason = ev.stopReason;
-        }
-      }
-      await recordOnce(outcomeFor(finalStopReason));
-      codec.sendResponse(reply, ctx, {
-        content,
-        stopReason: finalStopReason,
-        usage: finalUsage,
-      });
-    } catch (err) {
-      // As above: our own abort ended this, not the vendor.
-      if (clientGone) {
-        await recordOnce("error", { errorDetail: CLIENT_DISCONNECTED });
-        return;
-      }
-      await recordOnce("error", { errorDetail: errorDetailOf(err) });
-      const { status, code, message, param, retryAfter } = describeError(err, { structured });
-      // 502 for upstream failures, 400 when the vendor rejected the app's request,
-      // 429 (with retry-after) when it throttled one; the code stays within the
-      // shared set.
-      if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
-      codec.error(reply, status, code, message, param);
+    } finally {
+      // `recordOnce` runs on every exit path before this; releasing the lease after
+      // the ledger row is what keeps spend visible to the next admission check.
+      await release?.();
     }
   }
 

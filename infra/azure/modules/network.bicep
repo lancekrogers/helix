@@ -7,9 +7,11 @@
 // subnet per managed environment, which is *why* there are two app subnets and
 // two environments rather than one.
 //
-// Route tables are attached here (passed in by id) so the subnet definition and
-// its UDR stay in one place — Azure rejects late association if a subnet already
-// holds ACA infrastructure.
+// Route tables and the egress NSG are attached here (passed in by id) so the
+// subnet definition and its UDR stay in one place — Azure rejects late
+// association if a subnet already holds ACA infrastructure. The same
+// restriction may apply to attaching an NSG to a populated ACA subnet;
+// unverified in Azure.
 
 @description('Azure region for all network resources.')
 param location string
@@ -23,17 +25,21 @@ param appsRouteTableId string
 @description('Resource id of the route table for snet-egress (allow-egress).')
 param egressRouteTableId string
 
-@description('Address space for the VNet.')
-param vnetAddressPrefix string = '10.0.0.0/16'
+@description('Resource id of the NSG for snet-egress, or empty for none.')
+param egressNsgId string = ''
 
-// Subnet prefixes. AzureFirewallSubnet must be /26 or larger and must carry
-// exactly that name. The two ACA subnets must be /23 or larger for workload-
-// profile environments; /23 is the documented minimum, we give each a /23.
-var firewallSubnetPrefix = '10.0.0.0/26'
-var appsSubnetPrefix = '10.0.2.0/23'
-var egressSubnetPrefix = '10.0.4.0/23'
-var postgresSubnetPrefix = '10.0.6.0/24'
-var privateEndpointSubnetPrefix = '10.0.7.0/24'
+@description('Address space for the VNet.')
+param vnetAddressPrefix string
+
+@description('AzureFirewallSubnet prefix. Must be /26 or larger.')
+param firewallSubnetPrefix string
+
+@description('snet-apps prefix (/23 minimum for a workload-profile environment).')
+param appsSubnetPrefix string
+
+param egressSubnetPrefix string
+param postgresSubnetPrefix string
+param privateEndpointSubnetPrefix string
 
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: '${namePrefix}-vnet'
@@ -79,6 +85,9 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           routeTable: {
             id: egressRouteTableId
           }
+          networkSecurityGroup: empty(egressNsgId) ? null : {
+            id: egressNsgId
+          }
           delegations: [
             {
               name: 'aca-egress'
@@ -106,7 +115,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
         }
       }
       {
-        // Private endpoints for blob, both key vaults, and ACR.
+        // Private endpoints for blob and the three Key Vaults.
         name: 'snet-pe'
         properties: {
           addressPrefix: privateEndpointSubnetPrefix
@@ -149,3 +158,5 @@ output postgresSubnetId string = postgresSubnet.id
 output privateEndpointSubnetId string = peSubnet.id
 output appsSubnetPrefix string = appsSubnetPrefix
 output egressSubnetPrefix string = egressSubnetPrefix
+output privateEndpointSubnetPrefix string = privateEndpointSubnetPrefix
+output vnetAddressPrefix string = vnetAddressPrefix

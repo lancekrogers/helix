@@ -55,7 +55,11 @@ updates](/deploy/updates#when-you-do-need-a-full-apply).
 
 | Parameter | Default | What it is |
 | --- | --- | --- |
-| `appsDomain` | — | Your apps domain. Apps live on `<slug>.<appsDomain>`, sign-in on `auth.<appsDomain>`, the portal on `portal.<appsDomain>` |
+| `appsDomain` | — | Your control domain when split: sign-in on `auth.<appsDomain>`, portal on `portal.<appsDomain>`. When `hostedAppsDomain` is empty, apps also live on `<slug>.<appsDomain>` (single-domain layout) |
+| `hostedAppsDomain` | `''` | Optional apps-only domain. Empty: apps stay on `appsDomain`. Set: apps live on `<slug>.<hostedAppsDomain>` and `appsDomain` is the control domain |
+| `hostedAppsLive` | `false` | With `hostedAppsDomain` set: `false` provisions the apps zone, second certbot job, and optional apps TLS binding while apps stay on `appsDomain`; `true` cuts over app URLs and sets the edge, portal, and dev-gateway split env vars. Meaningless when `hostedAppsDomain` is empty. Default `false` fails toward no containment gain |
+| `hostedAppsTlsBound` | `false` | Second ADR-0044 gate for `*.<hostedAppsDomain>` on the edge. `true` only after the second certbot run; `true` without a certificate fails the edge PUT loudly. Meaningful only with `hostedAppsDomain` (**unverified in Azure**) |
+| `legacyAppRedirect` | `false` | `307` from old `<slug>.<appsDomain>` to the apps domain (`EDGE_LEGACY_APP_REDIRECT`). Split only; off leaves legacy hosts on 404 |
 | `deployCertbot` | `true` | The scheduled job that issues and renews the `*.<appsDomain>` Let's Encrypt certificate via DNS-01 |
 | `acmeEmail` | *(empty)* | Required for the certificate — the job is skipped without it |
 | `acmeServer` | Let's Encrypt **staging** | Switch to `https://acme-v02.api.letsencrypt.org/directory` once the flow is validated |
@@ -71,6 +75,10 @@ the bindings at runtime — but a full template re-apply **strips** them. After
 the first successful certbot run, set it to `true` and re-apply; from then on
 the template declares the bindings itself and re-applies preserve them.
 
+With `hostedAppsDomain`, repeat the same pattern for `hostedAppsTlsBound` and the
+`<namePrefix>-ap-certbot` job on the apps zone. The TLS what-if canary applies to **both**
+bindings when both gates are on.
+
 Set it literally in `main.bicepparam`, never from an environment variable — a
 set-but-blank variable reads as `false`, and that is the direction that wipes
 the bindings. The what-if check in
@@ -82,7 +90,13 @@ catches a wrongly-off flag before it does damage.
 | Parameter | Default | What it is |
 | --- | --- | --- |
 | `deployApps` | `false` | The two-phase switch: `false` deploys infrastructure only, `true` adds the container apps |
-| `deployFirewall` | `true` | The Azure Firewall that enforces the egress-only network zone. **Keep on for production** — it is the primary outbound control. `false` saves ~$920/month and is for dev/test installs only |
+| `deployFirewall` | `true` | Optional Azure Firewall tier: FQDN filtering and threat intelligence on top of the application SSRF filter and `snet-egress` NSG (baseline on every install). **Keep on for production.** `false` saves ~$920/month; edge and portal then have default internet egress while egress stays governed by `ssrf.ts` and the NSG |
+| `egressFqdnMode` | `any` | When `deployFirewall` is true: `any` = egress may reach any FQDN on 80/443; `allowlist` = only platform rules plus `egressAllowedFqdns` and derived LLM vendor hosts. Reference parameter files set `allowlist`; template default `any` preserves existing installs on upgrade |
+| `egressAllowedFqdns` | `[]` | Operator additions to the egress product allow-list (approved fetch origins, connection-provider API hosts). Not generated from approvals — run `just infra egress-hosts` after changes |
+| `egressNsgEnforce` | `deny-list-only` | NSG on `snet-egress`: `deny-list-only` (explicit deny rows without the closing deny-all or the `100.64.0.0/10` row — designed not to change platform flows on upgrade; **unverified in Azure** until `just infra net-verify` and the edge→egress check pass), `enforce` (deny list plus closing deny-all and `deny-cgnat`; choose for a new install or after those checks pass), or `off` (detaches the NSG). Test NSG attachment on a scratch copy before the first apply on a live subnet. The net probe is outbound-only — use post-deploy checks in the infra README for edge→egress inbound |
+| `egressAllowedPorts` | `80`, `443` | TCP ports the egress NSG opens to the Internet (row 300). Approved fetch origins on other ports need explicit values here and stop working once the closing deny is enforced |
+| `pinPrivateEndpointAddresses` | `false` | When `true`, the four `snet-pe` private endpoints get static `ipConfigurations` (defaults `.4`–`.7` of that subnet, overridable via `privateEndpointAddresses`). **New installs should set `true`** so egress NSG rules can name Key Vault and Blob by IP. **Existing installs should leave `false`** unless you list current endpoint addresses (`az network private-endpoint list`), pick non-clashing values, set `privateEndpointAddresses` if needed, and accept that Azure may require recreating endpoints to change an address (**unverified**). When `false`, endpoints keep dynamic addresses as before |
+| `privateEndpointAddresses` | *(defaults when pinning)* | Only used when `pinPrivateEndpointAddresses` is `true`. Overrides per-endpoint IPv4 (`kvPlatform`, `kvConnections`, `kvDelegated`, `blob`). Static `ipConfigurations` are **unverified in Azure** until an operator applies the template |
 | `deployDevGateway` | `false` | The opt-in cross-origin dev surface (`dev-api.<appsDomain>`) for building apps locally against a deployed platform |
 | `portalExternal` | `false` | Puts the portal on the public load balancer at `portal.<appsDomain>`, gated by Entra sign-in. Without it (or a private network path), nobody can reach the portal |
 | `allowPublicApps` | `false` | Permits `public` (anonymous) app visibility on this install |
@@ -118,10 +132,17 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `llmEndpoint` / `llmOpenAiEndpoint` | `https://api.anthropic.com` / `https://api.openai.com` | The LLM upstreams the edge gateway proxies to (per model family). See [Azure AI Foundry](/deploy/foundry) for pointing them at your own subscription |
 | `llmModelAllowlist` | *(empty)* | Catalog ids the portal advertises as servable (capability catalogue, agent skill, model picker). Empty with `deployFoundry` auto-derives from `foundryModels`; empty without it derives from seeded platform secrets. Set it to declare the set explicitly (e.g. a BYO Foundry serving a subset). Ids outside the platform catalog are ignored |
 | `llmModelBlocklist` | *(empty)* | Catalog ids withheld even when otherwise servable, subtracted in either allowlist mode — the "everything except these" knob (e.g. `['claude-fable-5']` when your Anthropic upstream lacks that line) |
-| `platformMonthlyUsdCap` | `1000` | Display-only LLM spend line on the admin Activity page. `0` hides it. Nothing enforces it — per-app daily budgets are the real limit |
+| `platformMonthlyUsdCap` | `1000` | Display-only LLM spend line on the admin Activity page. `0` hides it. When `llmPlatformDollarsPerDay` is `-1`, the enforced daily ceiling derives from one tenth of this value, floored at three times `llmDefaultDollarsPerDay` |
+| `llmDefaultDollarsPerDay` | `50` | Daily LLM spend enforced when an app's manifest omits `dollarsPerDay` (`EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` on the edge and dev gateway). Matches the approval baseline; raising it enforces more than the classifier showed approvers. `0` = unset is unlimited |
+| `llmPlatformDollarsPerDay` | `-1` | Platform-wide daily LLM ceiling enforced on the edge (`EDGE_LLM_PLATFORM_DOLLARS_PER_DAY`). `-1` derives `max(one tenth of platformMonthlyUsdCap, 3 × llmDefaultDollarsPerDay)` — `150` with defaults (`1000` / `50`). `0` switches enforcement off. An explicit value is kept as set. The edge logs `platform_ceiling.below_app_default_multiple` at boot when the ceiling is on and below `3 × llmDefaultDollarsPerDay`. Apply the `platform_llm_spend_micro_usd` migration before the edge image that reads it |
+| `llmMaxAppInFlight` | `10` | Cross-replica cap on concurrent LLM calls per app (`EDGE_LLM_MAX_APP_IN_FLIGHT`). `0` disables |
+| `llmMaxUserInFlight` | `3` | Cross-replica cap per authenticated user per app (`EDGE_LLM_MAX_USER_IN_FLIGHT`). `0` disables |
+| `llmMaxInFlight` | `200` | Per-replica in-flight LLM cap (`EDGE_LLM_MAX_IN_FLIGHT`). `0` disables |
+| `llmMaxCallMs` | `600000` | Wall-clock upstream LLM deadline in ms (`EDGE_LLM_MAX_CALL_MS`). Also drives `EGRESS_LLM_TIMEOUT_MS` on egress (`llmMaxCallMs + 120000` in Bicep) — egress's LLM vendor bound must stay above this value |
 | `deployMaxFileMb` | `50` | Max uncompressed size of any single file in a deployed bundle |
 | `deployMaxBundleMb` | `250` | Max uncompressed size of the whole bundle (and the compressed upload). Raising it a lot wants more CPU/memory on the portal container |
 | `fetchMaxBodyMb` | `25` | Max size of each direction of a `/_api/fetch` call (the request body and the response body). Sets `EDGE_FETCH_MAX_BODY_BYTES` on the edge and dev gateway and `EGRESS_MAX_BODY_BYTES` on egress; each hop enforces it, and a call over it gets a 413 |
+| `fetchMaxAppInFlight` | `0` | Max concurrent fetch-proxy calls per app across all edge replicas (`EDGE_FETCH_MAX_APP_IN_FLIGHT`). `0` disables. Lease TTL is ten minutes; a call that outlives it stops counting against the cap |
 | `imageRegistry` / `imageTag` | `ghcr.io/azx-pbc-oss` / `latest` | Where the three service images come from |
 | `logLevel` | `info` | Log level for all four services. `debug` on the edge puts app-request detail in Log Analytics (30-day retention) — treat it as a data decision, not a volume one |
 
@@ -133,6 +154,10 @@ first-party defaults, or pointed at an existing Foundry account per the
 | `deployAlerts` | `true` | Alert rules on the platform's own telemetry (registry staleness) |
 | `deployAvailabilityTests` | `true` | Outside HTTP probes on the public hosts — the only monitoring that works when the platform can't see itself. Billed per execution |
 | `deployInfraAlerts` | `true` | Azure platform-metric rules: Postgres availability/storage, restart storms, edge 5xx |
+| `deployNetprobe` | `true` | Daily (and on-demand) network probe job in the egress environment plus log alerts on its result. Requires `deployApps` |
+| `netprobeAllowedHost` | `mcr.microsoft.com` | Host the probe expects to reach on 443; must remain on the egress platform firewall list |
+| `netprobeCanaryHost` | `example.net` | Host deliberately not on any list; used when the firewall runs in `allowlist` mode |
+| `netprobeClosingDenyTarget` | empty | Optional `host:port` (not 80 or 443) passed to the probe as `PROBE_CLOSING_DENY_TARGET` to prove the NSG closing deny when `enforce` and `deployFirewall=false` |
 | `alertEmails` | `[]` | Who alerts notify. **Empty means the rules still deploy and still fire — at nobody.** Always set this, or turn alerts off |
 | `registryStalenessThresholdMs` | `1200000` | Staleness that fires the registry alert |
 | `availabilityTestFrequencySeconds` | `300` | Probe interval per location — the cost knob for availability tests |
@@ -187,9 +212,20 @@ build-time configuration at all):
 
 | Variable | Set from | If absent |
 | --- | --- | --- |
-| `APP_PUBLIC_BASE` | `https://<appsDomain>` | The portal refuses to boot |
+| `APP_PUBLIC_BASE` | `https://<hostedAppsDomain>` when set, else `https://<appsDomain>` | The portal refuses to boot |
+| `CONTROL_PUBLIC_BASE` | `https://<appsDomain>` when `hostedAppsDomain` is set | Single-domain: defaults to `APP_PUBLIC_BASE`. Split: invalid URL, scheme/port mismatch, or control host under the apps host → boot failure; one-sided with the edge → vendor rejects the callback |
+| `EDGE_CONTROL_DOMAIN` | `appsDomain` when split (edge env) | Unset on the edge → same as `EDGE_BASE_DOMAIN`. Invalid or control under apps → edge refuses to boot |
 | `DEV_API_PUBLIC_BASE` | set when `deployDevGateway` | The SPA reports dev mode as disabled |
 | `PLATFORM_MONTHLY_USD_CAP` | `platformMonthlyUsdCap` | No spend line on the Activity page |
+| `EDGE_LLM_DEFAULT_DOLLARS_PER_DAY` | `llmDefaultDollarsPerDay` | Apps with no manifest `dollarsPerDay` use the install default ($50/day unless raised); `0` on the parameter means unset is unlimited |
+| `EDGE_LLM_PLATFORM_DOLLARS_PER_DAY` | `llmPlatformDollarsPerDay` | Edge-only enforced platform daily LLM ceiling in USD; `0` disables. Not set on the dev gateway |
+| `EDGE_LLM_MAX_APP_IN_FLIGHT` | `llmMaxAppInFlight` | Cross-replica concurrent LLM calls per app; `0` disables |
+| `EDGE_LLM_MAX_USER_IN_FLIGHT` | `llmMaxUserInFlight` | Cross-replica concurrent LLM calls per authenticated user per app; `0` disables |
+| `EDGE_LLM_MAX_IN_FLIGHT` | `llmMaxInFlight` | Per-replica concurrent LLM cap; `0` disables |
+| `EDGE_LLM_MAX_CALL_MS` | `llmMaxCallMs` | Wall-clock LLM call deadline in ms |
+| `EDGE_IMG_SRC_EXTRA` | `imgSrcExtra` (default empty) | Comma-separated `https` origins appended to every app's enforced `img-src` in the default and allow-all modes, and only to the Report-Only header in measurement mode (`EDGE_IMG_SRC_REPORT_ONLY`). Not `connect-src`. Never list an image proxy that fetches attacker-chosen URLs |
+| `EDGE_IMG_SRC_REPORT_ONLY` | `imgSrcReportOnly` (default false) | Measurement window: enforces the previous open `img-src` and sends the tightened policy as `Content-Security-Policy-Report-Only`. Set on existing installs before enforcing; remove after reading the Violations screen |
+| `EDGE_IMG_SRC_ALLOW_ALL` | `imgSrcAllowAll` (default false) | Restores `img-src https: data: blob:` on the enforced header (plus approved origins and `EDGE_IMG_SRC_EXTRA`). Gives up the default tight image channel; `object-src 'none'` stays |
 
 The OAuth connections feature adds three more template-derived URLs —
 each is the target app's ingress FQDN, so there is nothing to configure:
@@ -206,7 +242,24 @@ parameter:
 | Variable | App(s) | Set from | If absent |
 | --- | --- | --- | --- |
 | `EDGE_FETCH_MAX_BODY_BYTES` | edge, dev-gateway | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
+| `EDGE_FETCH_MAX_APP_IN_FLIGHT` | edge, dev-gateway | `fetchMaxAppInFlight` | `0` (off). Lease TTL is ten minutes; a call that outlives it stops counting |
 | `EGRESS_MAX_BODY_BYTES` | egress | `fetchMaxBodyMb` × 1 MiB | 10 MiB |
+| `EGRESS_EXTRA_BLOCKED_CIDRS` | egress | `vnetAddressPrefix` and `100.100.0.0/17` (ACA platform-reserved ingress range) from the template | built-in SSRF ranges only (`100.64.0.0/10` is already in the built-in list). Subnet prefixes in this template are fixed inside `10.0.0.0/16`, so a `vnetAddressPrefix` outside RFC 1918 applies only to a fork with its own layout |
+
+LLM concurrency and the call deadline:
+
+| Variable | App(s) | Set from | If absent |
+| --- | --- | --- | --- |
+| `EDGE_LLM_MAX_APP_IN_FLIGHT` | edge, dev-gateway | `llmMaxAppInFlight` | 10 |
+| `EDGE_LLM_MAX_USER_IN_FLIGHT` | edge, dev-gateway | `llmMaxUserInFlight` | 3 |
+| `EDGE_LLM_MAX_IN_FLIGHT` | edge, dev-gateway | `llmMaxInFlight` | 200 |
+| `EDGE_LLM_MAX_CALL_MS` | edge, dev-gateway | `llmMaxCallMs` | 600000 (10 minutes) |
+
+Egress vendor idle timeouts (`EGRESS_TIMEOUT_MS` stays at 120s for non-LLM fetch; LLM uses the row below):
+
+| Variable | App(s) | Set from | If absent |
+| --- | --- | --- | --- |
+| `EGRESS_LLM_TIMEOUT_MS` | egress | `llmMaxCallMs + 120000` in Bicep | `EDGE_LLM_MAX_CALL_MS + 120000` when that env is present on egress, else 720000 |
 
 The portal image also carries one setting for the app owner's Visitors view:
 

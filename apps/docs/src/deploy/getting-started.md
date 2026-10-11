@@ -52,13 +52,17 @@ normal deploy builds nothing locally — you pick a published image tag.
 ## What it costs
 
 The default shape costs roughly **$125/month**. The one expensive optional is
-the Azure Firewall: about **$920/month**, flat whether busy or idle. It is the
-primary egress control — it is what stops a compromised app (or the edge
-itself) from reaching the internet directly — so it is on by default.
+the Azure Firewall: about **$920/month**, flat whether busy or idle. **Baseline
+egress control on every install** is the application SSRF filter plus the
+`snet-egress` NSG. The firewall adds FQDN allow-listing and threat intelligence
+when `deployFirewall=true`; it is on by default in the template.
 
-- Production, or anything hosting apps from multiple authors: keep it.
+- Production, or anything hosting apps from multiple authors: keep the firewall.
+  Use `egressFqdnMode=allowlist` on new installs; existing firewall installs
+  stay on `any` until you flip explicitly (operator cost: maintain
+  `egressAllowedFqdns` — see [network controls](/deploy/configuration#feature-gates)).
 - A dev or test install: `deployFirewall=false` saves the money. Data services
-  stay private either way.
+  stay private either way; the NSG and application filter still apply.
 
 A monthly budget alert is deployed alongside, sized from these two numbers, so
 tune `expectedMonthlyUsdExFirewall` if your Postgres SKU differs much from the
@@ -117,6 +121,10 @@ default. See the [configuration reference](/deploy/configuration#cost).
   gets its own origin — deliberate isolation, since every hosted app is
   untrusted code: the browser's same-origin policy is what keeps one app's
   code away from another app's data, and the platform manages it all.
+  Optionally you may add a **second** domain so hosted apps sit on their own site
+  while control hosts stay on the first — see `hostedAppsDomain` in
+  [Configuration](/deploy/configuration) and [Upgrading to hosted-app
+  containment](/deploy/updates#upgrading-to-hosted-app-containment).
 - `openssl` and `python3` on the machine you deploy from (the database
   bootstrap script uses both). Everything else runs inside Azure.
 
@@ -154,7 +162,11 @@ Copy `main.bootstrap.bicepparam` and set, at minimum:
 - Names: `namePrefix`, `storageAccountName`, `platformVaultName`,
   `connectionsVaultName`, `postgresServerName` (vault and storage names are
   globally unique).
-- `appsDomain` — your apps domain.
+- `appsDomain` — your control domain (or your only domain in the single-domain layout).
+- `hostedAppsDomain` — optional; when set, apps live here and `appsDomain` is control-only.
+  On a new split install also set `hostedAppsLive = true`. On an existing install leave
+  `hostedAppsLive = false` until DNS and the apps certificate are ready ([rollout
+  notes](/deploy/updates#upgrading-to-hosted-app-containment)).
 - The Entra ids from step 1: `edgeOidcClientId`, `portalOidcAudience` (the
   bare client-id GUID), `portalAdminGroupId` (`platform-admin`),
   `azxCliClientId`, `azxWebClientId`. (The edge OIDC **certificate pair** is a
@@ -322,9 +334,10 @@ that routine is in [Deploying updates](/deploy/updates).
 
 ## Step 7: DNS and TLS
 
-1. **Delegate the domain.** In the parent zone, add NS records for
+1. **Delegate the domain(s).** In the parent zone, add NS records for
    `<appsDomain>` pointing at the nameservers in the deployment output
-   `dnsNameServers`.
+   `dnsNameServers`. With `hostedAppsDomain`, delegate that zone at the parent using
+   the `hostedDnsNameServers` output before running either certbot job.
 2. **Bootstrap the wildcard certificate.** A scheduled job (`certbot`) issues
    and renews `*.<appsDomain>` via Let's Encrypt DNS-01 and binds it. It needs
    the domain verified first: take the `customDomainVerificationId` from the

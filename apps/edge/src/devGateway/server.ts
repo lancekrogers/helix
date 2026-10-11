@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { llmEgressHopTimeoutMs } from "@azx-pbc/shared";
 import { installGracefulShutdown } from "@azx-pbc/shared/lifecycle";
 import { startTelemetry } from "@azx-pbc/telemetry";
 import { buildDevGateway, SERVICE_NAME } from "./app.js";
@@ -136,6 +137,7 @@ const devTokens = new PgDevTokenStore(devDatabaseUrl, {
 
 // Fetch-proxy + LLM ride the same EgressProvider seam as the edge; env=dev is
 // carried in the attested instruction (step 1). Fail-closed when unconfigured.
+const llmHopTimeoutMs = llmEgressHopTimeoutMs(config.llm.maxCallMs);
 const egress: EgressProvider | null = config.fetch.egressUrl
   ? new HttpEgressProvider(config.fetch.egressUrl, { timeoutMs: config.fetch.timeoutMs })
   : null;
@@ -154,8 +156,14 @@ const llmProvider: LlmProvider | null =
           }),
           egress,
           instructionKey,
+          llmHopTimeoutMs,
         ),
-        openai: new EgressLlmProvider(openAiVendor(config.llm.openai), egress, instructionKey),
+        openai: new EgressLlmProvider(
+          openAiVendor(config.llm.openai),
+          egress,
+          instructionKey,
+          llmHopTimeoutMs,
+        ),
       })
     : null;
 
@@ -208,6 +216,9 @@ try {
       service: SERVICE_NAME,
       port: config.devGateway.port,
       baseDomain: config.baseDomain,
+      controlDomain: config.controlDomain,
+      split: config.controlDomain !== config.baseDomain,
+      llmDefaultDollarsPerDay: config.llm.defaultDollarsPerDay,
       tls: https !== null,
       telemetry: telemetry.enabled,
     },
