@@ -23,11 +23,17 @@ Apps can also use a platform-managed offline worker and an isolated development
 tier. Remaining M5 work includes an end-to-end pilot app and confirmation that the
 optional egress firewall is enabled in live deployments.
 
-## How this fork was hardened
+## How this clone was hardened
 
-This fork builds on [AZX's original Helix](https://github.com/AZX-PBC-OSS/helix).
-The hardening work started with the existing platform and is recorded in the
-[azx camp](https://github.com/Festival-Examples/azx-camp):
+This repository is an independent clone of [AZX's original Helix](https://github.com/AZX-PBC-OSS/helix).
+The [Festival-Examples azx camp](https://github.com/Festival-Examples/azx-camp)
+shows how the existing platform was evaluated, designed, and hardened. Its
+[case study](https://github.com/Festival-Examples/azx-camp#readme) includes the
+decisions, task records, reviews, and verification evidence.
+
+![Replay of the Helix hardening festival](https://github.com/Festival-Examples/azx-camp/blob/main/festivals/.dungeon/completed/2026-10-11/helix-hardening-HH0001/festival-replay.gif?raw=true)
+
+Follow the work from the initial evaluation to the completed festival:
 
 1. [Explore the repository](https://github.com/Festival-Examples/azx-camp/tree/main/workflow/explore/helix-repo-exploration) to check how Helix runs and identify confirmed gaps.
 2. [Design the changes](https://github.com/Festival-Examples/azx-camp/tree/main/workflow/design/helix-spend-containment-egress) to decide scope, rollout limits, and verification before implementation.
@@ -37,9 +43,8 @@ The resulting [spend controls](https://github.com/lancekrogers/helix/pull/2),
 [network egress controls](https://github.com/lancekrogers/helix/pull/3),
 [CSP and response-header changes](https://github.com/lancekrogers/helix/pull/4), and
 [hosted-app domain split](https://github.com/lancekrogers/helix/pull/5) were merged in that order.
-The camp's [case-study README](https://github.com/Festival-Examples/azx-camp#readme)
-links to the execution replay and final verification evidence. Azure-specific behavior
-was not tested in Azure, and these changes were not rolled out to the live installs.
+Azure-specific behavior was not tested in Azure, and these changes were not rolled
+out to the live installs.
 
 ## Layout
 
